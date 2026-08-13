@@ -1,0 +1,408 @@
+# OmniHub System Design
+
+状态：`ready`
+
+## 1. 承重判断
+
+OmniHub 的核心不是“每个平台写一个 Adapter”，而是把用户关心的内容来源与实际获取手段分开：
+
+- `Source` 回答“内容来自哪里”；
+- `Provider` 回答“谁帮我们找到/取到”；
+- `RouteTemplate` 回答“某类 Source 的某项 Capability 理论上可以怎样走”，只声明受信任能力和 Source constraint；
+- `Channel` 是用户真正启停、配置、授权、探测和执行的 RouteTemplate 实例；
+- `Adapter` 只翻译 Provider 协议。
+
+因此同一个 X Source 可以同时拥有 xurl official、RSSHub timeline 和 twscrape cookie 三个 Channel，分别配置、授权和显示健康；同一个 V2EX Source 可以优先 Direct Atom Channel，RSSHub Channel 作为获准回退。Tavily 搜到 GitHub 页面时，Provider 是 Tavily，Source 仍是 GitHub/目标域名。
+
+第二个承重判断是把一次性查询和持续订阅拆成两个运行平面。两者共享合同与执行内核，但只有 Subscription Plane 承担 SQLite、checkpoint、snapshot 和 Feed 新鲜度责任。综合 Web Dashboard 是 `serve` 上的管理投影：它读写同一 Registry/Repository 并复用 Operation/Envelope，不成为第三套业务内核。
+
+第三个承重判断是“为 MySQL 留迁移边界”和“现在实现分布式”必须分开。v1 只交付 SQLite，但领域层只依赖 Repository/Unit of Work；全局 ID、revision、idempotency、Run lease 和事务不变量从第一阶段就成立。MySQL Driver、多实例部署和分布式调度留到真实需要时实现。
+
+第四个承重判断是浏览器登录导航、Cookie 授权和 Channel 可用性是三件事。普通 Dashboard 页面不能跨站读取 Cookie；Chrome Companion 只在用户手势下获得目标 origin 权限，Native Host 在每次执行时把 allowlist 内的认证材料交给 Browser Bridge，最后还必须真实 Probe Channel 才能标记 ready。
+
+## 2. 总体架构
+
+```mermaid
+flowchart LR
+    CLIENT["Agent / Human / App"] --> CLI["CLI + JSON / JSONL"]
+    CLIENT --> HTTP["REST + OpenAPI"]
+    CLIENT --> MCP["MCP stdio / Streamable HTTP"]
+    CLIENT --> FEEDOUT["RSS / Atom / JSON Feed"]
+    CLIENT --> DASH["Web Dashboard"]
+
+    CLI --> OPS["Operation Service"]
+    HTTP --> OPS
+    MCP --> OPS
+    FEEDOUT --> VIEW["View Snapshot"]
+    DASH --> MGMT["Management API"]
+    MGMT --> OPS
+    MGMT --> REG
+    MGMT --> REPOS["Domain Repositories"]
+
+    DASH -. "open login / Companion UI" .-> EXT["Chrome MV3 Companion"]
+    EXT <-->|"connectNative Port"| CHOST["omnihub chrome-host"]
+    CHOST <-->|"user-scoped Bridge IPC"| BCLIENT["Browser Bridge Client"]
+    BCLIENT --> EXEC
+
+    OPS --> REG["Source / Provider / Channel Registry"]
+    OPS --> ROUTER["Channel Router"]
+    ROUTER --> EXEC["Channel Executor"]
+    EXEC --> ADAPTERS["Built-in Adapters"]
+    EXEC --> COMMAND["Fixed Command Binding"]
+    EXEC --> MCPCLIENT["MCP Client Binding"]
+
+    ADAPTERS --> DIRECT["RSS / Atom / JSON Feed"]
+    ADAPTERS --> RSSHUB["RSSHub Profiles"]
+    ADAPTERS --> APIS["Native / HTTP JSON APIs"]
+
+    EXEC --> NORM["Normalize + Observations"]
+    NORM --> IDENTITY["Identity Dedupe"]
+    IDENTITY --> GROUP["Optional Similarity Grouping"]
+    GROUP --> RESULT["Envelope"]
+    RESULT --> REPOS
+    REPOS --> SQLITE["SQLite Store v1"]
+    REPOS -. "future" .-> MYSQL["MySQL Store"]
+    SQLITE --> VIEW
+```
+
+凭据分两条简单路径：Dashboard 录入的 API Key/Token 直接保存在 SQLite Credential；Chrome Cookie 每次执行通过 Browser Bridge 进入 Adapter 内存，结束即丢弃。两者不再共用 Keychain/SecretStore 抽象。Credential detail 可以按本地用户请求返回完整 API Key，但日志、Run、Error、readiness、Cookie 和默认 export 不返回。
+
+已确认 Go 单二进制作为 v1 技术底座：符合全局安装、跨平台、并发 I/O、本地 HTTP/MCP Server 的目标。SQLite 选择无需系统动态库的驱动，避免安装后再要求用户准备额外运行时。
+
+建议目录按领域而不是出口组织：
+
+```text
+cmd/omnihub             进程入口
+internal/core           Operation、Envelope、Item、Coverage、Error
+internal/registry       Source/Provider/RouteTemplate/Channel/Profile/Collection
+internal/router         Capability、Channel 与选择策略
+internal/adapter        内建 Adapter 与 command/MCP bindings
+internal/credential     SQLite Credential CRUD、redaction 与 Channel binding
+internal/browser        Chrome Bridge、permission、按执行 Cookie 请求
+internal/normalize      URL、时间、内容角色、Observation
+internal/dedupe         identity 与 similarity group
+internal/repository     领域 Repository、Unit of Work 与 contract
+internal/store/sqlite   SQLite Repository 与 migration
+internal/transport      CLI、HTTP、MCP、Feed、OPML、Dashboard API
+schemas                 单一 Schema 源与生成产物
+sources                 随版本发布的 Source Bundles
+skills/omnihub          Agent Skill
+```
+
+## 3. 双运行平面
+
+### 3.1 Query Plane
+
+- `omnihub search/latest/fetch` 的无依赖基线可在没有 daemon 和数据库时运行，覆盖公开 Feed、无凭据 Provider 和调用方显式提供的环境变量凭据。使用 Dashboard 保存的 API Key Channel 时读取本机 SQLite；使用 Chrome Cookie Channel 时连接 Chrome 管理的 Browser Bridge IPC。依赖缺失必须返回 config/browser error，不能把“Query Plane 无状态优先”写成“所有 Channel 永远零依赖”。
+- Registry、Channel Router、Adapter、Normalizer 和 Envelope 都在当前进程完成。
+- 可以使用进程内/磁盘 response cache，但不承诺跨次全局分页、历史去重或 Feed 持续更新。
+- 多 Channel 默认只取 bounded first window；coverage 如实标记截断。
+
+### 3.2 Subscription Plane
+
+- `omnihub serve` 暴露 HTTP、Streamable HTTP MCP、Feed 与 Dashboard Backend。
+- View 保存 Operation，Snapshot 保存最近成功物化结果。
+- SQLite Repository 维护用户 Channel/Endpoint/Credential 元数据、Channel checkpoint、缓存、identity tombstone、View、Snapshot、Run 和 readiness。
+- Feed 只投影 Snapshot；它不是新的搜索实现。
+- Dashboard 管理同一份 RouteTemplate、Channel、Endpoint、Credential、Collection、View、Run 与 readiness；前端由另一 Agent 实现。
+
+把两者分开可以避免“为了输出 RSS，所有 CLI 用户都必须跑长期服务”，也避免让无状态 CLI 假装能提供稳定的跨 Provider continuation。
+
+## 4. Registry 与 Router
+
+### 4.1 Registry
+
+Registry 合并四类配置，并保持静态能力与用户实例分离：
+
+1. 随二进制发布的 Source/Provider/RouteTemplate Bundle；
+2. 用户审核并导入的 Source Bundle 与 user-owned overlay；
+3. 文件或 SQLite 中的 Channel、EndpointProfile、Credential 与 Collection；
+4. OPML 导入后创建的 Direct Feed Channel 与 Collection membership。
+
+Source tags 只用于发现；没有封闭类别枚举。RouteTemplate Descriptor 表达“理论支持”，Channel Probe 表达“当前这组 Endpoint、Credential 与参数真能执行”。
+
+配置层级固定为 `builtin < imported < user overlay`：内建资源只读，升级时可替换；用户可以 disable 或 overlay，而不是直接修改随二进制发布的文件。Dashboard、CLI 和 import 都调用同一 Registry Command Service，不能各自维护配置副本。
+
+### 4.2 默认选择算法
+
+1. 展开 Collection、Source、Provider、Channel 与 domain scope，生成候选 Channel。
+2. 依据每个 Channel 引用的 RouteTemplate，过滤不支持 Capability、分页/时间要求或内容层级要求的候选。
+3. 应用 only/exclude/prefer、aggregate 和 fallback policy。
+4. 做无网络 preflight：Channel 参数、Endpoint、Credential 是否存在、executable/MCP server 与 Chrome Bridge 依赖是否成立。
+5. 按用户偏好、Source priority、readiness TTL、费用、信任边界和 timeout 排序。
+6. `aggregate=false` 时每个 Source 只执行首选 Channel；失败后仅在 `allow_fallback=true` 时走已披露备选。
+7. 记录所有 selected/completed/failed/skipped Channel、RouteTemplate 与选择原因。
+
+默认不把一次查询广播给全部 Provider，因为这会同时增加费用、rate limit、隐私泄露和重复结果。
+
+### 4.3 一般优先级
+
+- Direct Feed：适合低成本 `latest`。
+- Native API/official CLI：适合 `search`、结构化 metadata、指标和真实分页。
+- RSSHub：适合把没有官方 Feed 的来源变成增量 Feed；不默认等价于平台搜索。
+- Specialized command/MCP：适合 X 等已有专项工具的来源。
+- Generic Web Search：适合发现候选 URL 和补充覆盖，不冒充目标站原生索引。
+
+每个 Source Manifest 可以覆盖这套默认顺序。
+
+## 5. Adapter 与扩展边界
+
+核心 Go 接口保持窄而有意义：
+
+```go
+type Adapter interface {
+    Describe(ctx context.Context, profile EndpointProfile) (Descriptor, error)
+    Execute(ctx context.Context, req AdapterRequest) AdapterResult
+    Health(ctx context.Context, check HealthCheck) HealthResult
+}
+```
+
+`AdapterResult` 同时返回 Items、Coverage、Errors 与私有 Cursor；Adapter 不负责全局路由或跨 Route merge。
+
+### 5.1 内建 Adapter
+
+- `feed`：RSS/Atom/JSON Feed discovery、conditional GET、解析和 bounded window。
+- `rsshub`：Endpoint 鉴权、Route metadata、Feed 获取与 Route 级诊断。
+- `http-json`：受信任 Manifest 的受限 HTTP 请求和 JSON Pointer mapping。
+- 高价值专用 Adapter：例如 GitHub API；只在通用 mapping 无法正确处理鉴权、分页、rate limit 或语义时进入核心。
+
+v1 不内建通用 HTML/CSS scraping DSL：RSSHub/RSS-Bridge 已经解决这类扩展，OmniHub 若再造会迅速背上反爬和浏览器维护成本。
+
+### 5.2 Command binding
+
+- 用户配置 executable 和由 literal/typed field 组成的 argv 数组；不经过 shell。
+- Credential 不允许映射到 argv；受信任 binding 只能把 API Key/Token 注入子进程环境变量或 stdin，并在 error/trace 中统一脱敏。
+- stdout 只能是 JSON/JSONL，stderr 是日志；规定 timeout、输出大小和 exit code 映射。
+- 简单第三方 schema 使用版本化 JSON Pointer mapping；复杂工具应提供一个小型 adapter executable，直接输出 OmniHub Adapter Result。
+- 这不是新 RPC 协议：没有 initialize/describe/shutdown JSONL 握手。
+
+### 5.3 MCP binding
+
+OmniHub 作为 MCP client 使用标准 stdio/Streamable HTTP、initialize、tools/list、tools/call、取消和 outputSchema。它只维护 Provider Tool 与 OmniHub 字段的 mapping，不复制一套生命周期协议。
+
+### 5.4 明确不采用
+
+- Go plugin：ABI、构建版本和分发耦合太强。
+- 远程 Manifest 任意 executable：远程内容不能获得本机代码执行权。
+- 为一个现有 CLI 再写一层同义脚本：固定 command binding 已足够。
+- 一开始就提供全功能扩展 SDK：先用五条纵切验证哪些扩展点真实需要稳定。
+
+## 6. RSSHub Endpoint 策略
+
+```yaml
+apiVersion: omnihub.dev/v1alpha1
+kind: EndpointProfile
+metadata:
+  id: rsshub-local
+spec:
+  provider: rsshub
+  baseUrl: http://127.0.0.1:1200
+  trust: local
+  timeout: 10s
+```
+
+建议 v1：
+
+- 只连接用户配置的本地/远程实例，不安装、不启动、不选择公共默认实例。
+- Endpoint 只是连接配置；用户还需显式创建 Channel，引用 RSSHub RouteTemplate，填写 path、typed parameters、Credential、priority/fallback 和 Collection。每个人的 RSSHub Channel 集合保存在 user-owned config，不由内建清单替代。
+- key/code 由内部构造；URL、日志、trace 与错误统一脱敏。
+- 优先读 RSSHub Route metadata；metadata 不可用时仍可实际请求 Feed，但 Channel readiness 记录为降级探测。
+- Channel Probe 检查 HTTP、Content-Type、Feed parse、最新时间和已知 `requireConfig/requirePuppeteer/antiCrawler`。
+- readiness key 至少包含 Channel + RouteTemplate + Endpoint + Credential revision；Endpoint 200 不扩散为全局绿色。
+- RSSHub X Route 只有用户配置 X credential 后才可能 ready；不能当匿名 X search 方案。
+
+后续的 managed RSSHub mode 会引入容器、升级、持久化、安全和监控责任，需单独 Shape。
+
+## 7. 统一格式与来源链路
+
+内部 Item 复用 JSON Feed 的内容字段语义，完整执行返回 OmniHub Envelope：
+
+- `content.role` 区分 snippet、summary、body。
+- `observations[]` 保存所有 Provider/Channel/RouteTemplate/Endpoint/URL/rank/verification。
+- `executions[] + coverage[] + errors[]` 让空结果、部分失败和覆盖截断可解释。
+- Feed 把兼容字段投影为 RSS/Atom/JSON Feed，额外信息进入 `_omnihub` 或 XML namespace。
+- Knowledge Studio 消费 Item URL/Observation 后负责深入抓取、保存证据和综合写作；OmniHub 不复制这部分状态机。
+
+## 8. Identity Dedupe 与 Similarity Grouping
+
+### 8.1 Identity Dedupe
+
+默认开启，按可靠性依次判断：
+
+1. 同 Source 的稳定 upstream ID；
+2. canonical URL；
+3. 规范化内容的精确哈希。
+
+确认是同一对象后合并 Item，但保留全部 Observation。Feed 特例借鉴 Miniflux：如果上游错误地给所有条目相同 GUID，必须结合 URL 或位置避免整批被吞。
+
+### 8.2 Similarity Grouping
+
+标题/正文相似度只建立 group，不把不同发布者的报道折叠成一个事实来源。标题比较保护数字、日期、版本号和实体 token；正文可以在限定时间窗内用 SimHash 等低成本指纹。默认关闭。
+
+语义向量 grouping/rerank 需要模型、阈值、费用和可解释性，不进入 v1。
+
+## 9. 状态、缓存与增量一致性
+
+### 9.1 Repository 边界
+
+Repository 使用领域操作，不做机械的“每表一个 CRUD interface”。建议端口：
+
+```go
+type Repositories interface {
+    Configuration() ConfigurationRepository
+    Credentials() CredentialRepository
+    Views() ViewRepository
+    Runs() RunRepository
+    ChannelState() ChannelStateRepository
+    Items() ItemRepository
+    ChannelHealth() ChannelHealthRepository
+    WithinTransaction(ctx context.Context, fn func(Repositories) error) error
+}
+```
+
+承重方法应表达真实原子行为，例如 `CommitViewRefresh(snapshot, items, observations, checkpoints)`、`ClaimRun(expectedRevision, leaseUntil)`、`UpdateCredentialAndInvalidateState(expectedRevision)` 和 `ApplyUserOverlay(expectedRevision)`；不能让 Service 自己组合十几个表级 Save 后假设原子性。
+
+SQLite 是唯一 v1 Store。领域层不得使用 SQLite connection/error/SQL；SQLite Store 可启用 WAL、busy timeout 和单写入协调。未来 MySQL Store 使用同一 Repository contract，但可以拥有独立 migration 与 SQL，不要求当前查询使用最低公分母方言。
+
+本机配置目录和 SQLite 使用当前用户专属权限（Unix `0700/0600`，Windows 当前用户 ACL）。这只阻止其他本机账号误读，不宣称加密；未来 MySQL/远程部署必须重新 Shape Credential 保护。
+
+### 9.2 数据与未来多实例不变量
+
+- 资源与 Run 使用 UUIDv7/ULID 一类全局唯一 ID，不使用仅在单库内有意义的自增 ID 作为公共标识。
+- 可写资源携带 `revision`；更新、Run claim/renew/finish 使用 compare-and-swap。
+- Run creation 使用 idempotency key；Run 持久化 `claimed_by/lease_expires_at/attempt`。
+- 时间统一 UTC；唯一约束和 foreign key 表达数据不变量，不能只靠进程内 map。
+- 进程内 singleflight 是 SQLite 单机优化；未来多实例正确性依赖持久 Run lease 与事务。
+- v1 不实现 MySQL Driver、distributed lock、leader election、sharding、tenant_id 或双写。
+
+### 9.3 SQLite 表边界
+
+- `managed_resources` 或按领域拆分的 Source/RouteTemplate/Channel/Endpoint/Collection 配置：origin、revision、enabled 与 overlay。
+- `credentials`：provider、auth kind、label、API Key/Token value、enabled、revision 与时间；`chrome_cookie` 记录的 value 为 null。
+- `channel_state`：按 Channel/RouteTemplate/Endpoint/parameters/Credential revision 分区的 cursor/checkpoint。
+- `response_cache`：ETag、Last-Modified、freshness 与受限响应缓存。
+- `items` / `observations`：当前保留窗口。
+- `identity_tombstones`：被 retention 清理过的身份，防止旧条目重现。
+- `views` / `view_snapshots`：保存请求与不可变成功快照。
+- `runs` / `run_channel_events`：持久执行状态、幂等 key、lease、Channel progress 与终态引用。
+- `channel_health_checks`：Probe/执行的分层 readiness 证据与 TTL；Browser Bridge connection/granted origins 是进程内 live state，聚合状态是派生读模型。
+
+刷新事务：
+
+```mermaid
+sequenceDiagram
+    participant V as View Refresher
+    participant C as Channel
+    participant DB as SQLite
+    V->>DB: 读取当前 checkpoint 和 snapshot
+    V->>C: conditional request / cursor
+    C-->>V: items + coverage + next checkpoint
+    V->>V: normalize + identity dedupe + group
+    V->>DB: BEGIN
+    V->>DB: 写 items/observations/tombstones
+    V->>DB: 写新 immutable snapshot
+    V->>DB: 推进 route checkpoint
+    V->>DB: COMMIT
+```
+
+只有 COMMIT 成功才推进 checkpoint，因而重复抓取最多产生 at-least-once 输入，由 identity dedupe 吸收；不会出现 checkpoint 已前进但 Snapshot 没写成的数据丢失。
+
+Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Retry-After。缓存 key 包含 Channel、RouteTemplate、Credential revision 与规范化参数，不能把一个 Endpoint 的命中扩散给所有 Channel。
+
+## 10. View Freshness
+
+已确认 v1 使用 on-demand stale-while-revalidate，而非内置 scheduler：
+
+1. fresh snapshot 直接返回；
+2. stale snapshot 立即返回，并对该 View singleflight 后台 refresh；
+3. 无 snapshot 时做一次有总 deadline 的阻塞 refresh；
+4. refresh 失败保留旧 snapshot、checkpoint 和错误状态；
+5. 用户仍可显式 `refresh`，或用 cron/systemd timer/launchd/Agent 调度。
+
+若未来选择内置 scheduler，需要额外 Shape 重试、错过执行、休眠恢复、任务租约、告警和监控；不能把一个 ticker 当成已完成的调度系统。
+
+## 11. 分页与排序
+
+- Channel 内的 Provider cursor 是 Adapter 私有实现细节。
+- Query Plane 多 Channel 只承诺 first window；coverage 标记 truncated，不伪造全局 `next_cursor`。
+- Subscription Plane/Query Session 只有在持久化每 Channel cursor、buffer 和消费位置后才签发 opaque token。
+- 搜索 merge 可以参考各 Channel position 与 Provider weight，但必须保留 observation positions；跨 Provider score 不视为可直接比较的“真分数”。
+- 排序用 canonical URL/稳定 ID 打破平局，保证同输入同响应可重复。
+
+## 12. Dashboard Backend
+
+Dashboard v1 Backend 围绕七个用户任务提供资源，而不是围绕数据库表暴露 CRUD：
+
+1. **概览**：实例版本、分层 readiness、View freshness、active Run、近期失败。
+2. **渠道管理**：基于只读 RouteTemplate 创建/启停 Channel，配置 Endpoint、Credential、parameters、priority/fallback 与 Collection membership。
+3. **凭据与登录**：录入/查看 API Key Credential；查看 Chrome Bridge 状态，跳转登录页，授予/撤销 origin permission；前端永远不接触 Cookie。
+4. **诊断**：分别显示 configuration、browser bridge、permission、credential、endpoint 与真实 Channel Probe 证据。
+5. **View 管理**：保存 Operation、Feed URL、当前 Snapshot 与最近刷新结果。
+6. **Run 观察**：queued/running/complete/partial/failed/cancelled、Channel progress 和最终 Envelope。
+7. **Item 浏览**：读取 Snapshot Item/Observation，严格区分 snippet 与 body。
+
+Management API 写操作使用 revision/If-Match 和 idempotency key。`dashboard/summary` 只是资源聚合缓存，不能成为另一份状态来源。Run 是长操作事实源；v1 已确认前端轮询持久 Run，不提供 SSE/WebSocket，并包含显式 scope/Provider/cost/trust/coverage 的 Query Workbench。
+
+后端 Task 只交付 API、Schema、错误、Run/事件合同和可供前端开发的 fixture/示例；不创建前端页面，不替前端选择框架。
+
+## 13. Agent、CLI 与运行可观测性
+
+固定调用形式：
+
+```bash
+omnihub search --query "..." --source github --format json
+omnihub latest --collection daily --identity-dedupe exact --format json
+omnihub doctor --channel channel_x_official --format json
+```
+
+- Skill 要求 Agent 原样调用稳定 CLI/MCP Tool，不再包一层自由脚本。
+- stdout 是结果，stderr 是日志；JSONL 必须包含 start/channel/item/end event，不能只有 Item。
+- 每次调用有 request ID；Channel event 记录 template、provider、query scope、selection、终态和耗时。
+- Host 观察 Tool Call 即可知道 Agent 是否使用 OmniHub、搜索了什么范围；最终答案仍由 Agent 返回具体引用和 partial/coverage 限制。
+- `doctor` 的状态层级为 template-declared → channel-configured → dependency-installed → browser-permission-granted → credential-resolved → endpoint-reachable → channel-probed。
+
+## 14. Credential、Chrome Browser Bridge 与本机信任
+
+- Dashboard 直接 CRUD API Key/Token Credential，值原样保存在本机 SQLite。列表返回掩码；detail 可在 `include_value=true` 时回显并使用 `Cache-Control: no-store`。日志、Run、Error、readiness 与默认 export 始终脱敏。
+- `chrome_cookie` Credential 不保存 Cookie。Chrome Extension 在用户手势下请求目标 origin 的 optional host permission，以 `chrome.cookies` 按 Channel Execute/Probe 读取 RouteTemplate allowlist；禁止 `<all_urls>` 常驻权限、`debugger`、默认 Profile CDP、Cookie SQLite 扫描或自行 OS 解密。
+- Extension 通过 `connectNative()` 与 `omnihub chrome-host` 维持可重连 Port。Host 暴露当前 OS 用户专属的 Unix socket/Windows named pipe，CLI 与 `serve` 的 Browser Bridge Client 都可请求当前 execution；Chrome 依据 Host manifest 的 `allowed_origins` 限制固定 Extension ID，Host 不信任 payload 自报身份。
+- Login URL、origin 与 cookie name 必须来自受信任 RouteTemplate。Chrome origin permission 可以被同一当前 Profile 中、allowlist 为其子集的多个 Channel 复用；Cookie 只进入当前 Adapter 内存，结束即释放。
+- Channel health 同时保留 `desired_state`、派生 `readiness`、带 TTL 的 `checks[]`、`action_required` 与独立 `last_execution`。登录成功、Extension 已连接或 Endpoint 200 都不能单独产生 ready；Bridge 断开以 `checks.browser_bridge.code=browser_unavailable` 表达，readiness 为 `blocked` 或保留近期成功证据时的 `degraded`。
+- `serve` 只监听 loopback，并校验 Host/Origin/CORS；个人 MVP 不增加 Dashboard 登录、bootstrap secret 或 session/CSRF 系统。能读 SQLite 的本机账号能读 API Key，这是明确的信任前提；开放非 loopback 监听需要重新 Shape。
+- 撤销 Chrome origin permission 会阻断依赖 Channel，但不修改网站 Cookie。修改/删除 API Key Credential 会更新 revision 或阻断依赖 Channel。
+- Remote RSSHub/Tavily 等 Profile 标记 trust，提示查询会离开本机。
+- HTTP 重定向、私网访问、响应大小、解压比例、Content-Type 和 timeout 受限。
+- Command executable 必须由用户本机配置；argv 不经 shell；远程 Bundle 不得启用 executable。
+- Authorization、Cookie、access key/code 与敏感 query 参数在日志、error 和 trace 中统一脱敏。
+- `twscrape` 只有在用户明确配置并接受账号/cookie与平台条款风险时启用；永不作为 xurl 鉴权失败后的自动回退。
+
+## 15. v1 纵切矩阵
+
+| Source/场景 | 首选 Channel（RouteTemplate） | 备选/作用 | 主要验证点 |
+|---|---|---|---|
+| 任意 Feed、V2EX、linux.do | Direct Feed | RSSHub 可选 | Feed parse、conditional GET、window coverage |
+| V2EX | Direct Atom Channel | RSSHub latest Channel | 同 Source 多 Channel、fallback、Endpoint optional |
+| GitHub | Native API/`gh` | Tavily discovery | search、pagination、rate limit、metadata |
+| Open Web | Tavily | 无 | Provider 与目标 Source、candidate coverage |
+| X | xurl command/MCP | RSSHub latest；twscrape opt-in | 官方 recent search、auth、第三方边界 |
+| NodeSeek | 当前 unavailable probe | 用户配置第三方 Feed | 不能把 Manifest/URL 当 readiness |
+
+arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充 Source Bundle，不阻塞核心 v1。
+
+## 16. 当前取舍表
+
+| 设计点 | 当前建议 | 代价 | 状态 |
+|---|---|---|---|
+| 技术底座 | Go 单二进制 + SQLite Repository；未来 MySQL Store | 现在需认真定义事务/ID/revision；不维护第二实现 | 已确认 |
+| 运行平面 | Query 无状态 + Subscription 有状态 | 两种运行模式需清楚文档 | 已确认 |
+| Feed 新鲜度 | stale-while-revalidate + 显式/外部调度 | 不提供一站式 scheduler/监控 | 已确认 |
+| 个性化来源 | Direct Feed 与 RSSHub Channel/参数均可管理 | 管理 API 与配置校验面扩大 | 已确认 |
+| Dashboard | loopback 单实例；Credential/Channel/配置管理 + Query Workbench；Run 轮询；前端独立 | 信任本机账号与 SQLite 权限 | 已确认 |
+| Channel | RouteTemplate 静态只读，Channel 才可配置、授权、探测和执行 | 新增配置与健康读模型 | 已确认 |
+| API Key | Dashboard 录入，SQLite 原样保存；列表掩码，detail 仅在 `include_value=true` 时完整回显 | 数据库备份可读到 Key | 已确认 |
+| Chrome 授权 | MV3 optional host permission + cookies API + connectNative 长连接；每次执行直接读 | Chrome/Bridge 离线时 Channel blocked | 已确认 |
+| RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
+| 扩展 | Built-in + Manifest + command/MCP | 要维护 mapping schema；不另造协议 | 已确认 |
+| 去重 | identity 默认；similarity 只分组 | 相似内容仍会占多条 | 已确认 |
+| v1 纵切 | Feed、V2EX/RSSHub、GitHub、Tavily、X/xurl | 首版不宣称大量平台 ready | 已确认 |
+| 测试文件 | 允许必要 `*_test.go`、Repository contract test 与 fixture | 增加维护量但形成可重放合同证据 | 已确认 |

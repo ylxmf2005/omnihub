@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/omnihub
+/omnihub.exe
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
