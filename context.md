@@ -9,7 +9,7 @@
 ## Reality Coordinates
 
 - 实际对象：计划中的独立项目 `/Users/ethan/Desktop/omnihub`；目标 GitHub 仓库为 `ylxmf2005/omnihub`。
-- 基线：本地只有本轮生成的 Shape 产物，没有实现、Git 历史或运行基线；远程目标仓库尚不存在。
+- 初始基线：本地只有 Shape 产物，没有实现、Git 历史或运行基线，远程目标仓库不存在。当前已创建公开仓库 `https://github.com/ylxmf2005/omnihub`，`main` 首个 Stage 0 提交为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
 - 调查基线：已冷读 AstaNews、`ylxmf2005/mol-news`、`deqiying/onesearch`、`mcncarl/yichen-skills`、RSSHub、FreshRSS、Miniflux、RSS-Bridge 与 SearXNG，并对照 JSON Feed、OPML、MCP、Singer State 和 RFC 9457。
 - 已验证的来源现实：V2EX Direct Atom 与 linux.do Direct RSS 在当前环境可取；RSSHub 当前存在 V2EX Route。NodeSeek 主站和第三方 Feed 在当前环境受到 TLS/403 限制，不能仅凭配置宣称可用。
 - X 的当前候选：优先接入 X 官方维护的 `xurl`，它提供 recent search、JSON 输出与 MCP bridge，但要求用户自己的 X Developer App；`twscrape` 只作为用户明确授权 cookie/account 后的可选 Provider，不自动回退。
@@ -70,4 +70,4 @@
 - `shape/contract.md`：`ready`，统一请求/结果、RouteTemplate/Channel、Credential、Chrome Bridge、Run、Dashboard 管理资源与出口映射。
 - `shape/design.md`：`ready`，Query/Subscription 双平面、Repository/SQLite、Channel 管理、Chrome Companion、Dashboard、刷新和安全设计。
 - `plan.md`：`ready`，从合同/Repository spike、Dashboard Backend 到 v1 候选发布的分阶段路线。
-- `dev/implementation.md`：`partial`，Stage 0 四个 spike 已实现并有聚焦反馈；远程仓库发布和后续 Stage 尚未完成。
+- `dev/implementation.md`：`ready`，Stage 0 四个 spike 已实现、验证、提交并推送；Stage 1+ 尚未实施。

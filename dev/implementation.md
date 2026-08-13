@@ -2,7 +2,7 @@
 
 ## 实际交付
 
-- 对象与基线：`/Users/ethan/Desktop/omnihub` 原先只有 ready Shape 文档，没有 Git、远程仓库或实现；本轮建立 Go 项目和本地 Git 基线，目标远程为 `ylxmf2005/omnihub`。
+- 对象与基线：`/Users/ethan/Desktop/omnihub` 原先只有 ready Shape 文档，没有 Git、远程仓库或实现；本轮建立 Go 项目与公开仓库 `https://github.com/ylxmf2005/omnihub`，`main` 首个 Stage 0 提交为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
 - 已实现行为：统一领域模型可生成 JSON Schema、CLI manifest、OpenAPI 3.1 与 MCP Tool Schema；command/MCP binding 产出相同 Adapter Result；SQLite 支持 Snapshot/checkpoint 原子事务、Run 幂等/CAS/lease 和 Credential revision 状态隔离。
 - 根因与实现边界：Stage 0 要证明合同和状态不变量可落地，因此实现止于四个 spike，不提前进入 Router、真实 Provider、Dashboard 或 Chrome Bridge。
 
@@ -29,6 +29,7 @@
 - `go vet ./...`：通过。
 - `go run ./cmd/omnihub schema`：输出可解析的合同产物。
 - `CGO_ENABLED=0 GOOS=<darwin|linux|windows> GOARCH=<arm64|amd64> go build ./cmd/omnihub`：macOS arm64、Linux amd64、Windows amd64 均可交叉构建；只证明构建，不证明异平台运行。
+- `git push -u origin main` 与 `git ls-remote --heads origin main`：本地 HEAD 和远程 `main` 均为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
 
 ## 证据边界与交接
 
