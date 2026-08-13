@@ -23,7 +23,7 @@
 - Chrome 现实：普通 localhost Dashboard 受同源与 HttpOnly 限制，无法读取其他站点 Cookie；可支持的正式路径是 Chrome MV3 Companion Extension 请求 optional host permission，通过 `chrome.cookies` 按执行直接读取，再经长连接 Native Messaging 与当前用户专属 IPC 交给 CLI/`serve`。Chrome 105+ 在 `connectNative()` 端口存活时会保持 Extension Service Worker；Chrome 关闭或 Bridge 断开时，依赖 Cookie 的 Channel 必须明确不可用。
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
-- 实施权限：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；用户随后要求继续，当前进入 `plan.md` Stage 0，允许创建独立仓库、初始化 Git、写实现，并新增必要的 `*_test.go`、Repository contract tests 与合同 fixture。该授权不提前扩大到 Stage 1+ 的真实 Provider、Dashboard 前端或 Chrome Extension 客户端。
+- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0 已提交并推送，Stage 1 的 Core、Registry、Router、readiness、SQLite user catalog 与诊断 CLI 已实现并完成 Test/Review。授权仍不扩大到 Stage 2+ 的真实 Provider、Dashboard 前端或 Chrome Extension 客户端。
 
 ## Goal
 
@@ -70,4 +70,7 @@
 - `shape/contract.md`：`ready`，统一请求/结果、RouteTemplate/Channel、Credential、Chrome Bridge、Run、Dashboard 管理资源与出口映射。
 - `shape/design.md`：`ready`，Query/Subscription 双平面、Repository/SQLite、Channel 管理、Chrome Companion、Dashboard、刷新和安全设计。
 - `plan.md`：`ready`，从合同/Repository spike、Dashboard Backend 到 v1 候选发布的分阶段路线。
-- `dev/implementation.md`：`ready`，Stage 0 四个 spike 已实现、验证、提交并推送；Stage 1+ 尚未实施。
+- `dev/implementation.md`：`ready`，Stage 1 Core、Registry、Router、readiness、SQLite v2 与诊断 CLI 的实际实现和边界。
+- `test/test-plan.md`：`completed`，Stage 1 风险模型、真实 CLI/SQLite 重放与完整质量闸。
+- `test/test-report.md`：`passed`，最终对象可按 Stage 1 承诺交付；范围外能力与证据边界已具名。
+- `review/review.md`：`approve`，相对 `5442559232e9c39608ce99b2f3cbf98af9406389` 的完整工作树无未解决 finding。

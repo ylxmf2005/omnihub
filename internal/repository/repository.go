@@ -31,6 +31,9 @@ type Store interface {
 	UpdateCredential(context.Context, UpdateCredential) (core.Credential, error)
 	UpdateCredentialAndState(context.Context, UpdateCredentialAndState) (core.Credential, error)
 	GetCredential(context.Context, string) (core.Credential, error)
+	ListCredentials(context.Context) ([]core.Credential, error)
+	SaveRoutingCatalog(context.Context, SaveRoutingCatalog) (core.RoutingCatalog, error)
+	LoadRoutingCatalog(context.Context) (core.RoutingCatalog, error)
 }
 
 type RefreshCommit struct {
@@ -82,6 +85,11 @@ type UpdateCredential struct {
 type UpdateCredentialAndState struct {
 	Credential UpdateCredential
 	State      core.ChannelCheckpoint
+}
+
+type SaveRoutingCatalog struct {
+	ExpectedRevision int64
+	Catalog          core.RoutingCatalog
 }
 
 type FaultPoint string

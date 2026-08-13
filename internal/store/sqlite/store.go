@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -20,6 +21,8 @@ type Store struct {
 	fault repository.FaultInjector
 }
 
+var _ repository.Store = (*Store)(nil)
+
 type Option func(*Store)
 
 func WithFaultInjector(injector repository.FaultInjector) Option {
@@ -31,11 +34,24 @@ func WithFaultInjector(injector repository.FaultInjector) Option {
 func Open(ctx context.Context, path string, options ...Option) (*Store, error) {
 	if path != ":memory:" {
 		directory := filepath.Dir(path)
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return nil, fmt.Errorf("create database directory: %w", err)
+		createdDirectory := false
+		info, err := os.Stat(directory)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				return nil, fmt.Errorf("create database directory: %w", err)
+			}
+			createdDirectory = true
+		} else if err != nil {
+			return nil, fmt.Errorf("inspect database directory: %w", err)
+		} else if !info.IsDir() {
+			return nil, fmt.Errorf("database directory path is not a directory: %s", directory)
 		}
-		if err := os.Chmod(directory, 0o700); err != nil {
-			return nil, fmt.Errorf("protect database directory: %w", err)
+		// 只收紧 OmniHub 自己新建的目录；用户通过 OMNIHUB_DATABASE 指定的
+		// 已有父目录可能与其他应用共享，不能由一次数据库打开改写其权限。
+		if createdDirectory {
+			if err := os.Chmod(directory, 0o700); err != nil {
+				return nil, fmt.Errorf("protect database directory: %w", err)
+			}
 		}
 	}
 
@@ -63,18 +79,84 @@ func Open(ctx context.Context, path string, options ...Option) (*Store, error) {
 	return store, nil
 }
 
+// SchemaVersion 只读取现有 SQLite header/version，不创建文件、不迁移、
+// 不切换 journal mode，也不修改路径权限。
+func SchemaVersion(ctx context.Context, path string) (int, error) {
+	db, err := sql.Open("sqlite", readOnlyDSN(path))
+	if err != nil {
+		return 0, fmt.Errorf("open SQLite read-only: %w", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read SQLite schema version: %w", err)
+	}
+	return version, nil
+}
+
+// OpenReadOnly 打开已由写入路径初始化的数据库。它不运行 migration、WAL
+// 配置或 chmod，供 Registry/Doctor/Plan 等观察入口使用。
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	db, err := sql.Open("sqlite", readOnlyDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("open SQLite read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open SQLite read-only: %w", err)
+	}
+	return &Store{db: db}, nil
+}
+
+func readOnlyDSN(path string) string {
+	return "file:" + url.PathEscape(path) + "?mode=ro"
+}
+
 func (store *Store) Close() error {
 	return store.db.Close()
 }
 
 func (store *Store) initialize(ctx context.Context) error {
-	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
-		return fmt.Errorf("set SQLite schema version: %w", err)
-	}
-	statements := []string{
+	// 先配置仅作用于当前连接的选项，再读取版本。journal_mode 会持久改写
+	// 数据库，因此必须等确认文件不是未知 future schema 后才能切换。
+	connectionSettings := []string{
 		`PRAGMA foreign_keys = ON`,
-		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
+	}
+	for _, statement := range connectionSettings {
+		if _, err := store.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("configure SQLite: %w", err)
+		}
+	}
+
+	var version int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read SQLite schema version: %w", err)
+	}
+	if version > 2 {
+		return fmt.Errorf("SQLite schema version %d is newer than supported version 2", version)
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
+		return fmt.Errorf("configure SQLite: %w", err)
+	}
+	if version == 0 {
+		if err := store.migrateV1(ctx); err != nil {
+			return err
+		}
+		version = 1
+	}
+	if version == 1 {
+		if err := store.migrateV2(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) migrateV1(ctx context.Context) error {
+	statements := []string{
 		`CREATE TABLE IF NOT EXISTS view_snapshots (
 			id TEXT PRIMARY KEY,
 			view_id TEXT NOT NULL,
@@ -121,12 +203,137 @@ func (store *Store) initialize(ctx context.Context) error {
 			CHECK(auth_kind != 'chrome_cookie' OR value IS NULL)
 		)`,
 	}
+	return store.runMigration(ctx, 1, statements)
+}
+
+func (store *Store) migrateV2(ctx context.Context) error {
+	return store.runMigration(ctx, 2, []string{
+		`CREATE TABLE routing_catalog (
+			id INTEGER PRIMARY KEY CHECK(id = 1),
+			revision INTEGER NOT NULL CHECK(revision > 0),
+			catalog_json BLOB NOT NULL,
+			updated_at_ns INTEGER NOT NULL
+		)`,
+	})
+}
+
+func (store *Store) runMigration(ctx context.Context, version int, statements []string) error {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin SQLite migration %d: %w", version, err)
+	}
 	for _, statement := range statements {
-		if _, err := store.db.ExecContext(ctx, statement); err != nil {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("initialize SQLite: %w", err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("set SQLite schema version %d: %w", version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit SQLite migration %d: %w", version, err)
+	}
 	return nil
+}
+
+// routingCatalogPayload 只保存用户可编辑的 Registry 资源。聚合 revision 由表列独立维护，
+// builtin Source、Provider、RouteTemplate 和 Credential 因而不会混入可编辑 JSON。
+type routingCatalogPayload struct {
+	Endpoints   []core.EndpointProfile `json:"endpoints"`
+	Channels    []core.Channel         `json:"channels"`
+	Collections []core.Collection      `json:"collections"`
+	Overlays    []core.TemplateOverlay `json:"overlays"`
+}
+
+func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.SaveRoutingCatalog) (core.RoutingCatalog, error) {
+	if input.ExpectedRevision < 0 {
+		return core.RoutingCatalog{}, repository.ErrConflict
+	}
+	if err := input.Catalog.ValidateForStorage(); err != nil {
+		return core.RoutingCatalog{}, err
+	}
+	payload, err := json.Marshal(routingCatalogPayload{
+		Endpoints:   input.Catalog.Endpoints,
+		Channels:    input.Catalog.Channels,
+		Collections: input.Catalog.Collections,
+		Overlays:    input.Catalog.Overlays,
+	})
+	if err != nil {
+		return core.RoutingCatalog{}, fmt.Errorf("encode routing catalog: %w", err)
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.RoutingCatalog{}, fmt.Errorf("begin routing catalog save: %w", err)
+	}
+	rollback := func() { _ = tx.Rollback() }
+
+	var result sql.Result
+	if input.ExpectedRevision == 0 {
+		// revision=0 只表示首次创建；已有 singleton row 时必须作为冲突返回。
+		result, err = tx.ExecContext(ctx, `INSERT INTO routing_catalog(id, revision, catalog_json, updated_at_ns)
+			VALUES(1, 1, ?, ?) ON CONFLICT(id) DO NOTHING`, payload, timeValue(time.Now()))
+	} else {
+		// 单条 UPDATE 同时校验 revision、替换完整 JSON 并推进 revision，避免并发写入部分生效。
+		result, err = tx.ExecContext(ctx, `UPDATE routing_catalog
+			SET revision = revision + 1, catalog_json = ?, updated_at_ns = ?
+			WHERE id = 1 AND revision = ?`, payload, timeValue(time.Now()), input.ExpectedRevision)
+	}
+	if err != nil {
+		rollback()
+		return core.RoutingCatalog{}, fmt.Errorf("save routing catalog: %w", err)
+	}
+	if err := requireUpdate(result); err != nil {
+		rollback()
+		return core.RoutingCatalog{}, repository.ErrConflict
+	}
+
+	// 在同一事务中回读本次 CAS 产生的 revision 与 payload。提交后另一个进程
+	// 即使立即写入，也不能让当前调用者拿到别人的保存结果。
+	row := tx.QueryRowContext(ctx, `SELECT revision, catalog_json FROM routing_catalog WHERE id = 1`)
+	saved, err := scanRoutingCatalog(row)
+	if err != nil {
+		rollback()
+		return core.RoutingCatalog{}, fmt.Errorf("read saved routing catalog: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return core.RoutingCatalog{}, fmt.Errorf("commit routing catalog save: %w", err)
+	}
+	return saved, nil
+}
+
+func (store *Store) LoadRoutingCatalog(ctx context.Context) (core.RoutingCatalog, error) {
+	row := store.db.QueryRowContext(ctx, `SELECT revision, catalog_json FROM routing_catalog WHERE id = 1`)
+	return scanRoutingCatalog(row)
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanRoutingCatalog(row rowScanner) (core.RoutingCatalog, error) {
+	var revision int64
+	var encoded []byte
+	if err := row.Scan(&revision, &encoded); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return core.RoutingCatalog{}, nil
+		}
+		return core.RoutingCatalog{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+
+	var payload routingCatalogPayload
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return core.RoutingCatalog{}, fmt.Errorf("decode routing catalog: %w", err)
+	}
+	return core.RoutingCatalog{
+		Revision:    revision,
+		Endpoints:   payload.Endpoints,
+		Channels:    payload.Channels,
+		Collections: payload.Collections,
+		Overlays:    payload.Overlays,
+	}, nil
 }
 
 func (store *Store) CommitViewRefresh(ctx context.Context, commit repository.RefreshCommit) error {
@@ -308,6 +515,15 @@ func (store *Store) FinishRun(ctx context.Context, input repository.FinishRun) (
 	if !isTerminal(input.Status) {
 		return core.Run{}, repository.ErrInvalidState
 	}
+	if input.Status == core.RunCancelled {
+		if input.Result != nil {
+			return core.Run{}, repository.ErrInvalidState
+		}
+	} else {
+		if input.Result == nil || input.Result.Validate() != nil || core.RunStatus(input.Result.Status) != input.Status {
+			return core.Run{}, repository.ErrInvalidState
+		}
+	}
 	resultJSON, err := json.Marshal(input.Result)
 	if err != nil {
 		return core.Run{}, fmt.Errorf("encode run result: %w", err)
@@ -418,6 +634,28 @@ func (store *Store) GetCredential(ctx context.Context, id string) (core.Credenti
 	return getCredential(ctx, store.db, id)
 }
 
+func (store *Store) ListCredentials(ctx context.Context) ([]core.Credential, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT id, provider, auth_kind, label, value, enabled, revision, created_at_ns, updated_at_ns
+		FROM credentials ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list credentials: %w", err)
+	}
+	defer rows.Close()
+
+	credentials := make([]core.Credential, 0)
+	for rows.Next() {
+		credential, err := scanCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list credentials: %w", err)
+	}
+	return credentials, nil
+}
+
 type credentialExecutor interface {
 	checkpointExecutor
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -426,6 +664,10 @@ type credentialExecutor interface {
 func getCredential(ctx context.Context, executor credentialExecutor, id string) (core.Credential, error) {
 	row := executor.QueryRowContext(ctx, `SELECT id, provider, auth_kind, label, value, enabled, revision, created_at_ns, updated_at_ns
 		FROM credentials WHERE id = ?`, id)
+	return scanCredential(row)
+}
+
+func scanCredential(row scanner) (core.Credential, error) {
 	var credential core.Credential
 	var value sql.NullString
 	var created, updated int64

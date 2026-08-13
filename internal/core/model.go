@@ -136,16 +136,17 @@ const (
 
 // Envelope 是同步执行和持久 Run 终态共享的结果模型。
 type Envelope struct {
-	SchemaVersion string       `json:"schema_version"`
-	RequestID     string       `json:"request_id"`
-	Status        Status       `json:"status"`
-	Request       Operation    `json:"request"`
-	Executions    []Execution  `json:"executions"`
-	Items         []Item       `json:"items"`
-	Coverage      []Coverage   `json:"coverage"`
-	Errors        []Error      `json:"errors"`
-	Continuation  Continuation `json:"continuation"`
-	Meta          Meta         `json:"meta"`
+	SchemaVersion      string       `json:"schema_version"`
+	RequestID          string       `json:"request_id"`
+	Status             Status       `json:"status"`
+	Request            Operation    `json:"request"`
+	SelectedChannelIDs []string     `json:"selected_channel_ids"`
+	Executions         []Execution  `json:"executions"`
+	Items              []Item       `json:"items"`
+	Coverage           []Coverage   `json:"coverage"`
+	Errors             []Error      `json:"errors"`
+	Continuation       Continuation `json:"continuation"`
+	Meta               Meta         `json:"meta"`
 }
 
 type Status string
@@ -163,7 +164,7 @@ type Execution struct {
 	Provider        string          `json:"provider"`
 	Endpoint        string          `json:"endpoint,omitempty"`
 	Capability      string          `json:"capability"`
-	Selection       string          `json:"selection"`
+	Selection       Selection       `json:"selection"`
 	Status          ExecutionStatus `json:"status"`
 	Reason          *string         `json:"reason,omitempty"`
 	StartedAt       time.Time       `json:"started_at"`
@@ -173,6 +174,16 @@ type Execution struct {
 	Auth            ExecutionAuth   `json:"auth"`
 	Limitations     []string        `json:"limitations,omitempty"`
 }
+
+type Selection string
+
+const (
+	SelectionCandidate Selection = "candidate"
+	SelectionPrimary   Selection = "primary"
+	SelectionPreferred Selection = "preferred"
+	SelectionAggregate Selection = "aggregate"
+	SelectionFallback  Selection = "fallback"
+)
 
 type ExecutionAuth struct {
 	Required     bool   `json:"required"`
@@ -285,7 +296,7 @@ type Coverage struct {
 }
 
 type Error struct {
-	Code            string         `json:"code"`
+	Code            ErrorCode      `json:"code"`
 	Message         string         `json:"message"`
 	Source          string         `json:"source,omitempty"`
 	Provider        string         `json:"provider,omitempty"`
@@ -296,10 +307,29 @@ type Error struct {
 	Details         map[string]any `json:"details,omitempty"`
 }
 
+// ErrorCode 是所有出口共享的稳定错误分类；Details 只补充脱敏上下文，不能替代分类。
+type ErrorCode string
+
+const (
+	ErrorParameter          ErrorCode = "parameter_error"
+	ErrorConfig             ErrorCode = "config_error"
+	ErrorAuth               ErrorCode = "auth_error"
+	ErrorRateLimit          ErrorCode = "rate_limited"
+	ErrorTimeout            ErrorCode = "timeout"
+	ErrorNetwork            ErrorCode = "network_error"
+	ErrorUpstream           ErrorCode = "upstream_error"
+	ErrorProtocol           ErrorCode = "protocol_error"
+	ErrorParse              ErrorCode = "parse_error"
+	ErrorInternal           ErrorCode = "internal_error"
+	ErrorBrowserUnavailable ErrorCode = "browser_unavailable"
+	ErrorBrowserPermission  ErrorCode = "browser_permission_missing"
+	ErrorCookieMissing      ErrorCode = "cookie_missing"
+)
+
 type Continuation struct {
 	Token       *string  `json:"token,omitempty"`
 	Mode        string   `json:"mode"`
-	Limitations []string `json:"limitations,omitempty"`
+	Limitations []string `json:"limitations"`
 }
 
 type Meta struct {

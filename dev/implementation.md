@@ -1,38 +1,38 @@
-# Implementation：OmniHub Stage 0 基础设施
+# Implementation：OmniHub Stage 1 Core、Registry、Router 与诊断骨架
 
 ## 实际交付
 
-- 对象与基线：`/Users/ethan/Desktop/omnihub` 原先只有 ready Shape 文档，没有 Git、远程仓库或实现；本轮建立 Go 项目与公开仓库 `https://github.com/ylxmf2005/omnihub`，`main` 首个 Stage 0 提交为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
-- 已实现行为：统一领域模型可生成 JSON Schema、CLI manifest、OpenAPI 3.1 与 MCP Tool Schema；command/MCP binding 产出相同 Adapter Result；SQLite 支持 Snapshot/checkpoint 原子事务、Run 幂等/CAS/lease 和 Credential revision 状态隔离。
-- 根因与实现边界：Stage 0 要证明合同和状态不变量可落地，因此实现止于四个 spike，不提前进入 Router、真实 Provider、Dashboard 或 Chrome Bridge。
+- 对象与基线：`/Users/ethan/Desktop/omnihub` 的 `main` 工作树，相对 `5442559232e9c39608ce99b2f3cbf98af9406389` 实现 Stage 1；该基线与开始实施时的 `origin/main` 一致。
+- 已实现行为：Core 可以严格校验 Operation、生成 `req_` UUIDv4、施加 deadline，并用已选 Channel 的唯一运行终态聚合 `complete | partial | failed` Envelope；Registry 从 builtin、严格 `sources.yaml` 与 SQLite user catalog 装配声明和配置；Router 可确定性执行 `auto/prefer/only/exclude/aggregate/fallback`；Doctor 只在有真实证据时提升 readiness。
+- 根因与实现边界：Stage 1 要在不访问真实上游的前提下固定请求、配置、选择与诊断语义，因此实现止于声明装配、只读诊断、路由计划和 Repository 合同。`plan` 固定输出 `upstream_executed:false`；`search/latest/fetch` 执行 CLI、真实 Adapter、服务端与 Dashboard 仍属后续阶段。
 
 ## 变更
 
-- `internal/core`：统一 Operation、Envelope、Adapter Result 与管理资源模型，提供 Operation 运行时校验。
-- `internal/transport`：从同一模型投影 JSON Schema、CLI、OpenAPI 与 MCP Tool 合同。
-- `internal/adapter`：固定 argv command binding 和标准 MCP discovery/call binding。
-- `internal/repository`、`internal/store/sqlite`：领域 Repository、Snapshot/checkpoint 事务、Run 生命周期与 Credential revision。
-- `cmd/omnihub`：提供 `omnihub schema` 可重放入口。
-- `README.md`：只呈现当前已实现能力、验证命令和未实现边界。
+- `internal/core`：增加稳定 ErrorCode/Selection、request lifecycle、Envelope builder/validator，以及 RoutingCatalog 的存储期不变量；拒绝 Stage 1 尚不能兑现的 domain scope 与 continuation。
+- `internal/registry`：建立不可原地修改的 builtin Catalog、严格单文档 `sources.yaml` 导入、builtin 冲突保护、user overlay/Channel/Endpoint/Credential/Collection 装配和 imported Cookie Template 信任提升。
+- `internal/router`：实现过滤、preflight、确定性 priority 排序、每 Source 首选/聚合与基于当前 Plan 的无重复 fallback；selected 与 skipped 保存可解释 reason 和真实 preflight 状态。
+- `internal/readiness`：区分声明、配置、Endpoint、Credential、信任和依赖层；Stage 1 未执行真实 probe 时固定返回 `unknown/dependency_not_probed`，不伪报 ready。
+- `internal/store/sqlite` 与 `internal/repository`：增加 v1→v2 migration、RoutingCatalog 快照/CAS、Credential 列表供内部 preflight 使用、Run 终态 Envelope 校验和只读 `mode=ro` 打开；拒绝 future schema 前不持久修改数据库。
+- `cmd/omnihub`：增加 `sources/providers/route-templates/channels/doctor --json/plan`，严格读取单个 Operation；只读命令在 DB 缺失时不创建路径，对已有库不 migration、切 WAL 或 chmod；参数、配置和内部错误分别返回 3、4、1。
+- `internal/transport`、`shape/contract.md` 与 `README.md`：把局部合同约束投影到 Schema，修正可由 Router 产生的 Envelope 示例，并明确跨数组/聚合语义由 `Envelope.Validate()` 权威校验。
 
 ## 偏离与决定
 
-- SQLite 采用纯 Go `modernc.org/sqlite`，避免单二进制跨平台发布依赖 CGO。
-- 当前数据库 Schema 从未发布，也不存在承诺兼容的用户库；首次版本从 `PRAGMA user_version=1` 起步，后续结构变化必须通过 migration，不兼容此前开发中的临时表结构。
-- Stage 0 用独立 `AdapterResult` 固定 command/MCP 等价语义；Provider 私有 cursor 暂用 `provider_state` 保存，尚不构成公共 continuation。
-- 旧 Credential revision 的 state 保留待后续 retention 清理；当前只保证新执行无法读取旧 revision。
+- imported 配置采用严格的单一 `sources.yaml`，而不是宽松 JSON/YAML 多入口。Bundle 只含静态 Source/Provider/RouteTemplate；user Channel 与 Credential 仍由 SQLite 管理。
+- SQLite Schema 从 v1 迁移到 v2 保存完整 user routing snapshot。读取型 CLI 不自动初始化或迁移，避免一次诊断命令改写用户状态。
+- JSON Schema 约束字段结构、枚举、局部条件与非空集合；动态 Channel ID 跨数组对应、唯一运行终态、聚合 status 与 meta 一致性无法由通用 JSON Schema 完整表达，继续由 `Operation.Validate()` / `Envelope.Validate()` 在生产和持久化边界强制执行。
+- 评审发现的 priority 极值溢出、aggregate fallback 重复、future DB 拒绝前 WAL 改写、camelCase secret 键绕过、preflight 成功仍为 false、合同示例与退出码漂移均已沿原触发输入修复并重测。
 
 ## 聚焦反馈
 
-- `go test ./...`：领域校验、Schema 投影、binding 等价、事务故障回滚、Run lease 和 Credential revision 测试通过。
-- `go test -race ./...`：当前包全部通过 race feedback。
-- `go vet ./...`：通过。
-- `go run ./cmd/omnihub schema`：输出可解析的合同产物。
-- `CGO_ENABLED=0 GOOS=<darwin|linux|windows> GOARCH=<arm64|amd64> go build ./cmd/omnihub`：macOS arm64、Linux amd64、Windows amd64 均可交叉构建；只证明构建，不证明异平台运行。
-- `git push -u origin main` 与 `git ls-remote --heads origin main`：本地 HEAD 和远程 `main` 均为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
+- `go test ./... -count=1` 与 `go test -race ./... -count=1`：全部包通过；Core/Registry/Router/Readiness/SQLite/Transport 的新增行为均有回归覆盖。
+- `go vet ./...`、`gofmt -l cmd internal` 与 `git diff --check`：通过，无格式、静态检查或空白错误。
+- 编译后的本机 CLI：缺失 DB 时 `schema/paths/sources/providers/route-templates/channels/doctor` 返回有效 JSON且不创建配置/状态路径；README Bundle 可导入，未知字段等非法 Bundle 以配置错误拒绝。
+- SQLite v2 fixture：`channels/doctor/plan` 能读取 user Channel 与 Credential preflight，但输出不包含 Credential value；只读前后 DB 与活跃 WAL/SHM 的权限、大小、时间、inode 和哈希不变。
+- `CGO_ENABLED=0 GOOS=<darwin|linux|windows> GOARCH=<arm64|amd64> go build ./cmd/omnihub`：macOS arm64、Linux amd64、Windows amd64 均交叉构建成功；只证明编译，不证明异平台运行。
 
 ## 证据边界与交接
 
-- 尚未证明：真实 Feed/RSSHub/GitHub/Tavily/X、完整 HTTP/MCP Server、Linux/Windows 运行、Windows 当前用户 ACL、Dashboard、Chrome Extension/Bridge 和远程部署。
-- 剩余风险：当前 Schema 只保证公共字段与枚举一致，跨出口的条件必填仍由 `Operation.Validate` 承担；Stage 1 若新增字段必须保持同一事实源。
-- 下一入口：按 `plan.md` Stage 1 实现 Core、Registry、Router 与诊断骨架，先保持固定 registry，不批量添加 Source Manifest。
+- 尚未证明：真实 RSS/Atom/JSON Feed、RSSHub、GitHub、Tavily、X，上游执行 CLI，HTTP/MCP Server，Dashboard/Chrome Bridge，Linux/Windows 运行和 Windows 当前用户 ACL。
+- 剩余风险：Stage 1 还没有公开写入 Channel/Credential 的 CLI/API，SQLite 写入与 CAS 由 Repository contract test 证明；公共 CLI 只证明读取与诊断。Schema manifest 中的 `search/latest/fetch` 是后续出口合同，不表示真实命令已实现。
+- 下一入口：按 `plan.md` Stage 2 实现 Query Plane + Direct Feed 纵切，并从 V2EX Atom/linux.do RSS 的真实结果端验证 Item、Observation、Coverage、缓存与失败语义。

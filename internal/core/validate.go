@@ -40,6 +40,16 @@ func (operation Operation) Validate() error {
 		return fmt.Errorf("%w: unsupported operation %q", ErrInvalidOperation, operation.Operation)
 	}
 
+	// Stage 1 还没有可供 Router 匹配的 domain 元数据。显式拒绝可以避免把
+	// domain-only 请求静默广播到所有 Channel；后续补齐映射能力后再开放。
+	if len(operation.Scope.Domains) > 0 {
+		return fmt.Errorf("%w: domain scope is not supported", ErrInvalidOperation)
+	}
+	// Stage 1 尚未签发或验证 continuation token。接受任意非空字符串会把
+	// Adapter cursor 误当成 OmniHub token，因此在签发器落地前显式拒绝。
+	if operation.Continuation != nil {
+		return fmt.Errorf("%w: continuation is not supported", ErrInvalidOperation)
+	}
 	if !operation.Scope.hasSelection() {
 		return fmt.Errorf("%w: scope requires a channel, source, provider, domain or collection", ErrInvalidOperation)
 	}
@@ -66,15 +76,30 @@ func (operation Operation) Validate() error {
 }
 
 func (scope Scope) hasSelection() bool {
-	return len(scope.Channels) > 0 || len(scope.Sources) > 0 || len(scope.Providers) > 0 || len(scope.Domains) > 0 || scope.Collection != nil
+	return len(scope.Channels) > 0 || len(scope.Sources) > 0 || len(scope.Providers) > 0 || scope.Collection != nil
 }
 
 func (policy RoutePolicy) validate() error {
 	switch policy.Mode {
-	case RouteAuto, RoutePrefer, RouteOnly, RouteExclude:
+	case RouteAuto:
+	case RoutePrefer:
+		if len(policy.Prefer) == 0 {
+			return fmt.Errorf("%w: prefer mode requires prefer selectors", ErrInvalidOperation)
+		}
+	case RouteOnly:
+		if len(policy.Only) == 0 {
+			return fmt.Errorf("%w: only mode requires only selectors", ErrInvalidOperation)
+		}
+	case RouteExclude:
+		if len(policy.Exclude) == 0 {
+			return fmt.Errorf("%w: exclude mode requires exclude selectors", ErrInvalidOperation)
+		}
 	default:
 		return fmt.Errorf("%w: unsupported route mode %q", ErrInvalidOperation, policy.Mode)
 	}
+
+	// Selector 数组可以组合：auto 可携带 hints，only 与 exclude 也可同时收窄。
+	// mode 只要求其同名数组存在，数组的实际作用由 Router 统一处理。
 	for _, selectors := range [][]RouteSelector{policy.Prefer, policy.Only, policy.Exclude} {
 		for _, selector := range selectors {
 			if selector.Kind != SelectorChannel && selector.Kind != SelectorProvider {

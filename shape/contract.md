@@ -40,9 +40,9 @@
 
 - `operation` 为 `search | latest | fetch`；`health` 通过 doctor/readiness 合同暴露，`refresh` 是 View 编排操作，不是 Provider Capability。
 - `search` 要求 `query`；`fetch` 要求 `target`；`latest` 不接受 query。
-- `scope` 至少给出 Channel、Source、Provider、Domain、Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。
+- `scope` 至少给出 Channel、Source、Provider 或 Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。`domains` 字段为后续通用 Web Search 保留；Stage 1 尚无 domain→Channel 元数据，非空时在上游调用前返回参数错误。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
-- `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。`prefer/only/exclude` 的 selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
+- `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
 - `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | title | content`，分组不删除不同 Item。
 - `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。
 
@@ -51,24 +51,60 @@
 ```json
 {
   "schema_version": "1.0",
-  "request_id": "req_01...",
+  "request_id": "req_123e4567-e89b-42d3-a456-426614174000",
   "status": "partial",
   "request": {
     "schema_version": "1.0",
     "operation": "search",
     "query": "agent search infrastructure",
     "scope": {"sources": ["github"]},
-    "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
+    "route_policy": {"mode": "auto", "aggregate": true, "allow_fallback": true},
     "limit": 20,
     "time_range": {},
     "identity_dedupe": "exact",
     "similarity_grouping": "off",
     "deadline_ms": 30000
   },
-  "executions": [],
+  "selected_channel_ids": ["channel_github_official", "channel_github_tavily"],
+  "executions": [{
+    "channel_id": "channel_github_official",
+    "route_template_id": "github-native-search",
+    "source": "github",
+    "provider": "github-api",
+    "capability": "search",
+    "selection": "aggregate",
+    "status": "completed",
+    "started_at": "2026-08-13T10:00:00Z",
+    "duration_ms": 700,
+    "examined": 10,
+    "returned": 0,
+    "auth": {"required": true, "used": true, "credential_id": "cred_github"}
+  }, {
+    "channel_id": "channel_github_tavily",
+    "route_template_id": "web-via-tavily",
+    "source": "github",
+    "provider": "tavily",
+    "capability": "search",
+    "selection": "aggregate",
+    "status": "failed",
+    "started_at": "2026-08-13T10:00:00Z",
+    "duration_ms": 600,
+    "examined": 0,
+    "returned": 0,
+    "auth": {"required": true, "used": true, "credential_id": "cred_tavily"}
+  }],
   "items": [],
   "coverage": [],
-  "errors": [],
+  "errors": [{
+    "code": "rate_limited",
+    "message": "a secondary selected channel was rate limited",
+    "source": "github",
+    "provider": "tavily",
+    "channel_id": "channel_github_tavily",
+    "route_template_id": "web-via-tavily",
+    "retryable": true,
+    "retry_after_ms": 60000
+  }],
   "continuation": {
     "token": null,
     "mode": "none",
@@ -78,10 +114,12 @@
     "started_at": "2026-08-13T10:00:00Z",
     "finished_at": "2026-08-13T10:00:01Z",
     "duration_ms": 1000,
-    "result_count": 12
+    "result_count": 0
   }
 }
 ```
+
+生成的 Envelope JSON Schema 负责字段、类型、枚举、非空公共集合与可直接表达的局部约束。跨数组的 Channel ID 一致性、每个 `selected_channel_id` 的唯一运行终态、聚合 `status` 与 `meta` 统计一致性由 `Envelope.Validate()` 权威校验；所有出口编码和 Run 持久化前都必须通过该校验，不能把“通过 Schema”解释为已经满足完整终态语义。
 
 `status`：
 
@@ -98,6 +136,7 @@
 ```json
 {
   "route_template_id": "x-xurl-recent-search",
+  "origin": "builtin",
   "source_constraint": {"kind": "exact", "values": ["x"]},
   "provider": "xurl",
   "adapter": "command",

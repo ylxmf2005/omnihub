@@ -1,13 +1,21 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/repository"
+	_ "modernc.org/sqlite"
 )
 
 func TestSnapshotAndCheckpointCommitAtomically(t *testing.T) {
@@ -113,12 +121,35 @@ func TestRunCreateIdempotencyAndLeaseLifecycle(t *testing.T) {
 	if err != nil || renewed.Revision != 3 {
 		t.Fatalf("RenewRun() = %#v, %v", renewed, err)
 	}
-	finished, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: renewed.Revision, InstanceID: "instance-a", Now: now.Add(20 * time.Second), Status: core.RunComplete, Result: &core.Envelope{SchemaVersion: core.SchemaVersion, RequestID: "req_01", Status: core.StatusComplete}})
+	envelope := validRunEnvelope(t, now)
+	finished, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: renewed.Revision, InstanceID: "instance-a", Now: now.Add(20 * time.Second), Status: core.RunComplete, Result: &envelope})
 	if err != nil || finished.Status != core.RunComplete || finished.Revision != 4 || finished.Result == nil || finished.Result.Status != core.StatusComplete {
 		t.Fatalf("FinishRun() = %#v, %v", finished, err)
 	}
 	if _, err := store.RenewRun(ctx, repository.RenewRun{ID: run.ID, ExpectedRevision: finished.Revision, InstanceID: "instance-a", Now: now.Add(30 * time.Second), LeaseUntil: now.Add(time.Minute)}); !errors.Is(err, repository.ErrInvalidState) {
 		t.Fatalf("renew terminal run error = %v, want ErrInvalidState", err)
+	}
+}
+
+func TestFinishRunRejectsInvalidOrMismatchedEnvelope(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	run, _, err := store.CreateRun(ctx, repository.CreateRun{ID: "run_invalid_result", Kind: "query", IdempotencyKey: "invalid-result", PayloadHash: "payload", CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimRun(ctx, repository.ClaimRun{ID: run.ID, ExpectedRevision: run.Revision, InstanceID: "instance-a", Now: now, LeaseUntil: now.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := core.Envelope{SchemaVersion: core.SchemaVersion, RequestID: "req_01", Status: core.StatusComplete}
+	if _, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: claimed.Revision, InstanceID: "instance-a", Now: now.Add(time.Second), Status: core.RunComplete, Result: &invalid}); !errors.Is(err, repository.ErrInvalidState) {
+		t.Fatalf("FinishRun(invalid envelope) error = %v, want ErrInvalidState", err)
+	}
+	valid := validRunEnvelope(t, now)
+	if _, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: claimed.Revision, InstanceID: "instance-a", Now: now.Add(time.Second), Status: core.RunPartial, Result: &valid}); !errors.Is(err, repository.ErrInvalidState) {
+		t.Fatalf("FinishRun(mismatched status) error = %v, want ErrInvalidState", err)
 	}
 }
 
@@ -141,7 +172,8 @@ func TestExpiredRunLeaseCanBeReclaimed(t *testing.T) {
 	if err != nil || reclaimed.Attempt != 2 || reclaimed.ClaimedBy != "instance-b" {
 		t.Fatalf("reclaim = %#v, %v", reclaimed, err)
 	}
-	if _, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: claimed.Revision, InstanceID: "instance-a", Now: now.Add(70 * time.Second), Status: core.RunComplete}); !errors.Is(err, repository.ErrConflict) {
+	envelope := validRunEnvelope(t, now)
+	if _, err := store.FinishRun(ctx, repository.FinishRun{ID: run.ID, ExpectedRevision: claimed.Revision, InstanceID: "instance-a", Now: now.Add(70 * time.Second), Status: core.RunComplete, Result: &envelope}); !errors.Is(err, repository.ErrConflict) {
 		t.Fatalf("old owner finish error = %v, want ErrConflict", err)
 	}
 }
@@ -255,6 +287,193 @@ func TestChromeCookieCredentialNeverStoresValue(t *testing.T) {
 	}
 }
 
+func TestListCredentialsUsesStableOrder(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	for _, id := range []string{"cred_b", "cred_a"} {
+		value := "secret-" + id
+		if _, err := store.CreateCredential(ctx, core.Credential{ID: id, Provider: "fixture", AuthKind: "api_key", Label: id, Value: &value, Enabled: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credentials, err := store.ListCredentials(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(credentials) != 2 || credentials[0].ID != "cred_a" || credentials[1].ID != "cred_b" {
+		t.Fatalf("ListCredentials() = %#v", credentials)
+	}
+}
+
+func TestRoutingCatalogPersistsWithRevisionCAS(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "omnihub.db")
+	store, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSchemaVersion(t, store, 2)
+
+	empty, err := store.LoadRoutingCatalog(ctx)
+	if err != nil || !reflect.DeepEqual(empty, core.RoutingCatalog{}) {
+		t.Fatalf("empty LoadRoutingCatalog() = %#v, %v", empty, err)
+	}
+	initial := routingCatalogFixture("channel_v2ex")
+	saved, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: initial})
+	if err != nil || saved.Revision != 1 {
+		t.Fatalf("first SaveRoutingCatalog() = %#v, %v", saved, err)
+	}
+	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: routingCatalogFixture("channel_stale")}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("duplicate first SaveRoutingCatalog() error = %v, want ErrConflict", err)
+	}
+	updated := routingCatalogFixture("channel_v2ex_updated")
+	updated.Revision = 999 // 请求中的 revision 不是持久化真相，CAS 只使用 ExpectedRevision。
+	saved, err = store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: saved.Revision, Catalog: updated})
+	if err != nil || saved.Revision != 2 {
+		t.Fatalf("updated SaveRoutingCatalog() = %#v, %v", saved, err)
+	}
+	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 1, Catalog: initial}); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("stale SaveRoutingCatalog() error = %v, want ErrConflict", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertFileSchemaVersion(t, databasePath, 2)
+
+	reopened, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	loaded, err := reopened.LoadRoutingCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated.Revision = 2
+	if !reflect.DeepEqual(loaded, updated) {
+		t.Fatalf("reopened LoadRoutingCatalog() = %#v, want %#v", loaded, updated)
+	}
+
+	var encoded string
+	if err := reopened.db.QueryRowContext(ctx, `SELECT CAST(catalog_json AS TEXT) FROM routing_catalog WHERE id = 1`).Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encoded, `"revision":999`) || strings.Contains(encoded, `"route_templates"`) || strings.Contains(encoded, `"providers"`) || strings.Contains(encoded, `"sources"`) {
+		t.Fatalf("catalog JSON contains aggregate revision or builtin declarations: %s", encoded)
+	}
+}
+
+func TestRoutingCatalogRejectsSecretsAndInvalidGraphs(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	for _, key := range []string{"api_key", "x-api-key", "accessToken", "clientSecret", "privateKey"} {
+		secret := routingCatalogFixture("channel_" + key)
+		secret.Channels[0].Parameters = map[string]any{"nested": map[string]any{key: "must-not-persist"}}
+		if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: secret}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+			t.Fatalf("SaveRoutingCatalog(%s) error = %v, want ErrInvalidRoutingCatalog", key, err)
+		}
+	}
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM routing_catalog`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("routing catalog rows after rejected secret = %d, %v", rows, err)
+	}
+
+	cycle := routingCatalogFixture("channel_a")
+	cycle.Channels = append(cycle.Channels, core.Channel{ID: "channel_b", Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", FallbackChannelIDs: []string{"channel_a"}, Enabled: true})
+	cycle.Channels[0].FallbackChannelIDs = []string{"channel_b"}
+	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: cycle}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+		t.Fatalf("SaveRoutingCatalog(cycle) error = %v, want ErrInvalidRoutingCatalog", err)
+	}
+}
+
+func TestSQLiteMigrationV1ToV2PreservesExistingDataAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "omnihub-v1.db")
+	legacy, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := createV1Fixture(ctx, legacy); err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSchemaVersion(t, store, 2)
+	credential, err := store.GetCredential(ctx, "cred_v1")
+	if err != nil || credential.Revision != 3 || credential.Value == nil || *credential.Value != "legacy-secret" {
+		t.Fatalf("migrated credential = %#v, %v", credential, err)
+	}
+	run, err := store.GetRun(ctx, "run_v1")
+	if err != nil || run.Revision != 2 || run.Status != core.RunRunning {
+		t.Fatalf("migrated run = %#v, %v", run, err)
+	}
+	checkpoint, err := store.GetCheckpoint(ctx, stateKey(3))
+	if err != nil || checkpoint.Checkpoint != "legacy-cursor" {
+		t.Fatalf("migrated checkpoint = %#v, %v", checkpoint, err)
+	}
+	snapshot, err := store.GetSnapshot(ctx, "view_v1")
+	if err != nil || snapshot.ID != "snapshot_v1" || string(snapshot.Envelope) != `{"status":"complete"}` {
+		t.Fatalf("migrated snapshot = %#v, %v", snapshot, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertFileSchemaVersion(t, databasePath, 2)
+
+	reopened, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	assertSchemaVersion(t, reopened, 2)
+	if _, err := reopened.GetCredential(ctx, "cred_v1"); err != nil {
+		t.Fatalf("credential missing after repeated initialize: %v", err)
+	}
+}
+
+func TestSQLiteRejectsFutureSchemaVersion(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "omnihub-future.db")
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `PRAGMA user_version = 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store, err := Open(ctx, databasePath); err == nil || store != nil || !strings.Contains(err.Error(), "newer than supported version 2") {
+		t.Fatalf("Open(future schema) = %#v, %v", store, err)
+	}
+	after, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("Open(future schema) modified the database before rejecting it")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(databasePath + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Open(future schema) left sidecar %s: %v", suffix, err)
+		}
+	}
+}
+
 func openTestStore(t *testing.T, options ...Option) *Store {
 	t.Helper()
 	store, err := Open(context.Background(), ":memory:", options...)
@@ -267,6 +486,100 @@ func openTestStore(t *testing.T, options ...Option) *Store {
 
 func stateKey(revision int64) core.StateKey {
 	return core.StateKey{ChannelID: "channel_fixture", RouteTemplateID: "fixture-search", EndpointProfileID: "endpoint_fixture", ParametersHash: "params-v1", CredentialID: "cred_01", CredentialRevision: revision}
+}
+
+func validRunEnvelope(t *testing.T, started time.Time) core.Envelope {
+	t.Helper()
+	query := "fixture"
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationSearch, Query: &query,
+		Scope: core.Scope{Sources: []string{"fixture"}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
+		Limit: 1, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 1000,
+	}
+	envelope, err := core.BuildEnvelope(core.EnvelopeInput{
+		RequestID: "req_123e4567-e89b-42d3-a456-426614174000", Request: operation,
+		RequiredChannelIDs: []string{"channel_fixture"},
+		Executions:         []core.Execution{{ChannelID: "channel_fixture", Selection: core.SelectionPrimary, Status: core.ExecutionCompleted, StartedAt: started}},
+		StartedAt:          started, FinishedAt: started.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func routingCatalogFixture(channelID string) core.RoutingCatalog {
+	return core.RoutingCatalog{
+		Endpoints:   []core.EndpointProfile{{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", Trust: "local", Enabled: true, Revision: 1}},
+		Channels:    []core.Channel{{ID: channelID, Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", Priority: 100, Enabled: true, Revision: 1}},
+		Collections: []core.Collection{{ID: "daily", ChannelIDs: []string{channelID}, Enabled: true, Revision: 1}},
+		Overlays:    []core.TemplateOverlay{{RouteTemplateID: "v2ex-rsshub-latest", Enabled: false, Revision: 1}},
+	}
+}
+
+func createV1Fixture(ctx context.Context, database *sql.DB) error {
+	statements := []string{
+		`PRAGMA user_version = 1`,
+		`CREATE TABLE view_snapshots (id TEXT PRIMARY KEY, view_id TEXT NOT NULL, envelope BLOB NOT NULL, created_at_ns INTEGER NOT NULL)`,
+		`CREATE INDEX view_snapshots_by_view ON view_snapshots(view_id, created_at_ns DESC)`,
+		`CREATE TABLE channel_state (
+			channel_id TEXT NOT NULL, route_template_id TEXT NOT NULL, endpoint_profile_id TEXT NOT NULL,
+			parameters_hash TEXT NOT NULL, credential_id TEXT NOT NULL, credential_revision INTEGER NOT NULL,
+			checkpoint TEXT NOT NULL, updated_at_ns INTEGER NOT NULL,
+			PRIMARY KEY(channel_id, route_template_id, endpoint_profile_id, parameters_hash, credential_id, credential_revision)
+		)`,
+		`CREATE TABLE runs (
+			id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+			status TEXT NOT NULL, claimed_by TEXT NOT NULL DEFAULT '', lease_expires_at_ns INTEGER, attempt INTEGER NOT NULL DEFAULT 0,
+			revision INTEGER NOT NULL, result_json BLOB, created_at_ns INTEGER NOT NULL, started_at_ns INTEGER, finished_at_ns INTEGER
+		)`,
+		`CREATE TABLE credentials (
+			id TEXT PRIMARY KEY, provider TEXT NOT NULL, auth_kind TEXT NOT NULL, label TEXT NOT NULL, value TEXT,
+			enabled INTEGER NOT NULL, revision INTEGER NOT NULL, created_at_ns INTEGER NOT NULL, updated_at_ns INTEGER NOT NULL,
+			CHECK(auth_kind != 'chrome_cookie' OR value IS NULL)
+		)`,
+		`INSERT INTO credentials(id, provider, auth_kind, label, value, enabled, revision, created_at_ns, updated_at_ns)
+			VALUES('cred_v1', 'fixture', 'api_key', 'Legacy', 'legacy-secret', 1, 3, 1, 2)`,
+		`INSERT INTO runs(id, kind, payload_hash, idempotency_key, status, claimed_by, lease_expires_at_ns, attempt, revision, created_at_ns, started_at_ns)
+			VALUES('run_v1', 'query', 'payload', 'legacy-run', 'running', 'legacy-instance', 9999999999, 1, 2, 1, 2)`,
+		`INSERT INTO channel_state(channel_id, route_template_id, endpoint_profile_id, parameters_hash, credential_id, credential_revision, checkpoint, updated_at_ns)
+			VALUES('channel_fixture', 'fixture-search', 'endpoint_fixture', 'params-v1', 'cred_01', 3, 'legacy-cursor', 3)`,
+		`INSERT INTO view_snapshots(id, view_id, envelope, created_at_ns)
+			VALUES('snapshot_v1', 'view_v1', '{"status":"complete"}', 4)`,
+	}
+	for index, statement := range statements {
+		if _, err := database.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply v1 fixture statement %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func assertSchemaVersion(t *testing.T, store *Store, want int) {
+	t.Helper()
+	var got int
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("SQLite user_version = %d, want %d", got, want)
+	}
+}
+
+func assertFileSchemaVersion(t *testing.T, databasePath string, want int) {
+	t.Helper()
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var got int
+	if err := database.QueryRow(`PRAGMA user_version`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("persisted SQLite user_version = %d, want %d", got, want)
+	}
 }
 
 type oneShotFault struct {
