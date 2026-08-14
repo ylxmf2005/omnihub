@@ -46,7 +46,7 @@ func contractExample(t *testing.T, path string, block int) map[string]any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := regexp.MustCompile("(?s)```json\\n(.*?)```").FindAllSubmatch(contract, -1)
+	blocks := regexp.MustCompile("(?s)```json\\r?\\n(.*?)```").FindAllSubmatch(contract, -1)
 	if block < 0 || block >= len(blocks) {
 		t.Fatalf("contract JSON block %d is unavailable", block)
 	}
@@ -66,7 +66,7 @@ func TestContractJSONExamplesMatchGeneratedSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := regexp.MustCompile("(?s)```json\\n(.*?)```").FindAllSubmatch(contract, -1)
+	blocks := regexp.MustCompile("(?s)```json\\r?\\n(.*?)```").FindAllSubmatch(contract, -1)
 	if len(blocks) < 9 {
 		t.Fatalf("contract JSON blocks = %d, want at least 9", len(blocks))
 	}
