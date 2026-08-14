@@ -1477,7 +1477,7 @@ func loadCatalog(ctx context.Context) (*registry.Catalog, func(), error) {
 
 func openCatalogStore(ctx context.Context, databasePath string) (*sqlite.Store, error) {
 	// Registry/Doctor/Plan 是读取入口。只接受已经完成当前 migration 的
-	// SQLite v4，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
+	// SQLite v5，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
 	version, err := sqlite.SchemaVersion(ctx, databasePath)
 	if err != nil {
 		return nil, err

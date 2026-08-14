@@ -207,7 +207,7 @@ Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoi
 
 ### REQ-031：本地 semantic grouping
 
-`similarity_grouping=semantic` 必须显式引用用户配置的 embedding profile；默认 `off`。MVP 复用现有 SQLite，以 little-endian `float32` BLOB 缓存 embedding，并只在同一 provider、model、dimension 与 index revision cohort 内计算精确 cosine。Embedding 输入固定为 title + summary；summary 缺失时才回退 content.text，并按 UTF-8 截断到总计 8 KiB。该输入配方属于 index revision，不包含 Cookie、Credential、请求头或 Browser Bridge 数据。
+`similarity_grouping=semantic` 必须显式引用用户配置的 embedding profile；默认 `off`。MVP 复用现有 SQLite，以 little-endian `float32` BLOB 缓存 embedding，并只在同一 Endpoint revision、embedding Credential ID/revision、provider、model、dimension 与 index revision cohort 内计算精确 cosine。Embedding 输入固定为 title + summary；summary 缺失时才回退 content.text，并按 UTF-8 截断到总计 8 KiB。该输入配方属于 index revision，不包含 Cookie、Credential、请求头或 Browser Bridge 数据。
 
 该路线已经过 2026-08-15 的近期本地方案复核，证据见 `shape/evidence/local-vector-study.md`。当前 Driver 已能通过 `modernc.org/sqlite/vec` 无 CGO 注册 sqlite-vec，但其 pre-v1 vec0 对当前最多 100 个 Item 仍是 exact scan，并会增加虚拟表与迁移状态；Chromem、LanceDB 与 Qdrant 同样没有相称收益。单 cohort 达到约 10,000 条、semantic p95 超过 150ms，或出现跨 Snapshot KNN 需求时，优先 spike 现有 Driver 的 vec 包；阈值未到前不为“向量数据库”标签增加状态。
 

@@ -273,11 +273,11 @@ JSON
 }
 ```
 
-当前最多对一次查询的 100 个结果做 Go 内精确 cosine，并把向量作为 little-endian `float32` BLOB 缓存在同一 SQLite。单 cohort 接近 10,000 条、p95 超过 150 ms，或出现跨 Snapshot KNN 需求时，再评估现有 SQLite Driver 可加载的 `sqlite-vec`；首发不增加第二数据库。
+当前最多对一次查询的 100 个结果做 Go 内精确 cosine，并把向量作为 little-endian `float32` BLOB 缓存在同一 SQLite。Endpoint、embedding Credential revision、模型、维度或输入配方 revision 改变都会形成新的 cache cohort。单 cohort 接近 10,000 条、p95 超过 150 ms，或出现跨 Snapshot KNN 需求时，再评估现有 SQLite Driver 可加载的 `sqlite-vec`；首发不增加第二数据库。
 
 ## Feed、RSSHub 与 OPML
 
-一次性 Feed 的 `search` 只在当前 Feed window 内执行 Unicode lowercase + 空白分词 AND 匹配，并在 Coverage 中披露 `local_feed_window_only`。需要复用时，可用 `channels apply` 保存为 Direct Feed Channel。
+一次性 Feed 的 `search` 只在当前 Feed window 内执行 Unicode lowercase + 空白分词 AND 匹配，并在 Coverage 中披露 `local_feed_window_only`。需要复用时，可用 `channels apply` 保存为 Direct Feed Channel。View 的 JSON Feed `_omnihub` 与 RSS/Atom `omnihub` 扩展保留 identity、provenance 和 semantic `group_id/strategy/score`；投影不会重新分组或删除同组 Item。
 
 OmniHub 不安装或托管 RSSHub，也不默认选择公共实例：
 
