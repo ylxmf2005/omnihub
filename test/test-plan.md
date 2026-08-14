@@ -3,13 +3,13 @@
 ## 计划状态
 
 - 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release` 工作树，基线 Stage D `a8ef7f3` 加完整 Stage E diff。
-- 计划状态：`executing`
+- 计划状态：`completed`
 - 任务承诺：`context.md`、`shape/requirements.md` REQ-031/034、`shape/contract.md` 7.7/9.2/13、`plan.md` Stage E。
 - 结论边界：证明显式 opt-in semantic grouping、OpenAI-compatible embedding、SQLite cache、全部公共出口与发布物；不宣称 ANN/sqlite-vec、模型安装、Ollama daemon 托管、云端fallback、真实Chrome Extension或无凭据平台live E2E。
 
 ## 测试事实账本
 
-- 环境与路由：macOS arm64、Go 1.26.4；本机临时SQLite、`httptest`/loopback OpenAI-compatible fixture、显式direct/environment/proxy配置；Linux/Windows以交叉构建为主。
+- 环境与路由：macOS arm64、Go 1.26.4；本机临时SQLite、`httptest`/loopback OpenAI-compatible fixture、显式direct/environment/proxy配置；GitHub Actions 的 macOS arm64、Ubuntu 与 Windows native runner。
 - 身份与权限：当前本机用户；embedding模型、API Key、Cookie、Extension ID与平台凭据全部使用固定假值。真实外部embedding只在有用户现成配置且无需新增授权时作为补证，不是发布gate。
 - 数据与清理责任：只写仓库、Go临时目录与`/private/tmp/omnihub-stage-e-*`；发布archive留在明确release目录，其他server、SQLite、socket、安装目录与fixture必须停止/删除并回读。
 - 观察面：Core/Schema、HTTP请求响应、egress事实、SQLite user_version/cache BLOB/retention、Envelope/Item/Run/Snapshot/Feed、CLI/REST/MCP/JSONL/Skill、archive/checksum/file与全新目录运行。
@@ -36,8 +36,8 @@
 
 - 背景与风险：外部embedding是显式数据外发，Profile/Endpoint/Egress/Credential必须在内容检索前成立。
 - 优先级：P1
-- 环境与身份：SQLite v4、管理CLI/Dashboard、计数为零的内容与embedding fixture。
-- 前置数据：enabled/disabled/missing Profile、embedding Endpoint、四种Egress、optional embedding/bearer Credential及引用Profile的View。
+- 环境与身份：SQLite v5、管理CLI/Dashboard、计数为零的内容与embedding fixture。
+- 前置数据：SQLite v5；enabled/disabled/missing Profile、embedding Endpoint、四种Egress、optional embedding/bearer Credential及引用Profile的View。
 - 实际动作：创建/更新/禁用/删除Profile；分别提交off/semantic/Fetch组合；制造endpoint/egress/credential缺失、disabled、provider/auth不匹配和revision冲突。
 - 预期：semantic只允许Search/Latest且profile id必填；off/fetch必须省略；配置错误在任何内容或embedding请求前失败；删除被View引用Profile、被Profile引用Endpoint/Credential返回409且不级联。
 - 观察面与窗口：CLI exit/JSON、HTTP status/ETag/Problem、SQLite catalog readback、fixture请求计数即时回读。
@@ -60,14 +60,14 @@
 - 清理：停止fixture/proxy并回读无listener。
 - 证据边界：loopback fixture不证明第三方API SLA。
 
-### TC-E03 — SQLite v4 cache、cohort与显式retention
+### TC-E03 — SQLite v5 cache、cohort与显式retention
 
 - 背景与风险：向量是derived state，但混用或损坏会直接污染分组。
 - 优先级：P1
-- 环境与身份：fresh DB、v3 fixture升级、future v5、可直接注入坏BLOB的SQLite测试。
-- 前置数据：相同/不同input hash、Endpoint ID/revision、provider、model、dimension、index revision与last_used时间。
-- 实际动作：put/get/touch；重开数据库；注入坏长度、NaN/Inf/零范数；dry-run/apply prune 30天记录。
-- 预期：little-endian float32 roundtrip；cohort任一维变化均miss；坏向量不返回；v3→v4事务迁移、future拒绝；dry-run只计数，apply只删过期embedding且不影响其他记录。
+- 环境与身份：fresh DB、v3 fixture升级、future v6、可直接注入坏BLOB的SQLite测试。
+- 前置数据：相同/不同input hash、Endpoint ID/revision、Credential ID/revision、provider、model、dimension、index revision与last_used时间。
+- 实际动作：put/get/touch；重开数据库；v3/v4迁移；轮换 embedding Credential；注入坏长度、NaN/Inf/零范数；dry-run/apply prune 30天记录。
+- 预期：little-endian float32 roundtrip；cohort任一维变化均miss；v4旧行只迁为匿名cohort；坏向量不返回；v3/v4→v5事务迁移、future拒绝；dry-run只计数，apply只删过期embedding且不影响其他记录。
 - 观察面与窗口：PRAGMA user_version、SQL row/BLOB、Repository返回、PruneResult和重开回读。
 - 证据：`internal/store/sqlite/store_test.go`。
 - 失败处理：阻断semantic执行与发布。
@@ -109,7 +109,7 @@
 - 环境与身份：最终binary、loopback server、MCP stdio或in-memory client、同一固定Operation/View。
 - 前置数据：SemanticProfile、固定内容源与embedding fixture。
 - 实际动作：分别经CLI/REST/MCP执行；读取JSONL；创建/刷新View并读取Snapshot/items与RSS/Atom/JSON Feed。
-- 预期：请求字段、status、group/score/error语义等价；Snapshot保留Item similarity；Feed不自行重算/删除条目，若格式不投影score则仍保留全部链接和来源。
+- 预期：请求字段、status、group/score/error语义等价；Snapshot保留Item similarity；JSON Feed `_omnihub` 与 RSS/Atom extension 投影同一 group/strategy/score，且不自行重算或删除条目。
 - 观察面与窗口：各入口原始输出、Run轮询终态、Feed XML/JSON与SQLite Snapshot。
 - 证据：transport现有测试与真实binary E2E。
 - 失败处理：阻断发布。
@@ -150,7 +150,7 @@
 - 优先级：P1
 - 环境与身份：darwin/arm64、linux/amd64、windows/amd64目标；全新HOME/config/database/cache/runtime。
 - 前置数据：版本`0.1.x`、冻结commit、release目录。
-- 实际动作：构建、归档、生成SHA-256；逐项解包/file/checksum；从全新目录运行version/help/schema/doctor；重放`go install ...@<commit/tag>`可达路径。
+- 实际动作：构建、归档、生成SHA-256；逐项解包/file/checksum；从全新目录运行version/help/schema/doctor；重放`go install ...@<commit>`可达路径。
 - 预期：archive命名/内容一致，checksum全匹配，二进制格式正确，fresh doctor不写假ready；安装说明与真实入口一致。
 - 观察面与窗口：archive listing、file/hash、CLI stdout/exit、目录权限与清理回读。
 - 证据：release产物与Test Report。
@@ -182,4 +182,4 @@
 
 - 仍可能全绿但产品错误的路径：只测内存向量会漏真实wire/egress；只测全成功会漏cache hit+miss partial；只看JSON会漏Snapshot/Feed；只交叉build会漏archive安装。对应由E02/E05/E06/E09闭合。
 - 仍需现场发明的输入或步骤：none；真实第三方凭据不是gate，固定fixture覆盖协议，live缺口单列。
-- 下一步：完成Stage E实现后从TC-E01开始执行，并在第一条实际运行时把`test/test-report.md`切换为executing。
+- 下一步：TC-E01—E10 已完成；从 `test/test-report.md` 的最终裁决进入发布授权，不在本 Task 内创建 Tag 或 GitHub Release。

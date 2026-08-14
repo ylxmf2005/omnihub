@@ -1,6 +1,6 @@
 # OmniHub Implementation Plan
 
-状态：`Stage E implementation completed；release validation executing`
+状态：`Stage E completed；0.1.0 release candidate verified`
 
 已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
@@ -121,13 +121,13 @@
 目标：在不改变 identity 去重与单二进制边界的前提下提供可选语义分组，并完成发布审计。
 
 - 新增 SemanticProfile；只实现 OpenAI-compatible embedding contract，本地 Ollama 经 `/v1/embeddings` 接入。输入固定为 title + summary，无 summary 时回退 content.text，总计最多 8 KiB UTF-8；不安装或下载模型、不启动 daemon、不从本地自动回退云端。
-- `shape/evidence/local-vector-study.md` 已确认当前 Driver 自带无 CGO `sqlite-vec`，但其 pre-v1 虚拟表对最多 100 个 Item 的 exact grouping 没有相称收益。当前仍复用普通 SQLite BLOB：只在同 provider/model/dimension/index-revision cohort 内做 Go exact cosine。默认关闭，只写 group/reason/score，不删除或 rerank Item。
+- `shape/evidence/local-vector-study.md` 已确认当前 Driver 自带无 CGO `sqlite-vec`，但其 pre-v1 虚拟表对最多 100 个 Item 的 exact grouping 没有相称收益。当前仍复用普通 SQLite BLOB：只在同 Endpoint/Credential/provider/model/dimension/index-revision cohort 内做 Go exact cosine。默认关闭，只写 group/reason/score，不删除或 rerank Item。
 - 固定小语料验证阈值、误合并边界、model revision 与 provider unavailable；另覆盖响应条数/dimension 不匹配、NaN/Inf、零范数与坏 BLOB。失败向量不写 cache、不分组，Item 保留且 Envelope partial。
 - 发布 OPML/Bundle、Egress、RSSHub、GitHub、Tavily、xurl、Chrome Host、SemanticProfile 示例；补扩展指南、SQLite/未来 MySQL 不变量、安装/卸载和 readiness 说明。
 - 生成 macOS/Linux/Windows 单二进制、archives 与 checksums；在全新目录重放 doctor 和来源×功能矩阵，完成独立 Review 与发布说明。
 - 首发按 `0.1.x` preview 准备并支持 `go install`；包管理器、平台签名与任意 Agent 最终文本审计不进入 v1，引用保证止于 OmniHub Item/Observation 与 Skill 约束。`serve` 保持前台 loopback 进程，普通卸载保留用户数据。
 
-当前证据：SemanticProfile/SQLite v4 cache/OpenAI-compatible wire/exact cosine、CLI/REST/MCP/JSONL/View/Feed、版本/Skill/Chrome uninstall 与 release/CI 入口已实现；全量普通/race/vet、真实 binary 公共出口 E2E、V2EX/linux.do/GitHub live smoke、NodeSeek layered conditional Probe、Skill forward-test 与 100 Item p95 已通过。剩余 gate 为 clean commit archive/fresh install、`go install`、三平台 Actions 与最终独立 Review。
+当前证据：SemanticProfile、SQLite v5 Credential-isolated cache、OpenAI-compatible wire/exact cosine、CLI/REST/MCP/JSONL/View/Feed、版本/Skill/Chrome uninstall 与 release/CI 入口均已实现。全量普通/race/vet、真实 binary 公共出口 E2E、三种 Feed semantic 投影、V2EX/linux.do/GitHub live smoke、NodeSeek layered conditional Probe、Skill forward-test、100 Item p95、clean commit archive/fresh install、`go install`、三平台 Actions 与独立 Review 均已通过。
 
 完成证据：全来源/功能测试矩阵通过；test/race/vet/schema/OpenAPI/MCP/Skill/Feed/Chrome/Egress/semantic E2E 与三平台构建通过；README 不把 Feed window/Tavily/conditional Source 写成平台全量搜索或 runtime ready。
 

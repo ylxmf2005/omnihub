@@ -1,28 +1,27 @@
-# Review：Stage D Chrome Cookie Backend
+# Review：Stage E Semantic Grouping 与 0.1.0 发布候选
 
 ## Findings
 
-无。当前完整对象没有未解决P0—P3，也没有待Owner决策项。
+无。当前完整对象没有未解决 P0—P3、`fix-now` 或待 Owner 决策项。
 
 ## 裁决
 
 - 结论：`approve`
-- 对象：`/private/tmp/omnihub-stage-a`的`feature/stage-d-chrome-bridge`最终未提交工作树；源码身份按`git ls-files -co --exclude-standard -- cmd internal go.mod go.sum | sort | xargs shasum -a 256 | shasum -a 256`复算为`3ca3b48f890c42c70c565cf8f987449ee690d1c8652560e3c8a663bd2c9decdc`。
-- Baseline：Stage C `55286d9138d4af679737d65d39040b54d3b6d516`。
-- 核心理由：Cookie信任边界从Catalog、Authorization、Native Host到Query贯通，scope/result均被重验且任何输出反射都fail-closed；Host单活、取消、迟到响应、断连与重连有真实生命周期保护；Dashboard Browser API、CORS与实时readiness合同一致。最终test/race/vet/diff、聚焦压力、隔离CLI/loopback E2E和三平台构建支持当前对象前进。
+- 对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release`，发布候选提交 `c8f3cf6c8141de7d59dcdd9d44c0f2f2c8ea6518`，以及由该 clean commit 生成的 `0.1.0` 三平台 archive。
+- Baseline：Stage D `a8ef7f3d9e7a944b0e46dd3a4b4bdd2e348b732a`。
+- 核心理由：semantic 静态 preflight、可信 Egress、OpenAI-compatible wire、Credential-isolated SQLite v5 cache、exact grouping 与失败保留 Item 形成闭合链路；CLI/REST/MCP/JSONL/View/Run/Snapshot/JSON-RSS-Atom Feed 共享同一事实。完整 test/race/vet、100 Item p95、三平台 Actions、archive/checksum/fresh install、公开 `go install` 与两路独立冷读均支持当前候选进入发布授权。
 
 ## 影响面与证据边界
 
 - 已检查：
-  - Native Messaging的4-byte little-endian framing、strict JSON、1 MiB上限、request ID、pending取消与迟到响应丢弃；
-  - macOS/Linux当前用户runtime目录与socket权限、stale socket恢复、单Profile；Windows current-SID named-pipe安全描述符与错误分类；
-  - trusted/enabled RouteTemplate、`chrome_cookie` nil-value Credential、精确HTTPS host scope和AuthorizationDescriptor；
-  - Query只在显式consumer存在后读Cookie，返回后释放引用，Item/Coverage/Error/details/limitations/provider state反射secret时整体失败；
-  - Bridge离线或permission缺失覆盖历史Probe为blocked并移除失真route-group；connected不提升未Probe Channel，disabled Channel/Template保留原事实；
-  - Dashboard Bridge状态、授权描述、permission撤销、严格body/Problem、Host/Origin/CORS和OpenAPI投影；
-  - `chrome-host run/install`、Chrome origin argv直启、CLI/serve共享runtime Client、manifest单一精确Extension origin；
-  - Stage A—C回归、xurl timeout测试同步、Schema、文档范围与三平台发布构建。
-- 独立复核：四项历史候选——Windows把全部pipe错误伪报为单活冲突、Catalog接受执行层拒绝的父域scope、Browser Client不可取消锁、disabled Channel/Template被Bridge覆盖——均已在当前共享根因修复。xurl历史红色来自测试把500 ms共享deadline误当成“search一定已启动”，现测试先观察完整search HOME/CWD事实再取消，未改变产品deadline语义。
-- 已判定无关：真实Chrome Extension客户端、通用Cookie Provider、Dashboard前端、Firefox/Safari/Edge、多Profile、Cookie数据库解密、CDP、MySQL、scheduler与semantic grouping没有借Stage D进入。
-- 证据缺口：Windows SID ACL/HKCU安装与Linux未实机运行；独立审查沙箱禁止Unix socket bind，因此Host聚焦用例由最终Test在允许本机IPC的环境提供，审查者独立运行的transport聚焦回归通过。真实Extension与Cookie Provider缺席意味着本阶段只能声明backend contract verified，不声明任何Browser来源ready。
-- 剩余风险与下一位：Stage D可以提交并push。下一位从`plan.md`进入Stage E；不得把mock consumer、交叉构建或manifest smoke写成真实Cookie来源端到端可用。
+  - Operation、SemanticProfile、Item/Similarity、Error、Run/Snapshot 与生成 Schema 的公共合同和 runtime 校验；
+  - Endpoint/Egress/Credential 解析，远程 HTTPS、literal loopback+direct、redirect、代理与 secret redaction 边界；
+  - 输入 recipe、响应条数/index/dimension/finite/non-zero 校验、partial 行为、确定性 leader 与最大 100 Item 热路径；
+  - embedding cache key、Credential ID/revision、group ID、little-endian BLOB、v3/v4→v5 transaction migration、坏 cache 与显式 prune；
+  - CLI、REST、MCP、JSONL、Dashboard、View refresh、Run、Snapshot 与 JSON/RSS/Atom 的 similarity/provenance 投影；
+  - Direct Feed、RSSHub、GitHub、Tavily、xurl、Egress/Probe、Chrome Backend、OPML 与 Subscription 回归面；
+  - README、Skill、来源 live/fixture/conditional 声明、CI CRLF 行为、release clean-commit gate、版本注入、许可、checksum、安装与卸载边界。
+- 独立复核：合同/安全审查与发布审查由不同冷读路径完成。Credential rotation 在 cache 与 group cohort 中均隔离；v4 旧行只迁为匿名 cohort；三种 Feed 从已提交 Snapshot 保留 group/strategy/score。Actions `31837490894` 的 macOS、Ubuntu、Windows job 与候选提交一致并全部成功。
+- 已判定无关：Dashboard 前端、Chrome Companion Extension/真实 Cookie Provider、MySQL/多实例、scheduler/service manager、ANN/第二向量数据库、包管理器、平台签名、Tag/GitHub Release 与任意 Agent 自由文本审计没有进入本次候选。
+- 证据缺口：没有用户真实 Tavily/X quota；NodeSeek 当前只证明 DNS/TCP 通过且 TLS 失败；没有 Windows Chrome/ACL 与真实 Extension 实机。README、Skill 与 Test Report 已按 fixture、conditional 或 backend-only 限定，因此这些缺口不改变 preview 的 `approve`。
+- 剩余风险与下一位：`0.1.0` 候选可以进入 owner 的发布动作授权；未经新增授权不创建 Tag、GitHub Release，不修改 `main`，也不把条件性来源升级为 ready。

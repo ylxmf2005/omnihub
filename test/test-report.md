@@ -2,27 +2,27 @@
 
 ## 总体结论
 
-- 状态：`executing`
-- 能否交付：`not-yet`
-- 核心依据：SemanticProfile、可信 embedding、SQLite cache、100 Item exact grouping、全部公共出口、既有来源回归、live/conditional 来源与 Skill forward-test 已成立；尚需从 clean commit 构建并验收 archive、验证三平台 GitHub Actions、完成最终独立 Review 和冻结对象质量闸。
-- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release`，Stage D `a8ef7f3` 加当前 Stage E diff。
+- 状态：`passed`
+- 能否交付：`yes`
+- 核心依据：SemanticProfile、可信 embedding、SQLite v5 Credential-isolated cache、100 Item exact grouping、全部公共出口、来源矩阵、Skill forward-test、三平台 CI、archive/checksum/fresh install、`go install @commit` 与两路独立冷审均已闭合；没有未解决的 fix-now。
+- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release`，发布候选提交 `c8f3cf6c8141de7d59dcdd9d44c0f2f2c8ea6518`，baseline Stage D `a8ef7f3d9e7a944b0e46dd3a4b4bdd2e348b732a`。
 
 ## 被测环境
 
 - 环境与路由：macOS arm64、Go 1.26.4；`/private/tmp` 隔离 Go cache、SQLite/config/cache/runtime；loopback Feed/embedding/REST/MCP fixture；公开网络只访问 V2EX、linux.do、GitHub 与 NodeSeek 候选。
 - 身份与资源：当前本机用户；Tavily/X/RSSHub/embedding/Chrome 使用固定假凭据或 fixture，不读取用户真实 API Key、Cookie、浏览器数据或 Shell secret。
 - 观察面：Go test/race/vet、CLI JSON/JSONL、REST、MCP stdio、SQLite、Run/Snapshot/View、RSS/Atom/JSON Feed、公开上游响应、Skill 隔离 Agent、进程/端口/临时目录回读。
-- 执行时间：2026-08-15（Asia/Shanghai），执行中。
+- 执行时间：2026-08-15（Asia/Shanghai），已完成。
 
 ## 证据完整度
 
 | 证据等级或范围 | 用例 | 可以复核的内容 | 缺口 |
 | --- | --- | --- | --- |
-| 最终源码自动化与聚焦缺陷重放 | E01—E05、E07、E10 | Core/Store/Management/Adapter/Transport、安全边界、cache、分组、race/vet | 冻结 commit 后还需最后重跑 |
-| 真实 binary + loopback 消费者 | E02、E06 | CLI/REST/MCP/View/Run/Snapshot/三 Feed 与 cache 复用 | 不代表第三方 embedding SLA |
+| 冻结源码自动化与聚焦缺陷重放 | E01—E05、E07、E10 | Core/Store/Management/Adapter/Transport、安全边界、cache、分组、race/vet | 不代表第三方 SLA |
+| 真实 binary + loopback 消费者 | E02、E06 | CLI/REST/MCP/View/Run/Snapshot/三 Feed、similarity extension 与 cache 复用 | 不代表第三方 embedding SLA |
 | 公开网络 smoke | E07 | V2EX、linux.do、GitHub 成功；NodeSeek 分层失败事实 | Tavily/X 无真实凭据，按 fixture 边界验收 |
 | 隔离 Agent forward-test | E08 | 固定 OmniHub 调用、失败不换工具、成功引用与 coverage 披露 | 不审计任意 Agent 的所有未来回答 |
-| 发布脚本与 CI 静态/本地入口 | E09 | clean-tree gate、许可/归档/checksum设计、native smoke workflow | archive、Actions 与 go install 尚待 clean commit |
+| clean commit 发布物与外部 CI | E09—E10 | 三 archive/checksum/license、macOS fresh runtime、SQLite v5、Go proxy install、三平台 native test/vet/smoke | Linux/Windows archive 未另做 Chrome 实机验证 |
 
 ## 覆盖台账
 
@@ -30,21 +30,21 @@
 | --- | --- | --- | --- | --- | --- |
 | TC-E01 | SemanticProfile 管理与零上游 preflight | P1 | passed | [TC-E01](#tc-e01--semanticprofile-管理与零上游-preflight--passed) | 现有 Core/Management/SQLite/Transport 回归 |
 | TC-E02 | OpenAI-compatible wire、输入与 Egress | P1 | passed | [TC-E02](#tc-e02--openai-compatible-wire输入与-egress--passed) | loopback 原始请求与明文缺陷重放 |
-| TC-E03 | SQLite v4 cache、cohort、BLOB、retention | P1 | passed | [TC-E03](#tc-e03--sqlite-v4-cachecohortblobretention--passed) | `internal/store/sqlite/store_test.go` |
+| TC-E03 | SQLite v5 cache、cohort、BLOB、retention | P1 | passed | [TC-E03](#tc-e03--sqlite-v5-cachecohortblobretention--passed) | `internal/store/sqlite/store_test.go` |
 | TC-E04 | exact cosine 与确定性 leader grouping | P1 | passed | [TC-E04](#tc-e04--exact-cosine-与确定性-leader-grouping--passed) | Stage E transport 回归、100 Item p95 |
 | TC-E05 | provider/cache 失败保留结果 | P1 | passed | [TC-E05](#tc-e05--providercache-失败保留结果--passed) | partial Envelope/Run/Snapshot 回读 |
 | TC-E06 | CLI/REST/MCP/JSONL/View/Feed 投影 | P1 | passed | [TC-E06](#tc-e06--clirestmcpjsonlviewfeed-投影--passed) | 真实 binary 公共出口 E2E |
 | TC-E07 | 全来源与既有功能矩阵 | P1 | passed | [TC-E07](#tc-e07--全来源与既有功能矩阵--passed) | 全量 test + live/fixture/conditional 矩阵 |
 | TC-E08 | README、Skill、示例与许可 | P1 | passed | [TC-E08](#tc-e08--readmeskill示例与许可--passed) | Skill byte-compare 与隔离 Agent forward-test |
-| TC-E09 | archive、checksum 与全新安装 | P1 | partial | [TC-E09](#tc-e09--archivechecksum-与全新安装--partial) | `scripts/release.sh`、CI workflow |
-| TC-E10 | 最终质量闸、性能与独立 Review | P1 | partial | [TC-E10](#tc-e10--最终质量闸性能与独立-review--partial) | pre-freeze test/race/vet/p95/冷审 |
+| TC-E09 | archive、checksum 与全新安装 | P1 | passed | [TC-E09](#tc-e09--archivechecksum-与全新安装--passed) | `dist/`、`go install @c8f3cf6`、Actions `31837490894` |
+| TC-E10 | 最终质量闸、性能与独立 Review | P1 | passed | [TC-E10](#tc-e10--最终质量闸性能与独立-review--passed) | test/race/vet、p95、`review/review.md` |
 
 ## 逐用例执行记录
 
 ### TC-E01 — SemanticProfile 管理与零上游 preflight — passed
 
 - 背景与风险：错误 Profile、Endpoint、Credential 或 Egress 不能在内容检索付费后才暴露。
-- 实际前置条件：fresh SQLite v4、管理 CLI/Dashboard、enabled/disabled/missing Profile 与引用 View。
+- 实际前置条件：fresh SQLite v5、管理 CLI/Dashboard、enabled/disabled/missing Profile 与引用 View。
 - 预期：Search/Latest semantic 组合严格；CRUD/CAS/引用保护成立；配置错误请求数为零。
 - 实际动作：执行 Core 参数表、Management apply/list/get/disable/delete、Dashboard POST/PUT/DELETE/ETag、Store 原子引用检查及真实 CLI apply/list/disable。
 - 实际响应与观察：`off+profile`、`semantic-profile missing`、Fetch semantic、revision 冲突、被 View 引用删除均在上游前拒绝；REST 非法路径为 `resource_not_found`；CLI 跨进程回读 revision 正确。
@@ -65,13 +65,13 @@
 - 证据：`internal/semantic/service.go` 与 `TestStageESemanticGroupingContracts`；安全冷审 P2 修复前后重放。
 - 证据边界：loopback fixture不代表云端服务可用性或费用。
 
-### TC-E03 — SQLite v4 cache、cohort、BLOB、retention — passed
+### TC-E03 — SQLite v5 cache、cohort、BLOB、retention — passed
 
 - 背景与风险：模型或配方混算、坏 BLOB 与隐式删除会污染结果或用户数据。
-- 实际前置条件：fresh DB、v3→v4、future schema、可注入坏 BLOB 的既有 Store 测试。
-- 预期：cohort 全字段隔离；finite/non-zero vector；30 天 explicit prune；migration 只向前。
-- 实际动作：put/get/touch/reopen、Endpoint revision/model/dimension/index revision miss、坏长度/NaN/Inf/零范数、dry-run/apply prune、future schema gate。
-- 实际响应与观察：little-endian float32 roundtrip 成立；坏向量 fail-closed；schema 常量统一为 4；dry-run 不写，apply 只删过期孤立 cache。
+- 实际前置条件：fresh DB、v3/v4 legacy DB、future schema、可注入坏 BLOB 的既有 Store 测试。
+- 预期：Endpoint/Credential/provider/model/dimension/index cohort 全字段隔离；finite/non-zero vector；30 天 explicit prune；migration 只向前。
+- 实际动作：put/get/touch/reopen、Credential ID/revision 与其他 cohort 字段逐项 miss、v4→v5 table rebuild、坏长度/NaN/Inf/零范数、dry-run/apply prune、future schema gate。
+- 实际响应与观察：little-endian float32 roundtrip 成立；Credential revision 1/2 使用不同 cache 与 group ID；v4 row 只迁为匿名 `""/0`；坏向量 fail-closed；schema 常量统一为 5；dry-run 不写，apply 只删过期孤立 cache。
 - 终态回读：其他 Run/Probe/tombstone/当前 Snapshot 不受 embedding prune 影响。
 - 清理与清理回读：SQLite/WAL/SHM 随临时目录删除。
 - 证据：`internal/store/sqlite/store_test.go` 全包与 race。
@@ -83,7 +83,7 @@
 - 实际前置条件：固定人工向量、threshold 边界、cache miss/hit、100 Item 最大窗口。
 - 预期：选择分数最高且最早的代表；稳定 group/score/strategy；全部 Item 保留。
 - 实际动作：运行相等向量、A/B leader、tie、best representative、profile/index revision；再对 100 个互不合并向量 warm cache 并连续执行 30 次。
-- 实际响应与观察：threshold=1 相等向量合组；tie 选择最早代表；index revision 改变 group/cache cohort；100 Item/100 group 全保留，embedding 请求总数 1，cached exact grouping p95=`1.918375ms`。
+- 实际响应与观察：threshold=1 相等向量合组；tie 选择最早代表；index revision 改变 group/cache cohort；最终候选重跑时 100 Item/100 group 全保留，embedding 请求总数 1，cached exact grouping p95=`1.913791ms`。
 - 终态回读：Item ID、URL、Observation 与排序不变。
 - 清理与清理回读：fixture 与 DB 删除。
 - 证据：`TestStageESemanticGroupingContracts`。
@@ -107,11 +107,11 @@
 - 实际前置条件：真实临时 binary、loopback Feed+embedding、SQLite、`serve` 与 MCP stdio。
 - 预期：同两条 Item、group/score/provenance/coverage；Feed 不删除同组条目；cache 跨入口复用。
 - 实际动作：CLI JSONL、REST `/v1/search`、MCP initialize/tools/call；创建 View、refresh、轮询 Run；读取 result/snapshot/items 与 JSON/RSS/Atom Feed。
-- 实际响应与观察：JSONL 顺序为 `start→execution→item×2→end`；三查询入口语义等价；Run=`partial`、attempt=1、1/1 Channel；三种 Feed 均保留 Alpha/Beta URL。最终 embedding 请求仍为 1，Feed 请求按真实执行增长。
-- 终态回读：Snapshot/items 保留相同 semantic group/score；stale/SWR 由 fixture freshness 事实触发，没有改写 semantic。
+- 实际响应与观察：JSONL 顺序为 `start→execution→item×2→end`；三查询入口语义等价；Run=`partial`、attempt=1、1/1 Channel；三种 Feed 均保留 Alpha/Beta URL，JSON `_omnihub.similarity` 与 RSS/Atom `omnihub:similarity` 保留同一 group/strategy/score。最终 embedding 请求仍为 1，Feed 请求按真实执行增长。
+- 终态回读：Snapshot/items 与三种 Feed extension 保留相同 semantic group/score；stale/SWR 由 fixture freshness 事实触发，没有重新计算 semantic。
 - 清理与清理回读：fixture、serve、MCP 均退出；两个端口无 listener；临时目录不存在。
 - 证据：真实 Run `run_f6194f602e8bf0dbf240a2cc15a266d6` 与执行记录。
-- 证据边界：Feed 格式不投影 score，但没有删除 Item；MCP SDK 把请求版本协商为其支持的 `2025-11-25`，Tool/Envelope 语义正常。
+- 证据边界：RSS/Atom 通过 `omnihub:similarity` 扩展投影 score 等语义字段，忽略该扩展的通用 Feed Reader 仍能读取完整 Item；MCP SDK 把请求版本协商为其支持的 `2025-11-25`，Tool/Envelope 语义正常。
 
 ### TC-E07 — 全来源与既有功能矩阵 — passed
 
@@ -149,34 +149,34 @@
 - 证据：`skills/omnihub/SKILL.md`、forward-test 最终回答、README 来源矩阵。
 - 证据边界：OmniHub 只能约束自己的输出与 Skill，不能审计任意 Agent 的自由文本。
 
-### TC-E09 — archive、checksum 与全新安装 — partial
+### TC-E09 — archive、checksum 与全新安装 — passed
 
-- 背景与风险：dirty 工作树上的交叉 build 不能证明用户能安装发布物。
-- 实际前置条件：release 脚本与 CI workflow 已实现，但 Stage E 尚未冻结 commit。
-- 预期：clean commit 构建三 archive、第三方许可、checksum；fresh 解包运行 version/schema/doctor；`go install @commit/tag`；三平台原生 CI。
-- 实际动作：`sh -n scripts/release.sh`；审查 clean-tree/tag/commit/许可/归档/checksum gate；本机 native binary version/schema/doctor。
-- 实际响应与观察：脚本语法与静态审查通过，dirty tree gate 按设计尚不允许正式执行；CI 已包含 macOS/Ubuntu/Windows test/vet/native build+smoke，但尚未 push 取得 Actions 结果。
-- 终态回读：当前没有可声明为发布候选的 `dist/`。
-- 清理与清理回读：none。
-- 证据：`.github/workflows/ci.yml`、`scripts/release.sh`。
-- 证据边界：未通过前不能发布、tag 或把交叉构建冒充实机。
+- 背景与风险：只有 clean commit 的可核验产物和原生 runner 才能支持发布准备。
+- 实际前置条件：clean commit `c8f3cf6c8141de7d59dcdd9d44c0f2f2c8ea6518`、版本 `0.1.0`、隔离安装目录与 Go module cache。
+- 预期：三 archive、第三方许可与 checksum 一致；macOS fresh runtime、SQLite v5、`go install @commit` 和三平台 native CI 成立。
+- 实际动作：以精确 COMMIT 运行 `scripts/release.sh`；独立执行 `shasum -a 256 -c`、archive listing、`file`、BUILD_INFO/许可检查；macOS fresh 解包运行 `version/schema/doctor/skill` 并用管理写入初始化 SQLite；从公开 Go proxy 执行 `go install github.com/ylxmf2005/omnihub/cmd/omnihub@c8f3cf6...`；读取 Actions Run `31837490894`。
+- 实际响应与观察：三项 checksum 均 `OK`；每包只有一个同名顶层目录并携带项目/第三方许可；Mach-O arm64、静态 ELF amd64、PE32+ amd64 格式正确；BUILD_INFO 为 `0.1.0`、精确 commit 与 `2026-08-15`。fresh archive 的 version/schema/doctor/skill 退出 0，SQLite `PRAGMA user_version=5`；Go proxy 解析 pseudo-version `v0.0.0-20260814202031-c8f3cf6c8141` 并安装成功，内嵌 Skill hash 与仓库一致。
+- 终态回读：Actions `31837490894` 在 macOS-14、Ubuntu、Windows 上均完成 test、vet 与 native binary version/schema/doctor smoke；Windows 合同测试实际通过 CRLF checkout。
+- 清理与清理回读：安装、module cache、fresh HOME 与 archive audit 临时目录已删除并重新枚举为空；最终 `dist/` 按发布候选保留。
+- 证据：`dist/`、`.github/workflows/ci.yml`、`scripts/release.sh`、[Actions 31837490894](https://github.com/ylxmf2005/omnihub/actions/runs/31837490894)。
+- 证据边界：Linux/Windows archive 内容与架构由本机静态审计，原生运行证据来自 Actions；未做代码签名、包管理器或 Chrome/Windows ACL 实机。
 
-### TC-E10 — 最终质量闸、性能与独立 Review — partial
+### TC-E10 — 最终质量闸、性能与独立 Review — passed
 
-- 背景与风险：必须在冻结对象上证明组合正确并接受独立证伪。
-- 实际前置条件：当前仍是 Stage E dirty diff。
-- 预期：test/race/vet/gofmt/diff/schema、p95、独立合同/安全/Ponytail/release Review 全部通过。
-- 实际动作：多轮全量普通/race/vet/gofmt/diff；100 Item p95；合同、安全与 Ponytail 冷审；修复重复校验、REST 错误路径、明文 embedding 与 CLI Probe 可见性。
-- 实际响应与观察：允许 loopback 的全量普通/race/vet 通过；p95 `1.918375ms`；当前合同冷审无 finding。安全 P2 已修并聚焦重测；Ponytail 确认 SQLite BLOB+Go cosine 是当前最小方案。
-- 终态回读：最终 Stage E `review/review.md` 尚未生成，冻结 commit 后全量闸尚未执行。
-- 清理与清理回读：没有常驻测试进程；Go cache 与当前 smoke 目录留待最终统一清理。
-- 证据：命令输出、合同/安全/Ponytail 审查反馈。
-- 证据边界：pre-freeze 绿色不能批准最终发布对象。
+- 背景与风险：必须在冻结运行对象上证明组合正确并接受作者之外的证伪。
+- 实际前置条件：提交 `c8f3cf6`、Stage D baseline `a8ef7f3`、TC-E01—E09 证据与最终发布物。
+- 预期：test/race/vet/gofmt/diff、100 Item p95、Ponytail、合同/安全/迁移/发布独立 Review 全部通过，且没有 fix-now。
+- 实际动作：在允许 loopback 的环境运行完整普通测试与 race，在隔离 cache 运行 vet，执行 gofmt/diff；重复 100 Item cache-hit exact grouping 30 次；分别冷读 Stage E 合同/安全/迁移/公共出口与 release/README/Skill/CI/archive。
+- 实际响应与观察：`go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`gofmt -l cmd internal skills`、`git diff --check` 全部通过；最终 100 Item p95=`1.913791ms`，远低于 150ms 重评阈值。`c8f3cf6` 相对测量提交只增加 README/合同和一个注释，未改变可执行语句；同提交的三平台全量 CI 再次通过。Ponytail 复核继续选择同一 SQLite BLOB + Go exact cosine，没有引入 ANN 或第二数据库。
+- 终态回读：独立合同复审确认 Credential cohort、v4→v5 migration 与三 Feed similarity 闭合；独立发布复审确认 Actions、archive、声明与卸载边界，最终裁决均为 `approve`，见 `review/review.md`。
+- 清理与清理回读：没有常驻测试进程、listener、socket、临时 DB、安装目录或 Go cache；只保留明确的 `dist/`。
+- 证据：`review/review.md`、完整命令终态、Actions `31837490894` 与发布物审计。
+- 证据边界：小规模 p95 只支持当前 sqlite-vec 止损点；Tavily/X/Chrome/NodeSeek 的条件性边界不被 Review 升级为 live。
 
 ## 失败、未完成与重测范围
 
 - Failed：none。NodeSeek TLS failure 是条件性来源的预期真实状态，不是 OmniHub 产品失败。
-- Partial：TC-E09、TC-E10；缺 clean commit archive/fresh install/go install、Actions 与最终 Review。
+- Partial：none。
 - Blocked：none。
 - Skipped：真实 Tavily/X quota、Chrome Extension/真实 Cookie Provider、Windows ACL 实机；均不在当前 preview gate，不能据此宣称 live-ready。
 - Flaky / 历史红色：
@@ -185,11 +185,16 @@
   - 第一次 GitHub fetch 使用了 Search 才有的 `limit/time_range`，strict decoder 正确以 unknown field/exit 3 拒绝；按 README FetchInput 重放 complete，属于测试输入错误。
   - Skill forward-test 首轮因隔离 Agent 网络权限返回 `network_error`；开放的仍是同一 OmniHub 命令，第二轮成功且未换 Provider。
   - NodeSeek 首次 Probe timeout，第二次 DNS/TCP 成功、TLS handshake failed；两次都保留为网络现实。
+  - Actions `31833249113` 的 Windows runner 因 checkout 使用 CRLF、合同测试只识别 LF 而失败；正则改为 `\r?\n` 后 `31834486775`、`31836298305` 与最终 `31837490894` 三平台全绿。macOS/Ubuntu 在首次 run 已通过，历史红色未被覆盖。
+  - 第一次 archive checksum 重放从仓库根执行相对路径而失败；切到 `dist/` 按 `checksums.txt` 语义执行后三项通过，属于 harness 工作目录错误。
+  - 第一版 Credential rotation 缺陷测试把 Bearer 放到明文 loopback，安全 preflight 正确拒绝；测试改为预置两个 Credential revision 的 cache cohort 后通过，没有放宽 HTTPS 边界。
+  - 沙箱内 `go install` 因 DNS 不可用失败；同一精确提交在允许公开 Go proxy 的环境安装成功。
+  - 首次删除 Go module cache 因下载文件只读而部分失败；只对两条已枚举临时路径恢复当前用户写权限后删除，最终枚举为空。
 
 ## 清理证明
 
 - Stage E 公共出口 fixture、MCP、serve 进程均退出；端口无 listener；其临时目录已删除。
-- 当前仍保留 `/private/tmp/omnihub-stage-e-gocache`、`/private/tmp/omnihub-stage-e-bin`、`/private/tmp/omnihub-stage-e-smoke` 与 forward-test symlink，供冻结前重放；最终交付前必须精确删除并回读。
+- `/private/tmp/omnihub-stage-e-*`、artifact audit/fresh-home、forward-test symlink 与具名 Go cache 已精确删除；同一枚举条件回读为空。`/private/tmp/omnihub-stage-a/dist` 是唯一有意保留的候选产物。
 - 未读取或写入真实 Credential、Chrome Cookie、外部账号或第三方资源。
 
 ## 证据与重放入口
@@ -202,6 +207,6 @@
 
 ## 当前环境交接
 
-- 仍在运行或保留的临时状态：没有进程；只保留上列具名临时文件/目录。
-- 剩余风险：三平台 native CI、archive/fresh-install、go install 和最终独立 Review 尚未形成。
-- 下一位与下一步：冻结 Stage E commit 并 push；在该 commit 上完成 TC-E09/E10，随后更新本报告为最终裁决。
+- 仍在运行或保留的临时状态：没有进程或临时目录；只保留工作树内忽略的 `dist/` 发布候选。
+- 剩余风险：真实 Tavily/X quota、Chrome Companion/真实 Cookie Provider、NodeSeek 当前网络可达性与 Windows Chrome/ACL 实机仍未证明，发布声明继续按 fixture、backend-only 或 conditional 承担。
+- 下一位与下一步：当前对象可进入发布授权；本 Task 不创建 Tag、GitHub Release，也不合入 `main`。

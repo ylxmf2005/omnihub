@@ -25,8 +25,8 @@
 - Chrome 现实：普通 localhost Dashboard 受同源与 HttpOnly 限制，无法读取其他站点 Cookie；可支持的正式路径是 Chrome MV3 Companion Extension 请求 optional host permission，通过 `chrome.cookies` 按执行直接读取，再经长连接 Native Messaging 与当前用户专属 IPC 交给 CLI/`serve`。Chrome 105+ 在 `connectNative()` 端口存活时会保持 Extension Service Worker；Chrome 关闭或 Bridge 断开时，依赖 Cookie 的 Channel 必须明确不可用。
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
-- 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。2026-08-15 复核确认当前 `modernc.org/sqlite v1.56.0` 已内置无 CGO 的 `sqlite-vec v0.1.9`，旧有“三平台 pure-Go 无法接入”前提失效；但它在当前仍是 exact scan，并会为单次最多 100 个结果增加 pre-v1 虚拟表、shadow table 与全局自动注册面，收益不足。MVP 因而继续以 little-endian `float32` BLOB 缓存 embedding 并在 Go 内做精确余弦比较；达到单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot KNN 需求时，优先 spike `modernc.org/sqlite/vec`。Embedding 只实现 OpenAI-compatible wire contract，本地 Ollama 通过 `/v1/embeddings` 接入；输入固定为 title + summary，无 summary 时回退 content.text，并在 UTF-8 8 KiB 处截断。OmniHub 不自动安装、下载或启动模型，也不从本地回退云端。
-- 实施状态：Shape 与 Grill 已收口；Stage 0—D 已提交并推送。Stage E 已在 `feature/stage-e-semantic-release` 完成 SemanticProfile、OpenAI-compatible embedding、SQLite v4 cache、exact cosine grouping、全部公共出口、CLI Probe 报告、版本/Skill/卸载与发布脚本；真实 binary E2E、公开来源 smoke、Skill forward-test 和 100 Item p95 已成立，正在冻结提交并完成 archive、三平台 CI 与最终 Review。Tavily/X 因无用户真实凭据仍只声明 fixture 证据，NodeSeek 当前真实 Probe 在 TLS 层失败并保持 conditional。
+- 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。2026-08-15 复核确认当前 `modernc.org/sqlite v1.56.0` 已内置无 CGO 的 `sqlite-vec v0.1.9`，旧有“三平台 pure-Go 无法接入”前提失效；但它在当前仍是 exact scan，并会为单次最多 100 个结果增加 pre-v1 虚拟表、shadow table 与全局自动注册面，收益不足。MVP 因而继续以 little-endian `float32` BLOB 缓存 embedding 并在 Go 内做精确余弦比较；cache cohort 包含 Endpoint 与 embedding Credential revision、provider、model、dimension 和输入配方 revision。达到单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot KNN 需求时，优先 spike `modernc.org/sqlite/vec`。Embedding 只实现 OpenAI-compatible wire contract，本地 Ollama 通过 `/v1/embeddings` 接入；输入固定为 title + summary，无 summary 时回退 content.text，并在 UTF-8 8 KiB 处截断。OmniHub 不自动安装、下载或启动模型，也不从本地回退云端。
+- 实施状态：Shape 与 Grill 已收口；Stage 0—E 均已提交并阶段性推送。`feature/stage-e-semantic-release` 的发布候选已完成 SemanticProfile、OpenAI-compatible embedding、SQLite v5 Credential-isolated cache、exact cosine grouping、全部公共出口、Feed semantic extension、CLI Probe、版本/Skill/卸载与发布脚本；全量 test/race/vet、三平台 Actions、archive/checksum/fresh install、`go install @commit`、公开来源 smoke、Skill forward-test、100 Item p95 与独立 Review 已成立。Tavily/X 因无用户真实凭据仍只声明 fixture 证据，NodeSeek 当前真实 Probe 在 TLS 层失败并保持 conditional。
 - 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
 - Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；Stage C 已在 Dashboard readiness 的 route-group 聚合读模型中实现跨绑定 `ready_dependent`，单 Channel 仍只表达自身事实。
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
@@ -91,7 +91,7 @@
 - Direct Feed、RSSHub、GitHub、Tavily 与 X/xurl 各有成功、缺配置/凭据和上游失败证据；V2EX、linux.do、NodeSeek conditional 及发布的 Feed Bundle 样例逐项有 fixture 或真实 smoke，未授权/不可达来源不报告 ready。
 - 同一 fixture Operation 经 CLI、REST、MCP 得到语义等价 Envelope；View refresh、Run 轮询、RSS/Atom/JSON Feed、JSONL、Skill 与 Dashboard API 均从同一 Operation/Subscription Service 投影。
 - Chrome mock Bridge 证明 permission/scope/断线/成功路径，Cookie 不进入 SQLite、HTTP、Run、Error、日志或 fixture；Extension 客户端仍由独立工作流交付。
-- semantic grouping 在固定语料上证明同模型 cohort、阈值边界、模型 revision 隔离、provider unavailable、dimension/finite/zero-norm 与坏 BLOB fail-closed；所有 Item 保留，功能默认关闭。
+- semantic grouping 在固定语料上证明同模型 cohort、阈值边界、Endpoint/Credential/model/index revision 隔离、provider unavailable、dimension/finite/zero-norm 与坏 BLOB fail-closed；所有 Item 保留，功能默认关闭，JSON/RSS/Atom 从 Snapshot 保留同一 similarity metadata。
 - macOS/Linux/Windows 产物、checksum、全新目录安装/doctor、配置示例和扩展文档可重放；最终 Test 与独立 Review 均通过。
 
 ## Current Artifacts
@@ -101,8 +101,8 @@
 - `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
 - `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
 - `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`executing`，Stage 0—D 已完成，Stage E 实现完成并进入发布候选冻结。
+- `plan.md`：`completed`，Stage 0—E 与 0.1.0 发布候选验证完成。
 - `dev/implementation.md`：`completed`，Stage E semantic grouping、公共出口与发布面已实现并通过聚焦反馈。
-- `test/test-plan.md`：`executing`，TC-E01—E10 正在执行。
-- `test/test-report.md`：`executing`，TC-E01—E08 已通过，TC-E09/E10 等待 clean commit archive、CI 与最终 Review。
-- `review/review.md`：`stale`，当前仍是 Stage D 裁决；必须由最终 Stage E 独立 Review 替换。
+- `test/test-plan.md`：`completed`，TC-E01—E10 已执行并闭合。
+- `test/test-report.md`：`passed`，来源/功能、发布物、三平台 CI 与历史红色均已裁决。
+- `review/review.md`：`approve`，Stage E 合同、安全、迁移、公共出口与发布候选独立复审通过。
