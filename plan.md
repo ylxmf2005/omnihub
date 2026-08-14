@@ -1,6 +1,6 @@
 # OmniHub Implementation Plan
 
-状态：`Stage C completed；下一入口 Stage D`
+状态：`Stage D completed；下一入口 Stage E`
 
 已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
@@ -101,24 +101,27 @@
 
 当前证据：SQLite v3 migration、故障注入、重复 idempotency、lease 过期重领、刷新失败保留旧 Snapshot、Observation/StateKey tombstone、三种 Feed 200→304、Dashboard 全资源 CRUD/409/202 polling/Host-Origin-CORS/credential no-store、Probe TTL/严格 route-group 与显式 prune 均通过。真实 CLI/loopback E2E、全量 test/race/vet/diff、三平台构建和独立 Review 已闭合；Dashboard 前端仍由独立工作流承担。
 
-## Stage D：Chrome Cookie Backend
+## Stage D：Chrome Cookie Backend（已完成）
 
 目标：Chrome 在线且用户授权时按执行读取 Cookie，同时不把 Host 变成通用凭据导出器。
 
 - 实现 `omnihub chrome-host` 的 Native Messaging length-prefixed JSON、精确 `allowed_origins` manifest 与当前用户 IPC；macOS/Linux 用 0600 Unix socket，Windows 用最窄 named-pipe 实现。
 - Operation Service 根据 Channel/RouteTemplate 权威校验 origin/name/store/partition allowlist；Extension 只执行已授权的明确查询。Host 不信任 payload 自报 Extension ID。
 - Cookie 仅进入当前 Execute/Probe 内存，取消/结束即释放；Bridge 断线、permission 缺失、Cookie 缺失与真实 Probe 是独立 health checks。
+- Bridge 离线或 permission 缺失时 Channel 始终 `blocked`；旧 Snapshot 的 View 仍可独立作为 `stale` 分发并保留最近刷新失败事实，历史 Probe 不覆盖当前执行依赖。
 - 输出 MV3 Companion message schema、安装清单与 mock host；Extension 客户端/UI 仍由独立前端工作流完成。
 - Host 安装时只接受一个精确 Extension ID；v1 以 Bridge/Host 与 mock consumer 验收，不为演示增加通用 Cookie Adapter，也不宣称尚无真实 Channel 的来源已可用。
 
 完成证据：framing、越权 scope、错误 origin、断线、成功一次性读取与 reconnect fixture；CLI/serve 共用 Bridge Client；SQLite/HTTP/Run/Error/log/fixture 全文无 Cookie；三平台构建和 Windows pipe 合同测试通过。
 
+当前证据：Native Messaging严格frame/JSON、单Profile当前用户IPC、取消/迟到响应、manifest安装与Chrome argv直启、trusted scope与nil-value Cookie Credential、Query mock consumer零泄漏、Dashboard Browser API/CORS、实时blocked readiness均已闭合。最终全量test/race/vet/diff、聚焦压力、真实隔离CLI/loopback E2E、三平台构建和独立Review通过；真实Extension客户端、Cookie Provider与Windows实机继续按范围外披露。
+
 ## Stage E：本地 semantic grouping 与 v1 发布候选
 
 目标：在不改变 identity 去重与单二进制边界的前提下提供可选语义分组，并完成发布审计。
 
-- 新增 SemanticProfile；本地优先连接用户已有 Ollama/OpenAI-compatible Endpoint，不安装或下载模型、不启动 daemon、不从本地自动回退云端。
-- `shape/evidence/local-vector-study.md` 已重新比较 `sqlite-vec`、Chromem、LanceDB 与 Qdrant。当前仍复用现有 SQLite：embedding 以 little-endian `float32` BLOB 缓存，只在同 provider/model/dimension/index-revision cohort 内做 exact cosine。默认关闭，只写 group/reason/score，不删除或 rerank Item。
+- 新增 SemanticProfile；只实现 OpenAI-compatible embedding contract，本地 Ollama 经 `/v1/embeddings` 接入。输入固定为 title + summary，无 summary 时回退 content.text，总计最多 8 KiB UTF-8；不安装或下载模型、不启动 daemon、不从本地自动回退云端。
+- `shape/evidence/local-vector-study.md` 已确认当前 Driver 自带无 CGO `sqlite-vec`，但其 pre-v1 虚拟表对最多 100 个 Item 的 exact grouping 没有相称收益。当前仍复用普通 SQLite BLOB：只在同 provider/model/dimension/index-revision cohort 内做 Go exact cosine。默认关闭，只写 group/reason/score，不删除或 rerank Item。
 - 固定小语料验证阈值、误合并边界、model revision 与 provider unavailable；另覆盖响应条数/dimension 不匹配、NaN/Inf、零范数与坏 BLOB。失败向量不写 cache、不分组，Item 保留且 Envelope partial。
 - 发布 OPML/Bundle、Egress、RSSHub、GitHub、Tavily、xurl、Chrome Host、SemanticProfile 示例；补扩展指南、SQLite/未来 MySQL 不变量、安装/卸载和 readiness 说明。
 - 生成 macOS/Linux/Windows 单二进制、archives 与 checksums；在全新目录重放 doctor 和来源×功能矩阵，完成独立 Review 与发布说明。

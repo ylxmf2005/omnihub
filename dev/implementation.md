@@ -1,41 +1,42 @@
-# Implementation：OmniHub Stage C Subscription、Dashboard Backend 与 Feed 分发
+# Implementation：OmniHub Stage D Chrome Cookie Backend
 
 ## 实际交付
 
-- 对象与基线：`/private/tmp/omnihub-stage-a` 的 `feature/stage-c-subscriptions` 工作树，相对 Stage B `ec834a9` 的完整 Stage C diff。
-- 已实现行为：一次性 Query 与持久 View 共用同一 Operation Service；SQLite v3 保存 View、immutable Snapshot/current pointer、Run、Probe health 与 identity tombstone；`serve` 提供 Dashboard 管理 API、Query Workbench、Run 轮询、readiness 与 RSS/Atom/JSON Feed 分发。
-- 用户结果：Dashboard Backend 可以用强 `ETag` 管理本机资源，刷新/Workbench/Probe 以持久 Run 返回真实终态；fresh Snapshot 零上游读取，stale Snapshot 立即分发并后台刷新，刷新失败保留旧结果；Agent 与 Feed 消费者仍能检查 Envelope 的来源、Coverage 与 Error。
-- 根因与实现边界：Stage B 的查询内核已有统一 Operation，但缺少持久生命周期和前端可消费的状态合同。本阶段把原子性落在 Repository/SQLite，把 SWR、Run 与 Feed 投影放在 Subscription Service，不新增 scheduler、第二套查询语义、Dashboard 前端或 MySQL 伪实现。
+- 对象与基线：`/private/tmp/omnihub-stage-a` 的 `feature/stage-d-chrome-bridge` 工作树，相对 Stage C `55286d9138d4af679737d65d39040b54d3b6d516` 的完整 Stage D diff。
+- 已实现行为：同一 `omnihub` 二进制可安装并作为 Chrome Native Messaging Host 直接启动；Host 通过当前用户 Unix socket/Windows named pipe 向 CLI/`serve` 暴露在线状态、精确 Cookie scope读取与permission撤销。Query只把Cookie交给显式mock consumer，Dashboard提供连接/授权/撤销合同和实时blocked readiness。
+- 根因与实现边界：localhost页面不能读取其他站点HttpOnly Cookie，Chrome manifest又不能传CLI子命令。实现把用户手势和`chrome.cookies`留给独立Companion Extension，把可信scope和单次执行约束放在Registry/Operation Service，把同一binary直接argv分派放在CLI入口；不增加通用Cookie Adapter、浏览器数据库解密、CDP或wrapper script。
 
 ## 变更
 
-- `internal/core/subscription.go`、`internal/repository/repository.go`、`internal/store/sqlite/store.go`：View/Run/Probe/tombstone 领域合同，SQLite v3 migration，Snapshot/checkpoint/tombstone/Run 终态原子事务，持久幂等、lease/CAS、显式 prune 与 Store 级引用防护。
-- `internal/subscription/`：View 不可变 Operation、fresh/stale/empty/disabled 状态、stale-while-revalidate、单机 singleflight、Observation/StateKey tombstone 与 RSS/Atom/JSON Feed renderer。
-- `internal/health/`、`internal/readiness/readiness.go`：Feed/RSSHub 分层 Probe 的脱敏持久投影、TTL 与严格 route-group `ready_dependent` 聚合；GitHub/Tavily/xurl 保持 `probe_unsupported`。
-- `internal/management/dashboard.go`、`internal/transport/dashboard.go`、`schema.go`：Dashboard CRUD、Credential mask/显式 no-store 回显、revoke、Query Workbench、Run 轮询、Feed、OpenAPI、RFC 9457、Host/Origin/CORS/If-Match 边界。
-- `cmd/omnihub/main.go`：`serve` 装配长期可写 SQLite 与全部 Stage C service；新增 `refresh`、持久 `channels probe`、默认 dry-run 的 `maintenance prune` 与显式 loopback `--dev-origin`。
-- `internal/management/service.go`：Direct Feed 路线 identity 使用 `(canonical URL, Egress)`；同 URL 可经不同出口并存，OPML 只复用相同路线。
-- 既有 `internal/store/sqlite/store_test.go`、`internal/transport/examples_test.go`、`internal/core/model_test.go`、`internal/transport/schema_test.go` 等追加 Stage C 长期回归；没有新增 test 文件。
-- `README.md`：公开当前 Subscription/Dashboard Backend/Feed 能力、调用方式与 append-only Snapshot 成本，不再把 Stage C 写成未来功能。
+- `internal/browser/`：strict Native Messaging framing/JSON、单Profile broker、取消/迟到响应、Client、typed error、scope/result双重校验、当前用户IPC、三平台manifest安装与可信AuthorizationDescriptor。
+- `internal/query/executor.go`、`internal/adapter/browser.go`：`CookieReader`与窄mock consumer；consumer存在后才读取，Cookie返回后清空；任何JSON可观察结果反射secret均fail-closed。
+- `internal/registry/catalog.go`、`internal/management/service.go`：Browser auth descriptor加载期验证；仅enabled+trusted Chrome Template可使用nil-value `chrome_cookie` Credential。
+- `internal/readiness/readiness.go`：Bridge离线或permission缺失始终阻断Channel并移除失真的历史`ready_dependent`；在线/授权不能把未Probe Channel提升为ready。
+- `internal/transport/dashboard.go`、`schema.go`：Bridge状态、Channel授权描述和permission撤销API；严格body、稳定Problem、OpenAPI/JSON Schema与既有Host/Origin/CORS边界。
+- `cmd/omnihub/main.go`：`chrome-host run/install`、Chrome origin argv直启、共享runtime IPC、Dashboard Browser Client与实时readiness装配；新增可测试的`OMNIHUB_RUNTIME_DIR`覆盖。
+- 既有`internal/adapter/binding_test.go`、`internal/transport/examples_test.go`、`internal/transport/schema_test.go`追加Stage D回归；没有新增test文件。
+- `shape/evidence/local-vector-study.md`及关联Shape产物：按当前锁定`modernc.org/sqlite v1.56.0`源码修正sqlite-vec事实，为Stage E保留正确入口，不改变Stage D运行代码。
 
 ## 偏离与决定
 
-- Snapshot 不做隐式覆盖或删除：每次成功刷新 append immutable Snapshot，再原子更新每 View 的 current pointer；v0.1 不暴露历史 API 或自动 compaction。该成本已在 README/Task 中如实保留。
-- 只有 Query Run、View refresh 与 Channel Probe 使用持久 `Idempotency-Key`。queued 或 lease 过期 Run 的幂等重放会重新 dispatch，由 Store claim CAS 保证只有一个执行者访问上游。
-- Probe 只保存可展示的脱敏 health 投影，不保存 Item、正文、原始 response body、代理地址或 Credential；普通 Query 不自动运行重型分层 Probe。
-- Ponytail full：复用现有 Operation、Envelope、Repository、SQLite、Egress 与 stdlib HTTP/XML/JSON；没有新增 scheduler、事件流、Snapshot history API、通用 health 抽象或后台清理器。
+- Channel readiness表达“现在能否执行”：Bridge/permission缺失时即使近期Probe成功也为`blocked`；已有Snapshot继续由View的`stale`与最近刷新结果表达，不新增View `degraded`枚举。
+- v0.1要求permission、scope URL及去掉可选前导点的allowed domain为同一精确HTTPS host。冷审发现Catalog允许父域而Browser拒绝后，收紧加载期合同，避免配置成功但运行失败，也不扩大Cookie读取面。
+- Chrome直接启动manifest中的主二进制时，CLI识别Chrome传入的origin argv并进入Host；origin不作为授权事实，真正允许的Extension仍只由manifest单一`allowed_origins`控制。
+- Windows只把可确认的named-pipe名称冲突映射为`bridge_already_active`；ACL/资源/其他系统错误保留原始根因。
+- Ponytail full：复用现有Catalog、Credential、Query、readiness、Dashboard、SQLite与单binary；没有实现真实Cookie Provider、Extension客户端、多Profile、TCP daemon、wrapper、通用凭据导出或第二份permission状态。
 
 ## 聚焦反馈
 
-- `go test ./... -count=1`：全仓通过；Subscription/Health 由既有 transport 真实 SQLite/HTTP 纵切覆盖。
-- `go test -race ./... -count=1`：全仓通过；Store 的 View/Routing Catalog 真实并发提交未留下悬挂引用。
-- `go vet ./...`、`git diff --check`：exit 0。
-- 最终 CLI/loopback E2E：Dashboard/OpenAPI/Host+CORS、Direct Feed View、refresh 幂等重放/Run 轮询、Feed 200→304、Probe→readiness、prune dry-run/apply 均从最终二进制重放；进程与隔离数据执行清理回读。
-- 三平台交叉构建：darwin/arm64 为 Mach-O、linux/amd64 为静态 ELF、windows/amd64 为 PE32+；SHA-256 分别为 `47cb3a20…2a76`、`d5d70522…7f6`、`dd245fbc…5a1b`。
-- 独立冷审：相对 `ec834a9` 的完整 Stage C diff 为 `approve`，无未解决 P0–P2。
+- `go test ./... -count=1`、`go test -race ./... -count=1`：最终全仓通过。
+- Browser取消/迟到响应同一用例连续20次：通过；没有deadlock或Host失活。
+- disabled Channel/Template readiness与xurl timeout单核压力各连续20次：通过；测试不再用子进程必须在500ms内启动的时序假设冒充产品合同。
+- `go vet ./...`、`git diff --check`：分别exit0。
+- 最终CLI E2E：隔离manifest为0600且只有一个Extension origin；同一binary按Chrome argv直启并返回connected hello ack，退出后socket消失。
+- 最终loopback Dashboard：offline Bridge/readiness为200真实状态；允许dev Origin为200，evil Origin为403；OpenAPI 3.1.0含三条Browser route且不暴露Cookie值。
+- 三平台构建：darwin/arm64 Mach-O、linux/amd64静态ELF、windows/amd64 PE32+；hash与清理见`test/test-report.md`。
 
 ## 证据边界与交接
 
-- 尚未证明：Dashboard 前端、Chrome Extension/Native Host、semantic grouping、Linux/Windows 实机运行、MySQL/多实例与真实 Tavily/X credential。
-- 剩余风险：非当前 Snapshot 会持续占用磁盘；当前没有历史读取或 compaction。Probe readiness 依赖最近一次未过期显式记录，不代表长期上游 SLA。
-- 下一入口：同步 Stage C Test Report/Review/Context/Plan，提交并 push `feature/stage-c-subscriptions`；随后从 `plan.md` Stage D 实现 Chrome Cookie Backend。
+- 尚未证明：真实Chrome Extension、真实Cookie Provider、Windows SID ACL/HKCU实机、Linux实机和Dashboard前端；这些缺口不能被mock或交叉构建写成已支持。
+- 剩余风险：Browser能力在Companion客户端交付前只能标为backend contract verified；Windows平台安全边界需发布矩阵中的真实Windows执行补证。
+- 下一入口：读取`test/test-report.md`与`review/review.md`；Stage D批准并提交后进入Stage E semantic grouping与发布候选。

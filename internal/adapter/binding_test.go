@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -34,8 +35,10 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/egress"
+	"github.com/ylxmf2005/omnihub/internal/registry"
 )
 
 func TestCommandAndMCPBindingProduceSameAdapterResult(t *testing.T) {
@@ -1862,7 +1865,7 @@ func TestXURLAdapterMapsCommandFailuresAndAlwaysCleansHome(t *testing.T) {
 		{name: "malformed_stdout", behavior: fakeXURLBehavior{SearchStdout: "not-json"}, code: core.ErrorParse, wantSearch: true},
 		{name: "schema_invalid", behavior: fakeXURLBehavior{SearchStdout: `{"data":[],"meta":{"result_count":1}}`}, code: core.ErrorProtocol, wantSearch: true},
 		{name: "oversized_stdout", behavior: fakeXURLBehavior{SearchStdout: strings.Repeat("x", 256)}, maxOutputBytes: 64, code: core.ErrorProtocol, wantSearch: true},
-		{name: "timeout", behavior: fakeXURLBehavior{HangSearch: true}, deadlineMS: 500, code: core.ErrorTimeout, retryable: true, wantSearch: true},
+		{name: "timeout", behavior: fakeXURLBehavior{HangSearch: true}, deadlineMS: 30_000, code: core.ErrorTimeout, retryable: true, wantSearch: true},
 		{name: "auth_failure", behavior: fakeXURLBehavior{AuthStderr: "invalid token", AuthExit: 1}, code: core.ErrorAuth},
 	}
 	for _, test := range tests {
@@ -1873,7 +1876,40 @@ func TestXURLAdapterMapsCommandFailuresAndAlwaysCleansHome(t *testing.T) {
 				deadline = 2_000
 			}
 			request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 10, DeadlineMS: deadline}, secret, core.EgressModeDirect, "")
-			result := (XURLAdapter{Executable: executable, MaxOutputBytes: test.maxOutputBytes}).Execute(context.Background(), request)
+			adapter := XURLAdapter{Executable: executable, MaxOutputBytes: test.maxOutputBytes}
+			var result core.AdapterResult
+			if test.behavior.HangSearch {
+				// 先确认 fake search 已启动，再取消整个 Operation。这样测试验证的
+				// 是挂起命令的终止与清理，不依赖机器能否在 500ms 内 fork shell。
+				executionContext, cancel := context.WithCancel(context.Background())
+				resultChannel := make(chan core.AdapterResult, 1)
+				go func() {
+					resultChannel <- adapter.Execute(executionContext, request)
+				}()
+
+				startedBy := time.Now().Add(5 * time.Second)
+				for {
+					raw, err := os.ReadFile(record)
+					if err == nil && strings.Count(string(raw), "twurlrc=hidden") == 2 {
+						break
+					}
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
+						cancel()
+						<-resultChannel
+						t.Fatal(err)
+					}
+					if time.Now().After(startedBy) {
+						cancel()
+						result = <-resultChannel
+						t.Fatalf("xurl search did not start before fixture deadline: %#v", result)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				cancel()
+				result = <-resultChannel
+			} else {
+				result = adapter.Execute(context.Background(), request)
+			}
 			assertAdapterError(t, result, test.code, test.retryable)
 			log := readFixtureFile(t, record)
 			if strings.Count(log, "argv=[auth][app-only][-]") != 1 || strings.Count(log, "argv=[search]") > 1 || test.wantSearch != strings.Contains(log, "argv=[search]") {
@@ -2467,4 +2503,532 @@ func atomFeedFixture(baseURL string) string {
 
 func jsonFeedFixture(baseURL string) string {
 	return fmt.Sprintf(`{"version":"https://jsonfeed.org/version/1.1","title":"Fixture","items":[{"id":"json-1","url":%q,"title":"JSON item","content_text":"JSON body","date_published":"2026-08-14T10:00:00+08:00","authors":[{"name":"Carol"}],"tags":["news"],"attachments":[{"url":%q,"mime_type":"audio/mpeg","title":"Audio"}]}]}`, baseURL+"/json-item", baseURL+"/audio.mp3")
+}
+
+func TestBrowserHostRoundTripPermissionAndRevoke(t *testing.T) {
+	runtimeDir := browserRuntimeDir(t)
+	fixed := time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)
+	host := startBrowserHostFixture(t, runtimeDir, "Current Chrome profile", []string{"https://x.com/*"}, fixed)
+	defer host.stop(t)
+	client := browser.NewClient(runtimeDir)
+
+	status, err := client.Status(context.Background())
+	if err != nil || !status.Connected || status.ProfileLabel != "Current Chrome profile" || !reflect.DeepEqual(status.GrantedOrigins, []string{"https://x.com/*"}) || !status.LastSeenAt.Equal(fixed) {
+		t.Fatalf("Status() = %#v, %v", status, err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(runtimeDir, "chrome.sock"))
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("browser socket mode = %#v, %v", info, err)
+		}
+	}
+
+	request := browserReadCookiesFixture("browserreq_roundtrip")
+	readResult := make(chan browserReadResult, 1)
+	go func() {
+		response, err := client.ReadCookies(context.Background(), request)
+		readResult <- browserReadResult{response: response, err: err}
+	}()
+	forwarded := readBrowserWireFixture(t, host.output)
+	if forwarded.Type != "read_cookies" || forwarded.RequestID != request.RequestID || forwarded.ChannelID != request.ChannelID || forwarded.CookieScope == nil || forwarded.CookieScope.URL != request.CookieScope.URL {
+		t.Fatalf("forwarded read_cookies = %#v", forwarded)
+	}
+	cookie := browser.Cookie{Name: "auth_token", Value: "temporary-cookie-value", Domain: ".x.com", Path: "/", Store: "current", Partition: "unpartitioned"}
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID, Cookies: []browser.Cookie{cookie}})
+	result := <-readResult
+	if result.err != nil || result.response.RequestID != request.RequestID || !reflect.DeepEqual(result.response.Cookies, []browser.Cookie{cookie}) {
+		t.Fatalf("ReadCookies() = %#v, %v", result.response, result.err)
+	}
+
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "permissions_changed", RequestID: "browserreq_permissions_empty", GrantedOrigins: []string{}})
+	permissionAck := readBrowserWireFixture(t, host.output)
+	if permissionAck.Type != "result" || permissionAck.Status == nil || len(permissionAck.Status.GrantedOrigins) != 0 {
+		t.Fatalf("permissions_changed ack = %#v", permissionAck)
+	}
+	if _, err := client.ReadCookies(context.Background(), browserReadCookiesFixture("browserreq_denied")); !errors.Is(err, browser.ErrBrowserPermissionMissing) {
+		t.Fatalf("ReadCookies() permission error = %v", err)
+	}
+
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "permissions_changed", RequestID: "browserreq_permissions_restore", GrantedOrigins: []string{"https://x.com/*"}})
+	_ = readBrowserWireFixture(t, host.output)
+	revokeResult := make(chan browserRevokeResult, 1)
+	go func() {
+		response, err := client.RevokePermission(context.Background(), "https://x.com/*")
+		revokeResult <- browserRevokeResult{response: response, err: err}
+	}()
+	revoke := readBrowserWireFixture(t, host.output)
+	if revoke.Type != "revoke_permission" || revoke.PermissionOriginPattern != "https://x.com/*" {
+		t.Fatalf("forwarded revoke_permission = %#v", revoke)
+	}
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: revoke.RequestID, GrantedOrigins: []string{}})
+	revoked := <-revokeResult
+	if revoked.err != nil || revoked.response.Status.Connected != true || len(revoked.response.Status.GrantedOrigins) != 0 {
+		t.Fatalf("RevokePermission() = %#v, %v", revoked.response, revoked.err)
+	}
+}
+
+func TestBrowserHostRejectsMissingCookiesAndExpandedScope(t *testing.T) {
+	host := startBrowserHostFixture(t, browserRuntimeDir(t), "Profile", []string{"https://x.com/*"}, time.Now().UTC())
+	defer host.stop(t)
+	client := browser.NewClient(host.runtimeDir)
+
+	request := browserReadCookiesFixture("browserreq_missing")
+	missing := make(chan error, 1)
+	go func() {
+		_, err := client.ReadCookies(context.Background(), request)
+		missing <- err
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID})
+	if err := <-missing; !errors.Is(err, browser.ErrCookieMissing) {
+		t.Fatalf("missing cookie error = %v", err)
+	}
+
+	request = browserReadCookiesFixture("browserreq_scope")
+	expanded := make(chan error, 1)
+	go func() {
+		_, err := client.ReadCookies(context.Background(), request)
+		expanded <- err
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	writeBrowserWireFixture(t, host.input, browserWireFixture{
+		ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID,
+		Cookies: []browser.Cookie{{Name: "auth_token", Value: "out-of-scope", Domain: ".example.com", Path: "/", Store: "current", Partition: "unpartitioned"}},
+	})
+	if err := <-expanded; !errors.Is(err, browser.ErrScopeInvalid) {
+		t.Fatalf("expanded cookie scope error = %v", err)
+	}
+
+	request = browserReadCookiesFixture("browserreq_sanitized_error")
+	sanitized := make(chan error, 1)
+	go func() {
+		_, err := client.ReadCookies(context.Background(), request)
+		sanitized <- err
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "error", RequestID: request.RequestID, Error: &browser.BridgeError{Code: browser.ErrorCookieMissing, Message: "temporary-cookie-value"}})
+	if err := <-sanitized; !errors.Is(err, browser.ErrCookieMissing) || strings.Contains(err.Error(), "temporary-cookie-value") {
+		t.Fatalf("unsanitized Extension error = %v", err)
+	}
+	if _, err := client.Status(context.Background()); err != nil {
+		t.Fatalf("host stopped after a scoped result error: %v", err)
+	}
+}
+
+func TestBrowserHostCancellationDoesNotBlockNextRequest(t *testing.T) {
+	host := startBrowserHostFixture(t, browserRuntimeDir(t), "Profile", []string{"https://x.com/*"}, time.Now().UTC())
+	defer host.stop(t)
+	client := browser.NewClient(host.runtimeDir)
+
+	// Client 保持单飞，但等待前一个请求的调用必须遵守自己的 context；
+	// 第二个请求取消不能影响仍在 Extension 中执行的第一个请求。
+	held := browserReadCookiesFixture("browserreq_held")
+	heldResult := make(chan browserReadResult, 1)
+	go func() {
+		response, err := client.ReadCookies(context.Background(), held)
+		heldResult <- browserReadResult{response: response, err: err}
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	shortContext, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	shortResult := make(chan error, 1)
+	go func() {
+		_, err := client.Status(shortContext)
+		shortResult <- err
+	}()
+	select {
+	case err := <-shortResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("queued Status() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		writeBrowserWireFixture(t, host.input, browserWireFixture{
+			ProtocolVersion: "1.0", Type: "result", RequestID: held.RequestID,
+			Cookies: []browser.Cookie{{Name: "auth_token", Value: "held", Domain: ".x.com", Path: "/", Store: "current", Partition: "unpartitioned"}},
+		})
+		t.Fatal("queued Status() ignored its context while another request was pending")
+	}
+	writeBrowserWireFixture(t, host.input, browserWireFixture{
+		ProtocolVersion: "1.0", Type: "result", RequestID: held.RequestID,
+		Cookies: []browser.Cookie{{Name: "auth_token", Value: "held", Domain: ".x.com", Path: "/", Store: "current", Partition: "unpartitioned"}},
+	})
+	if result := <-heldResult; result.err != nil || len(result.response.Cookies) != 1 {
+		t.Fatalf("pending ReadCookies() after queued cancellation = %#v, %v", result.response, result.err)
+	}
+
+	first := browserReadCookiesFixture("browserreq_timeout")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := client.ReadCookies(ctx, first)
+		firstResult <- err
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	if err := <-firstResult; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timed out ReadCookies() error = %v", err)
+	}
+
+	second := browserReadCookiesFixture("browserreq_after_timeout")
+	secondResult := make(chan browserReadResult, 1)
+	go func() {
+		response, err := client.ReadCookies(context.Background(), second)
+		secondResult <- browserReadResult{response: response, err: err}
+	}()
+	forwarded := readBrowserWireFixture(t, host.output)
+	if forwarded.RequestID != second.RequestID {
+		t.Fatalf("next forwarded request_id = %q", forwarded.RequestID)
+	}
+	writeBrowserWireFixture(t, host.input, browserWireFixture{
+		ProtocolVersion: "1.0", Type: "result", RequestID: second.RequestID,
+		Cookies: []browser.Cookie{{Name: "auth_token", Value: "short-lived", Domain: ".x.com", Path: "/", Store: "current", Partition: "unpartitioned"}},
+	})
+	if result := <-secondResult; result.err != nil || len(result.response.Cookies) != 1 {
+		t.Fatalf("ReadCookies() after timeout = %#v, %v", result.response, result.err)
+	}
+
+	// 迟到的旧响应只按已取消 request_id 丢弃，不能杀死当前 Profile Bridge。
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "error", RequestID: first.RequestID, Error: &browser.BridgeError{Code: browser.ErrorCookieMissing, Message: "late"}})
+	if _, err := client.Status(context.Background()); err != nil {
+		t.Fatalf("host stopped after a late canceled response: %v", err)
+	}
+}
+
+func TestBrowserHostStrictFramingAndOfflineClient(t *testing.T) {
+	client := browser.NewClient(filepath.Join(t.TempDir(), "missing"))
+	started := time.Now()
+	if _, err := client.Status(context.Background()); !errors.Is(err, browser.ErrBrowserUnavailable) {
+		t.Fatalf("offline Status() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("offline Status() took %s", elapsed)
+	}
+
+	var oversized [4]byte
+	binary.LittleEndian.PutUint32(oversized[:], (1<<20)+1)
+	if err := browser.RunHost(context.Background(), bytes.NewReader(oversized[:]), io.Discard, t.TempDir(), time.Now); !errors.Is(err, browser.ErrProtocol) {
+		t.Fatalf("oversized native frame error = %v", err)
+	}
+
+	for _, payload := range [][]byte{
+		[]byte(`{"protocol_version":"1.0","type":"hello","request_id":"browserreq_unknown","profile_label":"Profile","granted_origins":[],"extension_id":"untrusted"}`),
+		[]byte(`{"protocol_version":"1.0","type":"hello","request_id":"browserreq_first","request_id":"browserreq_second","profile_label":"Profile","granted_origins":[]}`),
+	} {
+		var framed bytes.Buffer
+		binary.LittleEndian.PutUint32(oversized[:], uint32(len(payload)))
+		framed.Write(oversized[:])
+		framed.Write(payload)
+		if err := browser.RunHost(context.Background(), &framed, io.Discard, t.TempDir(), time.Now); !errors.Is(err, browser.ErrProtocol) {
+			t.Fatalf("non-strict native JSON error = %v", err)
+		}
+	}
+}
+
+func TestBrowserHostAndClientRejectMismatchedRequestID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("raw fake endpoint is Unix-only; Windows Host mismatch path uses the same broker")
+	}
+	runtimeDir := browserRuntimeDir(t)
+	listener, err := net.Listen("unix", filepath.Join(runtimeDir, "chrome.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	statusResult := make(chan error, 1)
+	go func() {
+		_, err := browser.NewClient(runtimeDir).Status(context.Background())
+		statusResult <- err
+	}()
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := readBrowserWireFixture(t, connection)
+	writeBrowserWireFixture(t, connection, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID + "_wrong", Status: &browser.Status{Connected: true}})
+	_ = connection.Close()
+	if err := <-statusResult; !errors.Is(err, browser.ErrProtocol) {
+		t.Fatalf("Client mismatched response error = %v", err)
+	}
+	_ = listener.Close()
+
+	host := startBrowserHostFixture(t, runtimeDir, "Profile", []string{"https://x.com/*"}, time.Now().UTC())
+	readResult := make(chan error, 1)
+	go func() {
+		_, err := browser.NewClient(runtimeDir).ReadCookies(context.Background(), browserReadCookiesFixture("browserreq_host_mismatch"))
+		readResult <- err
+	}()
+	_ = readBrowserWireFixture(t, host.output)
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: "browserreq_wrong", Cookies: []browser.Cookie{{Name: "auth_token", Value: "short-lived", Domain: ".x.com", Path: "/", Store: "current", Partition: "unpartitioned"}}})
+	select {
+	case err := <-host.done:
+		host.stopped = true
+		_ = host.input.Close()
+		_ = host.output.Close()
+		if !errors.Is(err, browser.ErrProtocol) {
+			t.Fatalf("Host mismatched response error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Host did not fail a mismatched Extension response")
+	}
+	if err := <-readResult; !errors.Is(err, browser.ErrBrowserUnavailable) {
+		t.Fatalf("Client error after Host mismatch = %v", err)
+	}
+}
+
+func TestBrowserHostSingleActiveStaleSocketAndReconnect(t *testing.T) {
+	runtimeDir := browserRuntimeDir(t)
+	first := startBrowserHostFixture(t, runtimeDir, "First Profile", nil, time.Now().UTC())
+	client := browser.NewClient(runtimeDir)
+
+	var secondInput, secondOutput bytes.Buffer
+	writeBrowserWireFixture(t, &secondInput, browserWireFixture{ProtocolVersion: "1.0", Type: "hello", RequestID: "browserreq_second_profile", ProfileLabel: "Second Profile"})
+	if err := browser.RunHost(context.Background(), &secondInput, &secondOutput, runtimeDir, time.Now); !errors.Is(err, browser.ErrBridgeAlreadyActive) {
+		first.stop(t)
+		t.Fatalf("second profile RunHost() error = %v", err)
+	}
+	secondResponse := readBrowserWireFixture(t, &secondOutput)
+	if secondResponse.Type != "error" || secondResponse.Error == nil || secondResponse.Error.Code != browser.ErrorBridgeAlreadyActive {
+		first.stop(t)
+		t.Fatalf("second profile response = %#v", secondResponse)
+	}
+	first.stop(t)
+	if runtime.GOOS == "windows" {
+		reconnected := startBrowserHostFixture(t, runtimeDir, "Reconnected Profile", nil, time.Now().UTC())
+		defer reconnected.stop(t)
+		status, err := client.Status(context.Background())
+		if err != nil || status.ProfileLabel != "Reconnected Profile" {
+			t.Fatalf("Windows named-pipe Status() after reconnect = %#v, %v", status, err)
+		}
+		return
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, "chrome.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket remained after host exit: %v", err)
+	}
+
+	address := &net.UnixAddr{Name: filepath.Join(runtimeDir, "chrome.sock"), Net: "unix"}
+	stale, err := net.ListenUnix("unix", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reconnected := startBrowserHostFixture(t, runtimeDir, "Reconnected Profile", nil, time.Now().UTC())
+	defer reconnected.stop(t)
+	status, err := client.Status(context.Background())
+	if err != nil || status.ProfileLabel != "Reconnected Profile" || status.GrantedOrigins == nil || len(status.GrantedOrigins) != 0 {
+		t.Fatalf("Status() after reconnect = %#v, %v", status, err)
+	}
+}
+
+func TestBrowserHostManifestUsesOneExactExtensionOrigin(t *testing.T) {
+	for _, invalid := range []string{"", "abcdefghijklmnop", "abcdefghijklmnopabcdefghijklmnox", "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"} {
+		if _, err := browser.InstallHost(filepath.Join(t.TempDir(), "missing"), invalid); !errors.Is(err, browser.ErrScopeInvalid) {
+			t.Fatalf("InstallHost(%q) error = %v", invalid, err)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("positive install writes HKCU; Windows build validates the registry implementation")
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	executable := filepath.Join(home, "omnihub")
+	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	extensionID := "abcdefghijklmnopabcdefghijklmnop"
+	result, err := browser.InstallHost(executable, extensionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(result.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Name           string   `json:"name"`
+		Description    string   `json:"description"`
+		Path           string   `json:"path"`
+		Type           string   `json:"type"`
+		AllowedOrigins []string `json:"allowed_origins"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Name != browser.HostName || manifest.Path != executable || manifest.Type != "stdio" || !reflect.DeepEqual(manifest.AllowedOrigins, []string{"chrome-extension://" + extensionID + "/"}) {
+		t.Fatalf("native host manifest = %#v", manifest)
+	}
+	info, err := os.Stat(result.ManifestPath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("native host manifest mode = %#v, %v", info, err)
+	}
+}
+
+func TestBrowserAuthorizationComesFromEnabledTrustedCatalog(t *testing.T) {
+	template := core.RouteTemplate{
+		RouteTemplateID: "x-browser-cookie", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "fixture",
+		Auth: core.AuthDescriptor{
+			Kind: "browser_cookie", Required: true, LoginURL: "https://x.com/login", Browser: "chrome", PermissionOrigins: []string{"https://x.com/*"},
+			CookieScope: &core.CookieScope{URL: "https://x.com/", AllowedDomains: []string{"x.com", ".x.com"}, Names: []string{"auth_token"}, Store: "current", Partitions: []string{"unpartitioned"}},
+		},
+	}
+	channel := core.Channel{ID: "channel_x_cookie", Source: "x", RouteTemplateID: template.RouteTemplateID, Enabled: true}
+	catalog, err := registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{channel}, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := browser.AuthorizationForChannel(catalog, channel.ID)
+	if err != nil || descriptor.LoginURL != template.Auth.LoginURL || descriptor.PermissionOriginPattern != template.Auth.PermissionOrigins[0] || !reflect.DeepEqual(descriptor.CookieScope.Names, template.Auth.CookieScope.Names) {
+		t.Fatalf("AuthorizationForChannel() = %#v, %v", descriptor, err)
+	}
+
+	disabled := channel
+	disabled.Enabled = false
+	catalog, err = registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{disabled}, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := browser.AuthorizationForChannel(catalog, channel.ID); !errors.Is(err, browser.ErrScopeInvalid) {
+		t.Fatalf("disabled AuthorizationForChannel() error = %v", err)
+	}
+}
+
+type browserWireFixture struct {
+	ProtocolVersion         string               `json:"protocol_version"`
+	Type                    string               `json:"type"`
+	RequestID               string               `json:"request_id"`
+	ProfileLabel            string               `json:"profile_label,omitempty"`
+	GrantedOrigins          []string             `json:"granted_origins,omitempty"`
+	Status                  *browser.Status      `json:"status,omitempty"`
+	ChannelID               string               `json:"channel_id,omitempty"`
+	PermissionOriginPattern string               `json:"permission_origin_pattern,omitempty"`
+	CookieScope             *browser.CookieScope `json:"cookie_scope,omitempty"`
+	Cookies                 []browser.Cookie     `json:"cookies,omitempty"`
+	Error                   *browser.BridgeError `json:"error,omitempty"`
+}
+
+type browserHostFixture struct {
+	runtimeDir string
+	input      *io.PipeWriter
+	output     *io.PipeReader
+	done       chan error
+	stopped    bool
+}
+
+type browserReadResult struct {
+	response browser.ReadCookiesResponse
+	err      error
+}
+
+type browserRevokeResult struct {
+	response browser.RevokePermissionResponse
+	err      error
+}
+
+func startBrowserHostFixture(t *testing.T, runtimeDir, profile string, origins []string, fixed time.Time) *browserHostFixture {
+	t.Helper()
+	hostInput, extensionInput := io.Pipe()
+	extensionOutput, hostOutput := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- browser.RunHost(context.Background(), hostInput, hostOutput, runtimeDir, func() time.Time { return fixed })
+	}()
+	fixture := &browserHostFixture{runtimeDir: runtimeDir, input: extensionInput, output: extensionOutput, done: done}
+	writeBrowserWireFixture(t, extensionInput, browserWireFixture{ProtocolVersion: "1.0", Type: "hello", RequestID: "browserreq_hello", ProfileLabel: profile, GrantedOrigins: origins})
+	ack := readBrowserWireFixture(t, extensionOutput)
+	if ack.Type != "result" || ack.RequestID != "browserreq_hello" || ack.Status == nil || !ack.Status.Connected {
+		fixture.stop(t)
+		t.Fatalf("hello ack = %#v", ack)
+	}
+	return fixture
+}
+
+func (fixture *browserHostFixture) stop(t *testing.T) {
+	t.Helper()
+	if fixture.stopped {
+		return
+	}
+	fixture.stopped = true
+	_ = fixture.input.Close()
+	select {
+	case err := <-fixture.done:
+		if err != nil {
+			t.Fatalf("RunHost() exit error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunHost() did not stop after native disconnect")
+	}
+	_ = fixture.output.Close()
+}
+
+func browserReadCookiesFixture(requestID string) browser.ReadCookiesRequest {
+	return browser.ReadCookiesRequest{
+		RequestID: requestID, ChannelID: "channel_x_cookie", PermissionOriginPattern: "https://x.com/*",
+		CookieScope: browser.CookieScope{URL: "https://x.com/", AllowedDomains: []string{"x.com", ".x.com"}, Names: []string{"auth_token"}, Store: "current", Partitions: []string{"unpartitioned"}},
+	}
+}
+
+func browserRuntimeDir(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "omnihub-browser-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return directory
+}
+
+func writeBrowserWireFixture(t *testing.T, writer io.Writer, message browserWireFixture) {
+	t.Helper()
+	payload, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [4]byte
+	binary.LittleEndian.PutUint32(header[:], uint32(len(payload)))
+	if _, err := writer.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readBrowserWireFixture(t *testing.T, reader io.Reader) browserWireFixture {
+	t.Helper()
+	type result struct {
+		message browserWireFixture
+		err     error
+	}
+	resultChannel := make(chan result, 1)
+	go func() {
+		var header [4]byte
+		if _, err := io.ReadFull(reader, header[:]); err != nil {
+			resultChannel <- result{err: err}
+			return
+		}
+		payload := make([]byte, binary.LittleEndian.Uint32(header[:]))
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			resultChannel <- result{err: err}
+			return
+		}
+		var message browserWireFixture
+		err := json.Unmarshal(payload, &message)
+		resultChannel <- result{message: message, err: err}
+	}()
+	select {
+	case decoded := <-resultChannel:
+		if decoded.err != nil {
+			t.Fatal(decoded.err)
+		}
+		return decoded.message
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out reading browser native message")
+		return browserWireFixture{}
+	}
 }

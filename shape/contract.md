@@ -354,7 +354,7 @@ spec:
   limitations: [user_opt_in_only, x_terms_apply]
 ```
 
-RouteTemplate 声明允许的 Source constraint、Provider、权限 origin pattern、实际 Cookie query scope、参数和限制，自身不可运行。Chrome permission pattern 与 `chrome.cookies` 的 URL/domain/name/store/partition 不能混为一个字段。`sourceConstraint` 至少支持 `exact | any_registered | domain_pattern`；具体 Source 始终由 Channel 绑定。`builtin` Template 随版本发布且只读；imported Template 在用户审核 browser scope 并提升为 trusted 前不能创建启用的 Cookie Channel。
+RouteTemplate 声明允许的 Source constraint、Provider、权限 origin pattern、实际 Cookie query scope、参数和限制，自身不可运行。Chrome permission pattern 与 `chrome.cookies` 的 URL/domain/name/store/partition 不能混为一个字段，但 v0.1 要求 permission、scope URL 和去掉可选前导点的 allowed domain 都指向同一个精确 HTTPS host，不接受父域扩张。`sourceConstraint` 至少支持 `exact | any_registered | domain_pattern`；具体 Source 始终由 Channel 绑定。`builtin` Template 随版本发布且只读；imported Template 在用户审核 browser scope 并提升为 trusted 前不能创建启用的 Cookie Channel。
 
 ### 7.2 EndpointProfile
 
@@ -533,13 +533,13 @@ spec:
   enabled: true
 ```
 
-- Endpoint 必须由用户显式配置并遵守自己的 EgressProfile；本地 Ollama 与云端 OpenAI-compatible Endpoint 使用同一 embedding 请求边界，不自动下载模型、启动服务、切换 Provider 或从本地回退云端。
-- embedding 输入只由有界、确定性的 title + summary/content 组成。Cookie、Credential、Authorization、请求头、Browser Bridge 消息与未选择的正文不得进入输入。
+- Endpoint 必须由用户显式配置并遵守自己的 EgressProfile；v0.1 只发送 OpenAI-compatible embedding 请求，本地 Ollama 使用 `/v1/embeddings`，不实现或自动探测原生 `/api/embed`，也不自动下载模型、启动服务、切换 Provider 或从本地回退云端。
+- embedding 输入固定拼接 title + summary；summary 缺失时才回退 content.text，并按 UTF-8 截断到总计 8 KiB。该配方由 index revision 固定；Cookie、Credential、Authorization、请求头、Browser Bridge 消息与未选择的正文不得进入输入。
 - MVP 把向量按 little-endian `float32` BLOB 缓存在现有 SQLite；cache key 至少包含规范化输入 hash、Endpoint、model、dimension 与 index revision。不同 cohort 不得比较，模型或规范化规则变化使旧 cohort stale。
 - 写 cache 前必须验证响应条数、每条 dimension 与 profile 完全一致，所有分量为有限数且向量范数大于零；BLOB 长度、字节序或解码失败同样拒绝。失败条目不写 cache、不参与 grouping，并产生 `similarity_unavailable`，不得让 NaN/Inf 进入 score。
 - 单次 Operation 最多 100 个 Item，使用精确 cosine，不建立 ANN 索引。每个分组 Item 保留自己的 ID/Observation，`similarity.strategy` 为 `semantic:<profile-id>:<model>`，并记录与组代表的 score。
 - embedding 失败时保留全部检索 Item，Envelope 为 `partial` 并报告 `similarity_unavailable`；不得静默关闭 grouping 或伪装成功。
-- 该路线已按 `shape/evidence/local-vector-study.md` 对近期本地候选重新裁决。单 cohort 达到约 10,000 条、semantic p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec`；此前不引入第二 Store、CGO 或 sidecar。
+- 该路线已按 `shape/evidence/local-vector-study.md` 对近期本地候选重新裁决。当前 Driver 的 `modernc.org/sqlite/vec` 已能无 CGO 注册 sqlite-vec，但 v0.1 在单次最多 100 个 Item 的 exact grouping 中不启用其 pre-v1 虚拟表。单 cohort 达到约 10,000 条、semantic p95 超过 150ms 或出现跨 Snapshot KNN 需求时，优先 spike 该现成入口；此前不增加第二套向量状态。
 
 ## 8. Provider Binding
 
@@ -810,7 +810,7 @@ sequenceDiagram
     O-->>D: Run + Channel Health
 ```
 
-Chrome 或 Bridge 离线时，依赖 Cookie 的 Channel 立即以 check/error code `browser_unavailable` 失败，不尝试启动浏览器或无限等待；Channel readiness 派生为 `blocked`，若已有近期成功 Probe 证据则可为 `degraded`。其他 Channel 成功时总结果为 `partial`；View 保留最近成功 Snapshot。登录、permission、Bridge connected 和真实 Channel Probe 是分层证据，前三者不能单独产生 `ready`。
+Chrome 或 Bridge 离线时，依赖 Cookie 的 Channel 立即以 check/error code `browser_unavailable` 失败，不尝试启动浏览器或无限等待；Channel readiness 始终派生为 `blocked`，近期成功 Probe 不能覆盖当前依赖缺失。其他 Channel 成功时总结果为 `partial`；View 可保留最近成功 Snapshot，以 `stale` 与最近刷新失败事实分别呈现。登录、permission、Bridge connected 和真实 Channel Probe 是分层证据，前三者不能单独产生 `ready`。
 
 ### 13.4 撤销
 

@@ -254,9 +254,9 @@ Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder�
 
 ### 9.2 Similarity Grouping
 
-semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 little-endian `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。`shape/evidence/local-vector-study.md` 已比较近期 `sqlite-vec`、Chromem、LanceDB 与 Qdrant；当前候选要么仍是 exact scan，要么需要 C extension、第二持久状态或 sidecar，不能改善这条真实路径。其复杂度上限清楚，且复用现有事务、备份、权限与三平台纯 Go 发布链。
+semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 little-endian `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。`shape/evidence/local-vector-study.md` 已确认当前 Driver 可用无 CGO 的 `modernc.org/sqlite/vec`，但它在这条路径仍是 exact scan，并额外引入 pre-v1 虚拟表、shadow table 和全局自动注册；Chromem、LanceDB 与 Qdrant 则需要第二状态、FFI 或 sidecar。BLOB + Go cosine 的复杂度上限清楚，且复用现有事务、备份、权限与三平台发布链。
 
-SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；本地 Ollama 和云端 OpenAI-compatible Endpoint 都经现有 Endpoint/Egress/Credential 边界。OmniHub 不安装 Ollama、不下载模型、不启动 daemon。模型或输入规范变化提升 index revision，旧向量保持 stale 而不混算。embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec` 的 driver 与发布矩阵。
+SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；v0.1 只实现 OpenAI-compatible wire contract，本地 Ollama 经 `/v1/embeddings` 接入，云端兼容服务走同一条 Endpoint/Egress/Credential 边界。输入为 title + summary，summary 缺失时回退 content.text，总计最多 8 KiB UTF-8；配方变化提升 index revision。OmniHub 不实现原生 `/api/embed` 自动探测，不安装 Ollama、不下载模型、不启动 daemon。旧向量保持 stale 而不混算；embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec` 的 driver 与发布矩阵。
 
 ## 10. 状态、缓存与增量一致性
 
@@ -386,7 +386,7 @@ omnihub doctor --channel channel_x_official --format json
 - `chrome_cookie` Credential 不保存 Cookie。Chrome Extension 在用户手势下请求目标 origin 的 optional host permission，以 `chrome.cookies` 按 Channel Execute/Probe 读取 RouteTemplate allowlist；禁止 `<all_urls>` 常驻权限、`debugger`、默认 Profile CDP、Cookie SQLite 扫描或自行 OS 解密。
 - Extension 通过 `connectNative()` 与 `omnihub chrome-host` 维持可重连 Port。Host 暴露当前 OS 用户专属的 Unix socket/Windows named pipe，CLI 与 `serve` 的 Browser Bridge Client 都可请求当前 execution；Chrome 依据 Host manifest 的 `allowed_origins` 限制固定 Extension ID，Host 不信任 payload 自报身份。
 - Login URL、origin 与 cookie name 必须来自受信任 RouteTemplate。Chrome origin permission 可以被同一当前 Profile 中、allowlist 为其子集的多个 Channel 复用；Cookie 只进入当前 Adapter 内存，结束即释放。
-- Channel health 同时保留 `desired_state`、派生 `readiness`、带 TTL 的 `checks[]`、`action_required` 与独立 `last_execution`。登录成功、Extension 已连接或 Endpoint 200 都不能单独产生 ready；Bridge 断开以 `checks.browser_bridge.code=browser_unavailable` 表达，readiness 为 `blocked` 或保留近期成功证据时的 `degraded`。
+- Channel health 同时保留 `desired_state`、派生 `readiness`、带 TTL 的 `checks[]`、`action_required` 与独立 `last_execution`。登录成功、Extension 已连接或 Endpoint 200 都不能单独产生 ready；Bridge 断开或 permission 缺失代表当前不可执行，Channel readiness 始终为 `blocked`。已有成功 Snapshot 的 View 可独立保持 `stale`，并保留最近刷新失败事实。
 - `serve` 只监听 loopback，并校验 Host/Origin/CORS；个人 MVP 不增加 Dashboard 登录、bootstrap secret 或 session/CSRF 系统。能读 SQLite 的本机账号能读 API Key，这是明确的信任前提；开放非 loopback 监听需要重新 Shape。
 - 撤销 Chrome origin permission 会阻断依赖 Channel，但不修改网站 Cookie。修改/删除 API Key Credential 会更新 revision 或阻断依赖 Channel。
 - Remote RSSHub/Tavily 等 Profile 标记 trust，提示查询会离开本机。

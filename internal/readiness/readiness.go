@@ -126,6 +126,75 @@ func FromProbeHealth(catalog *registry.Catalog, records []core.ChannelProbeRecor
 	return report
 }
 
+// WithBrowserBridge 把当前 Chrome 长连接和 origin permission 叠加到既有
+// readiness；Bridge/permission 只决定能否执行，不能把未 Probe 的 Channel
+// 提升为 ready。调用方必须传入本次实时读取的 Bridge 状态。
+func WithBrowserBridge(report Report, catalog *registry.Catalog, bridge core.BrowserBridge, now time.Time) Report {
+	if catalog == nil {
+		return report
+	}
+	granted := make(map[string]bool, len(bridge.GrantedOrigins))
+	blocked := make(map[string]bool)
+	for _, origin := range bridge.GrantedOrigins {
+		granted[origin] = true
+	}
+	for index := range report.Channels {
+		channelHealth := &report.Channels[index]
+		channel, ok := catalog.Channel(channelHealth.ChannelID)
+		if !ok || !channel.Enabled {
+			continue
+		}
+		template, ok := catalog.RouteTemplate(channel.RouteTemplateID)
+		if !ok || !catalog.TemplateEnabled(template.RouteTemplateID) || template.Auth.Kind != "browser_cookie" || template.Auth.Browser != "chrome" || !catalog.TemplateTrusted(template.RouteTemplateID) {
+			continue
+		}
+		if !bridge.Connected {
+			code := string(core.ErrorBrowserUnavailable)
+			problem := core.Error{Code: core.ErrorBrowserUnavailable, Message: "Chrome Browser Bridge is unavailable", Retryable: true}
+			channelHealth.Checks = append(channelHealth.Checks, Check{Kind: "browser_bridge", Status: CheckFailed, Code: &code, CheckedAt: now.UTC(), Error: &problem})
+			channelHealth.Readiness = StateBlocked
+			blocked[channelHealth.ChannelID] = true
+			channelHealth.ActionRequired = &ActionRequired{Kind: "start_chrome_bridge"}
+			continue
+		}
+		channelHealth.Checks = append(channelHealth.Checks, Check{Kind: "browser_bridge", Status: CheckPassed, CheckedAt: now.UTC()})
+
+		permissionGranted := len(template.Auth.PermissionOrigins) > 0
+		for _, origin := range template.Auth.PermissionOrigins {
+			permissionGranted = permissionGranted && granted[origin]
+		}
+		if !permissionGranted {
+			code := string(core.ErrorBrowserPermission)
+			problem := core.Error{Code: core.ErrorBrowserPermission, Message: "Chrome origin permission is missing", Retryable: false}
+			channelHealth.Checks = append(channelHealth.Checks, Check{Kind: "browser_permission", Status: CheckFailed, Code: &code, CheckedAt: now.UTC(), Error: &problem})
+			channelHealth.Readiness = StateBlocked
+			blocked[channelHealth.ChannelID] = true
+			channelHealth.ActionRequired = &ActionRequired{Kind: "grant_browser_permission", URL: template.Auth.LoginURL}
+			continue
+		}
+		channelHealth.Checks = append(channelHealth.Checks, Check{Kind: "browser_permission", Status: CheckPassed, CheckedAt: now.UTC()})
+	}
+	// route-group 是 Channel 当前事实的聚合；Browser 依赖阻断后不能继续
+	// 保留根据历史 Probe 计算的 ready_dependent。
+	if len(blocked) > 0 {
+		groups := report.RouteGroups[:0]
+		for _, group := range report.RouteGroups {
+			keep := true
+			for _, channelID := range group.ChannelIDs {
+				if blocked[channelID] {
+					keep = false
+					break
+				}
+			}
+			if keep {
+				groups = append(groups, group)
+			}
+		}
+		report.RouteGroups = groups
+	}
+	return report
+}
+
 func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) ChannelHealth {
 	result := ChannelHealth{ChannelID: channel.ID, DesiredState: DesiredEnabled, Readiness: StateUnknown}
 	addCheck := func(kind string, status CheckStatus, code *string) {

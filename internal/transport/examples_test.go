@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/ylxmf2005/omnihub/internal/adapter"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/health"
 	"github.com/ylxmf2005/omnihub/internal/management"
@@ -337,12 +339,7 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 		}
 	}
 
-	cookieTemplate := core.RouteTemplate{
-		RouteTemplateID: "cookie-template", Origin: "imported", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}},
-		Provider: "provider", Adapter: "command", Capabilities: []string{"latest"}, ContentLevel: "metadata",
-		Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "provider_defined"},
-		Auth: core.AuthDescriptor{Kind: "browser_cookie", Required: true}, Cost: "unknown", Trust: "imported",
-	}
+	cookieTemplate := stageDBrowserTemplate("cookie-template", "provider", "source")
 	cookieCatalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "source", Origin: "imported", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
 		[]core.RouteTemplate{cookieTemplate}, []core.Channel{{ID: "cookie", Source: "source", RouteTemplateID: "cookie-template", EgressProfileID: "egress-direct", CredentialID: "cookie-credential", Enabled: true}},
@@ -367,6 +364,34 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	}
 	if plan, err := router.Build(trusted, operation); err != nil || len(plan.Selected) != 1 {
 		t.Fatalf("Build(trusted cookie) = %#v, %v", plan, err)
+	}
+	for name, mutate := range map[string]func(*core.RouteTemplate){
+		"wrong browser": func(template *core.RouteTemplate) { template.Auth.Browser = "firefox" },
+		"broad origin": func(template *core.RouteTemplate) {
+			template.Auth.PermissionOrigins = []string{"https://*.example.com/*"}
+		},
+		"outside cookie domain": func(template *core.RouteTemplate) {
+			template.Auth.CookieScope.AllowedDomains = []string{"outside.example"}
+		},
+		"parent cookie domain": func(template *core.RouteTemplate) {
+			template.Auth.PermissionOrigins = []string{"https://www.example.com/*"}
+			template.Auth.CookieScope.URL = "https://www.example.com/"
+			template.Auth.CookieScope.AllowedDomains = []string{".example.com"}
+		},
+		"browser fields on token auth": func(template *core.RouteTemplate) { template.Auth.Kind = "token" },
+	} {
+		t.Run("browser descriptor "+name, func(t *testing.T) {
+			template := stageDBrowserTemplate("invalid-browser", "provider", "source")
+			mutate(&template)
+			_, err := registry.NewCatalog(
+				[]core.Source{{ID: "source", Enabled: true}},
+				[]core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+				[]core.RouteTemplate{template}, nil, nil, nil, nil, nil, nil,
+			)
+			if !errors.Is(err, registry.ErrInvalidCatalog) {
+				t.Fatalf("NewCatalog(invalid browser descriptor) error = %v", err)
+			}
+		})
 	}
 
 	endpointTemplate := core.RouteTemplate{RouteTemplateID: "endpoint-required", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "provider", Capabilities: []string{"latest"}, EndpointRequired: true}
@@ -688,6 +713,18 @@ type fakeXURLExecutor struct {
 	requests []adapter.XURLRequest
 }
 
+type fakeCookieReader struct {
+	cookies  []browser.Cookie
+	err      error
+	requests []browser.ReadCookiesRequest
+}
+
+type fakeBrowserCookieExecutor struct {
+	result   func(adapter.BrowserCookieRequest) core.AdapterResult
+	requests []adapter.BrowserCookieRequest
+	values   [][]string
+}
+
 func (executor *fakeRSSHubExecutor) Execute(_ context.Context, request adapter.RSSHubRequest) core.AdapterResult {
 	executor.calls = append(executor.calls, request.Channel.ID)
 	executor.requests = append(executor.requests, request)
@@ -707,6 +744,24 @@ func (executor *fakeTavilyExecutor) Execute(_ context.Context, request adapter.T
 func (executor *fakeXURLExecutor) Execute(_ context.Context, request adapter.XURLRequest) core.AdapterResult {
 	executor.requests = append(executor.requests, request)
 	return executor.results[request.Channel.ID]
+}
+
+func (reader *fakeCookieReader) ReadCookies(_ context.Context, request browser.ReadCookiesRequest) (browser.ReadCookiesResponse, error) {
+	reader.requests = append(reader.requests, request)
+	return browser.ReadCookiesResponse{RequestID: request.RequestID, Cookies: slices.Clone(reader.cookies)}, reader.err
+}
+
+func (executor *fakeBrowserCookieExecutor) Execute(_ context.Context, request adapter.BrowserCookieRequest) core.AdapterResult {
+	values := make([]string, len(request.Cookies))
+	for index := range request.Cookies {
+		values[index] = request.Cookies[index].Value
+	}
+	executor.values = append(executor.values, values)
+	executor.requests = append(executor.requests, request)
+	if executor.result != nil {
+		return executor.result(request)
+	}
+	return successfulFeedResult()
 }
 
 func (executor *fakeFeedExecutor) Execute(_ context.Context, request adapter.FeedRequest) core.AdapterResult {
@@ -760,6 +815,52 @@ func stage2Operation(kind core.OperationKind, channelIDs []string, limit int) co
 		operation.Query = &query
 	}
 	return operation
+}
+
+func stageDBrowserTemplate(id, provider, source string) core.RouteTemplate {
+	return core.RouteTemplate{
+		RouteTemplateID: id, Origin: "imported", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{source}},
+		Provider: provider, Adapter: "browser_cookie", Capabilities: []string{"latest"}, ContentLevel: "metadata",
+		Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "provider_defined"},
+		Auth: core.AuthDescriptor{
+			Kind: "browser_cookie", Required: true, Browser: "chrome", LoginURL: "https://accounts.example.com/login",
+			PermissionOrigins: []string{"https://accounts.example.com/*"},
+			CookieScope: &core.CookieScope{
+				URL: "https://accounts.example.com/", AllowedDomains: []string{"accounts.example.com", ".accounts.example.com"},
+				Names: []string{"session", "csrf"}, Store: "current", Partitions: []string{"unpartitioned"},
+			},
+		},
+		Cost: "unknown", Trust: "imported",
+	}
+}
+
+func stageDBrowserCatalog(t *testing.T, trusted bool) *registry.Catalog {
+	t.Helper()
+	overlays := []core.TemplateOverlay(nil)
+	if trusted {
+		overlays = []core.TemplateOverlay{{RouteTemplateID: "browser-cookie", Enabled: true, Trusted: true, Revision: 1}}
+	}
+	catalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "browser-source", Origin: "imported", Enabled: true}},
+		[]core.Provider{{ID: "browser-fixture", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{stageDBrowserTemplate("browser-cookie", "browser-fixture", "browser-source")},
+		[]core.Channel{{
+			ID: "browser-channel", Source: "browser-source", RouteTemplateID: "browser-cookie", EgressProfileID: "direct",
+			CredentialID: "browser-credential", Priority: 100, Enabled: true,
+		}}, nil, []core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
+		[]core.Credential{{ID: "browser-credential", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true}}, nil, overlays,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func stageDBrowserCookies(session, csrf string) []browser.Cookie {
+	return []browser.Cookie{
+		{Name: "session", Value: session, Domain: ".accounts.example.com", Path: "/", Store: "current", Partition: "unpartitioned"},
+		{Name: "csrf", Value: csrf, Domain: "accounts.example.com", Path: "/", Store: "current", Partition: "unpartitioned"},
+	}
 }
 
 func successfulFeedResult(items ...core.Item) core.AdapterResult {
@@ -990,6 +1091,273 @@ func TestStageBProviderAggregatePreservesPartialFacts(t *testing.T) {
 	}
 	if problems["tavily"] != core.ErrorRateLimit || problems["xurl"] != core.ErrorUpstream || envelope.Coverage[0].ChannelID != "github" {
 		t.Fatalf("provider coverage/errors = %#v / %#v", envelope.Coverage, envelope.Errors)
+	}
+}
+
+func TestStageDBrowserCookieQueryContracts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	operation := stage2Operation(core.OperationLatest, []string{"browser-channel"}, 10)
+	session, csrf := "stage-d-session-cookie", "stage-d-csrf-cookie"
+	successResult := func() core.AdapterResult {
+		upstreamID := "browser-result"
+		return successfulFeedResult(core.Item{
+			Title: "Browser result", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}},
+		})
+	}
+
+	t.Run("trusted scope succeeds and clears values", func(t *testing.T) {
+		reader := &fakeCookieReader{cookies: stageDBrowserCookies(session, csrf)}
+		consumer := &fakeBrowserCookieExecutor{result: func(adapter.BrowserCookieRequest) core.AdapterResult { return successResult() }}
+		envelope, err := (queryservice.Service{
+			CookieReader: reader, BrowserCookie: consumer, Now: func() time.Time { return fixedNow },
+		}).Execute(context.Background(), stageDBrowserCatalog(t, true), operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Status != core.StatusComplete || len(envelope.Items) != 1 || len(envelope.Executions) != 1 || !envelope.Executions[0].Auth.Used {
+			t.Fatalf("browser cookie Envelope = %#v", envelope)
+		}
+		if len(reader.requests) != 1 || reader.requests[0].ChannelID != "browser-channel" || reader.requests[0].PermissionOriginPattern != "https://accounts.example.com/*" || !slices.Equal(reader.requests[0].CookieScope.Names, []string{"session", "csrf"}) {
+			t.Fatalf("browser read request = %#v", reader.requests)
+		}
+		if len(consumer.values) != 1 || !slices.Equal(consumer.values[0], []string{session, csrf}) || len(consumer.requests) != 1 {
+			t.Fatalf("browser consumer did not receive the two scoped values exactly once: values=%d requests=%d", len(consumer.values), len(consumer.requests))
+		}
+		for _, cookie := range consumer.requests[0].Cookies {
+			if cookie.Value != "" {
+				t.Fatalf("browser consumer retained Cookie value: %#v", consumer.requests[0])
+			}
+		}
+		encoded, err := json.Marshal(struct {
+			Envelope core.Envelope                `json:"envelope"`
+			Request  adapter.BrowserCookieRequest `json:"request"`
+		}{Envelope: envelope, Request: consumer.requests[0]})
+		if err != nil || bytes.Contains(encoded, []byte(session)) || bytes.Contains(encoded, []byte(csrf)) {
+			t.Fatalf("serialized browser result leaked Cookie: %s, %v", encoded, err)
+		}
+	})
+
+	for name, fixture := range map[string]struct {
+		reader *fakeCookieReader
+		code   core.ErrorCode
+	}{
+		"offline":    {reader: &fakeCookieReader{err: browser.ErrBrowserUnavailable}, code: core.ErrorBrowserUnavailable},
+		"permission": {reader: &fakeCookieReader{err: browser.ErrBrowserPermissionMissing}, code: core.ErrorBrowserPermission},
+		"missing":    {reader: &fakeCookieReader{}, code: core.ErrorCookieMissing},
+		"scope overreach": {reader: &fakeCookieReader{cookies: []browser.Cookie{
+			{Name: "session", Value: session, Domain: "outside.example", Path: "/", Store: "current", Partition: "unpartitioned"},
+			{Name: "csrf", Value: csrf, Domain: "accounts.example.com", Path: "/", Store: "current", Partition: "unpartitioned"},
+		}}, code: core.ErrorProtocol},
+	} {
+		t.Run(name, func(t *testing.T) {
+			consumer := &fakeBrowserCookieExecutor{result: func(adapter.BrowserCookieRequest) core.AdapterResult { return successResult() }}
+			envelope, err := (queryservice.Service{
+				CookieReader: fixture.reader, BrowserCookie: consumer, Now: func() time.Time { return fixedNow },
+			}).Execute(context.Background(), stageDBrowserCatalog(t, true), operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Status != core.StatusFailed || len(envelope.Errors) != 1 || envelope.Errors[0].Code != fixture.code || len(consumer.requests) != 0 || len(fixture.reader.requests) != 1 {
+				t.Fatalf("browser %s Envelope/requests = %#v / %#v / %#v", name, envelope, fixture.reader.requests, consumer.requests)
+			}
+		})
+	}
+
+	t.Run("executor is required before reading", func(t *testing.T) {
+		reader := &fakeCookieReader{cookies: stageDBrowserCookies(session, csrf)}
+		_, err := (queryservice.Service{CookieReader: reader, Now: func() time.Time { return fixedNow }}).
+			Execute(context.Background(), stageDBrowserCatalog(t, true), operation)
+		if !errors.Is(err, queryservice.ErrInvalidExecutor) || len(reader.requests) != 0 {
+			t.Fatalf("missing browser executor error/reads = %v / %#v", err, reader.requests)
+		}
+	})
+
+	t.Run("untrusted template never reads", func(t *testing.T) {
+		reader := &fakeCookieReader{cookies: stageDBrowserCookies(session, csrf)}
+		consumer := &fakeBrowserCookieExecutor{result: func(adapter.BrowserCookieRequest) core.AdapterResult { return successResult() }}
+		_, err := (queryservice.Service{
+			CookieReader: reader, BrowserCookie: consumer, Now: func() time.Time { return fixedNow },
+		}).Execute(context.Background(), stageDBrowserCatalog(t, false), operation)
+		if !errors.Is(err, router.ErrNoRoute) || len(reader.requests) != 0 || len(consumer.requests) != 0 {
+			t.Fatalf("untrusted browser route error/reads/executes = %v / %#v / %#v", err, reader.requests, consumer.requests)
+		}
+	})
+
+	for name, reflectedResult := range map[string]func(string) core.AdapterResult{
+		"item": func(secret string) core.AdapterResult {
+			return core.AdapterResult{Items: []core.Item{{Title: "leaked:" + secret}}}
+		},
+		"coverage": func(secret string) core.AdapterResult {
+			return core.AdapterResult{Coverage: []core.Coverage{{Scope: "leaked:" + secret}}}
+		},
+		"error": func(secret string) core.AdapterResult {
+			return core.AdapterResult{Errors: []core.Error{{Code: core.ErrorUpstream, Message: "leaked:" + secret}}}
+		},
+		"error details": func(secret string) core.AdapterResult {
+			return core.AdapterResult{Errors: []core.Error{{
+				Code: core.ErrorUpstream, Message: "failed", Details: map[string]any{"nested": map[string]any{"cookie": secret}},
+			}}}
+		},
+		"limitation": func(secret string) core.AdapterResult {
+			return core.AdapterResult{Limitations: []string{"leaked:" + secret}}
+		},
+		"provider state": func(secret string) core.AdapterResult {
+			return core.AdapterResult{ProviderState: map[string]string{"leaked": secret}}
+		},
+	} {
+		t.Run("reflected "+name+" fails closed", func(t *testing.T) {
+			reader := &fakeCookieReader{cookies: stageDBrowserCookies(session, csrf)}
+			consumer := &fakeBrowserCookieExecutor{result: func(adapter.BrowserCookieRequest) core.AdapterResult {
+				return reflectedResult(session)
+			}}
+			envelope, err := (queryservice.Service{
+				CookieReader: reader, BrowserCookie: consumer, Now: func() time.Time { return fixedNow },
+			}).Execute(context.Background(), stageDBrowserCatalog(t, true), operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, marshalErr := json.Marshal(envelope)
+			if envelope.Status != core.StatusFailed || len(envelope.Errors) != 1 || envelope.Errors[0].Code != core.ErrorProtocol || marshalErr != nil || bytes.Contains(encoded, []byte(session)) || bytes.Contains(encoded, []byte(csrf)) {
+				t.Fatalf("reflected %s Envelope leaked or did not fail closed: %s / %v", name, encoded, marshalErr)
+			}
+			for _, cookie := range consumer.requests[0].Cookies {
+				if cookie.Value != "" {
+					t.Fatalf("reflected %s retained Cookie value: %#v", name, consumer.requests[0])
+				}
+			}
+		})
+	}
+}
+
+func TestStageDBrowserCookieAggregateAndCredentialContracts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 15, 9, 30, 0, 0, time.UTC)
+	browserTemplate := stageDBrowserTemplate("browser-cookie", "browser-fixture", "browser-source")
+	feedTemplate := core.RouteTemplate{
+		RouteTemplateID: "feed", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"feed-source"}},
+		Provider: "feed-fixture", Adapter: "feed", Capabilities: []string{"latest"},
+	}
+	catalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "browser-source", Enabled: true}, {ID: "feed-source", Enabled: true}},
+		[]core.Provider{
+			{ID: "browser-fixture", Capabilities: []string{"latest"}, Enabled: true},
+			{ID: "feed-fixture", Capabilities: []string{"latest"}, Enabled: true},
+		},
+		[]core.RouteTemplate{browserTemplate, feedTemplate},
+		[]core.Channel{
+			{ID: "browser-channel", Source: "browser-source", RouteTemplateID: "browser-cookie", EgressProfileID: "direct", CredentialID: "browser-credential", Priority: 100, Enabled: true},
+			{ID: "feed-channel", Source: "feed-source", RouteTemplateID: "feed", EgressProfileID: "direct", Priority: 90, Enabled: true},
+		}, nil, []core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
+		[]core.Credential{{ID: "browser-credential", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true}}, nil,
+		[]core.TemplateOverlay{{RouteTemplateID: "browser-cookie", Enabled: true, Trusted: true, Revision: 1}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 当前 Browser 依赖比历史 Probe 更新：Bridge 离线或 permission
+	// 缺失都必须阻断 Channel；旧 Snapshot 是否可读由 View 单独表达。
+	lastSuccess := fixedNow.Add(-time.Minute)
+	for _, fixture := range []struct {
+		name       string
+		bridge     core.BrowserBridge
+		check      string
+		actionKind string
+	}{
+		{name: "bridge offline", bridge: core.BrowserBridge{ID: browser.BridgeID, Browser: "chrome"}, check: "browser_bridge", actionKind: "start_chrome_bridge"},
+		{name: "permission missing", bridge: core.BrowserBridge{ID: browser.BridgeID, Browser: "chrome", Connected: true}, check: "browser_permission", actionKind: "grant_browser_permission"},
+	} {
+		t.Run(fixture.name+" overrides recent Probe", func(t *testing.T) {
+			report := readiness.WithBrowserBridge(readiness.Report{
+				Channels: []readiness.ChannelHealth{{
+					ChannelID: "browser-channel", DesiredState: readiness.DesiredEnabled, Readiness: readiness.StateReady,
+					LastSuccessfulProbeAt: &lastSuccess,
+				}},
+				RouteGroups: []readiness.RouteGroupHealth{{RouteGroup: "historical-browser-group", Readiness: readiness.StateReadyDependent, ChannelIDs: []string{"browser-channel"}}},
+			}, catalog, fixture.bridge, fixedNow)
+			if len(report.Channels) != 1 || len(report.RouteGroups) != 0 || report.Channels[0].Readiness != readiness.StateBlocked || report.Channels[0].ActionRequired == nil || report.Channels[0].ActionRequired.Kind != fixture.actionKind {
+				t.Fatalf("browser readiness = %#v", report)
+			}
+			found := false
+			for _, check := range report.Channels[0].Checks {
+				found = found || check.Kind == fixture.check && check.Status == readiness.CheckFailed
+			}
+			if !found {
+				t.Fatalf("browser readiness checks = %#v", report.Channels[0].Checks)
+			}
+		})
+	}
+	connected := readiness.WithBrowserBridge(readiness.Report{Channels: []readiness.ChannelHealth{{
+		ChannelID: "browser-channel", DesiredState: readiness.DesiredEnabled, Readiness: readiness.StateDegraded,
+	}}}, catalog, core.BrowserBridge{
+		ID: browser.BridgeID, Browser: "chrome", Connected: true, GrantedOrigins: []string{"https://accounts.example.com/*"},
+	}, fixedNow)
+	if connected.Channels[0].Readiness != readiness.StateDegraded {
+		t.Fatalf("connected Browser Bridge promoted unprobed Channel: %#v", connected)
+	}
+	for name, disabledCatalog := range map[string]*registry.Catalog{
+		"channel":  browserDashboardCatalog(t, true, true, false),
+		"template": browserDashboardCatalog(t, true, false, true),
+	} {
+		t.Run("disabled "+name+" ignores live Browser state", func(t *testing.T) {
+			report := readiness.Doctor(disabledCatalog, fixedNow)
+			before := report.Channels[0]
+			report = readiness.WithBrowserBridge(report, disabledCatalog, core.BrowserBridge{ID: browser.BridgeID, Browser: "chrome"}, fixedNow)
+			if !reflect.DeepEqual(report.Channels[0], before) {
+				t.Fatalf("disabled %s Browser readiness changed: before=%#v after=%#v", name, before, report.Channels[0])
+			}
+		})
+	}
+	// Browser Bridge 离线只让当前执行失败；并行 Feed 结果仍进入 partial
+	// Envelope，证明浏览器错误没有升级为整次编排的 Go error。
+	upstreamID := "feed-result"
+	feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{"feed-channel": successfulFeedResult(core.Item{
+		Title: "Feed survives", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}},
+	})}}
+	reader := &fakeCookieReader{err: browser.ErrBrowserUnavailable}
+	consumer := &fakeBrowserCookieExecutor{}
+	operation := stage2Operation(core.OperationLatest, []string{"browser-channel", "feed-channel"}, 10)
+	operation.RoutePolicy.Aggregate = true
+	envelope, err := (queryservice.Service{
+		Feed: feed, CookieReader: reader, BrowserCookie: consumer, Now: func() time.Time { return fixedNow },
+	}).Execute(context.Background(), catalog, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Status != core.StatusPartial || len(envelope.Items) != 1 || envelope.Items[0].Title != "Feed survives" || len(envelope.Errors) != 1 || envelope.Errors[0].Code != core.ErrorBrowserUnavailable || len(feed.calls) != 1 || len(consumer.requests) != 0 {
+		t.Fatalf("browser aggregate partial = %#v, feed=%v browser=%#v", envelope, feed.calls, consumer.requests)
+	}
+
+	// chrome_cookie Credential 只保存执行时依赖关系；管理创建、列表与 SQLite
+	// 回读都不能出现 value，未信任模板也不能为 Provider 开启这种凭据。
+	store, err := sqlitestore.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	service := management.Service{Store: store, Catalog: stageDBrowserCatalog(t, true)}
+	summary, err := service.ApplyCredential(context.Background(), management.ApplyCredentialInput{
+		ID: "managed-browser", Provider: "browser-fixture", AuthKind: "chrome_cookie", Label: "Chrome", Enabled: true,
+	})
+	if err != nil || summary.HasValue || summary.ValueMasked != "" || summary.Revision != 1 {
+		t.Fatalf("ApplyCredential(chrome_cookie) = %#v, %v", summary, err)
+	}
+	stored, err := store.GetCredential(context.Background(), "managed-browser")
+	if err != nil || stored.Value != nil || stored.AuthKind != "chrome_cookie" {
+		t.Fatalf("stored chrome_cookie Credential = %#v, %v", stored, err)
+	}
+	lists, err := service.ListCredentialSummaries(context.Background())
+	if err != nil || len(lists) != 1 || lists[0].ID != "managed-browser" || lists[0].HasValue {
+		t.Fatalf("ListCredentialSummaries(chrome_cookie) = %#v, %v", lists, err)
+	}
+	if _, err := service.ApplyCredential(context.Background(), management.ApplyCredentialInput{
+		ID: "managed-browser-secret", Provider: "browser-fixture", AuthKind: "chrome_cookie", Value: "must-not-store", Enabled: true,
+	}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+		t.Fatalf("ApplyCredential(chrome_cookie value) error = %v", err)
+	}
+	untrusted := management.Service{Store: store, Catalog: stageDBrowserCatalog(t, false)}
+	if _, err := untrusted.ApplyCredential(context.Background(), management.ApplyCredentialInput{
+		ID: "managed-browser-untrusted", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true,
+	}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+		t.Fatalf("ApplyCredential(untrusted chrome_cookie) error = %v", err)
 	}
 }
 

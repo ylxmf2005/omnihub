@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
 )
@@ -96,6 +98,9 @@ func (catalog *Catalog) Validate() error {
 		if _, ok := catalog.providers[template.Provider]; !ok {
 			return fmt.Errorf("%w: route template %s references unknown provider %s", ErrInvalidCatalog, id, template.Provider)
 		}
+		if err := validateBrowserAuth(template.Auth); err != nil {
+			return fmt.Errorf("%w: route template %s: %v", ErrInvalidCatalog, id, err)
+		}
 	}
 	for id, endpoint := range catalog.endpoints {
 		if endpoint.ID != id {
@@ -166,6 +171,68 @@ func (catalog *Catalog) Validate() error {
 			}
 			seen[channelID] = true
 		}
+	}
+	return nil
+}
+
+// validateBrowserAuth 把 Chrome 的权限和 Cookie 查询范围固定在受信任模板
+// 描述符中。普通认证不能夹带这些字段，避免后续执行层把任意 URL 当授权。
+func validateBrowserAuth(auth core.AuthDescriptor) error {
+	if auth.Kind != "browser_cookie" {
+		if auth.LoginURL != "" || auth.Browser != "" || len(auth.PermissionOrigins) != 0 || auth.CookieScope != nil {
+			return errors.New("non-browser auth cannot declare browser scope")
+		}
+		return nil
+	}
+	if !auth.Required || auth.Browser != "chrome" || auth.CookieScope == nil || len(auth.PermissionOrigins) != 1 {
+		return errors.New("browser_cookie requires Chrome, permission origins, and cookie scope")
+	}
+	loginURL, err := url.Parse(auth.LoginURL)
+	if err != nil || loginURL.Scheme != "https" || loginURL.Hostname() == "" || loginURL.Host != loginURL.Hostname() || loginURL.User != nil || loginURL.Fragment != "" {
+		return errors.New("browser_cookie login_url must be an exact HTTPS URL")
+	}
+
+	permissionHosts := make(map[string]bool, len(auth.PermissionOrigins))
+	for _, pattern := range auth.PermissionOrigins {
+		if pattern != strings.TrimSpace(pattern) || !strings.HasPrefix(pattern, "https://") || !strings.HasSuffix(pattern, "/*") {
+			return errors.New("browser_cookie permission origin must be an exact HTTPS match pattern")
+		}
+		parsed, err := url.Parse(strings.TrimSuffix(pattern, "*"))
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.Host != parsed.Hostname() || parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil || parsed.Hostname() != strings.ToLower(parsed.Hostname()) || permissionHosts[parsed.Hostname()] {
+			return errors.New("browser_cookie permission origins must be unique exact HTTPS hosts")
+		}
+		permissionHosts[parsed.Hostname()] = true
+	}
+
+	scope := auth.CookieScope
+	scopeURL, err := url.Parse(scope.URL)
+	if err != nil || scopeURL.Scheme != "https" || scopeURL.Hostname() == "" || scopeURL.Host != scopeURL.Hostname() || scopeURL.User != nil || scopeURL.RawQuery != "" || scopeURL.Fragment != "" || !permissionHosts[scopeURL.Hostname()] {
+		return errors.New("browser_cookie scope URL must belong to a permission origin")
+	}
+	if scope.Store != "current" || len(scope.AllowedDomains) == 0 || len(scope.Names) == 0 || len(scope.Partitions) == 0 {
+		return errors.New("browser_cookie scope requires domains, names, current store, and partitions")
+	}
+	seenDomains := make(map[string]bool, len(scope.AllowedDomains))
+	for _, candidate := range scope.AllowedDomains {
+		domain := strings.TrimPrefix(candidate, ".")
+		if candidate != strings.TrimSpace(candidate) || domain == "" || domain != strings.ToLower(domain) || strings.ContainsAny(domain, "/:@?#") || seenDomains[candidate] || scopeURL.Hostname() != domain {
+			return errors.New("browser_cookie allowed domain is outside the scope URL")
+		}
+		seenDomains[candidate] = true
+	}
+	seenNames := make(map[string]bool, len(scope.Names))
+	for _, name := range scope.Names {
+		if name == "" || name != strings.TrimSpace(name) || strings.ContainsFunc(name, unicode.IsControl) || seenNames[name] {
+			return errors.New("browser_cookie names must be unique non-empty values")
+		}
+		seenNames[name] = true
+	}
+	seenPartitions := make(map[string]bool, len(scope.Partitions))
+	for _, partition := range scope.Partitions {
+		if partition != "unpartitioned" || seenPartitions[partition] {
+			return errors.New("browser_cookie v1 only supports one unpartitioned scope")
+		}
+		seenPartitions[partition] = true
 	}
 	return nil
 }

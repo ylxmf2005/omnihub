@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/management"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
@@ -44,33 +45,36 @@ type MCPManifest struct {
 }
 
 type Schemas struct {
-	Problem           json.RawMessage `json:"problem"`
-	Operation         json.RawMessage `json:"operation"`
-	Envelope          json.RawMessage `json:"envelope"`
-	Item              json.RawMessage `json:"item"`
-	Observation       json.RawMessage `json:"observation"`
-	Coverage          json.RawMessage `json:"coverage"`
-	Error             json.RawMessage `json:"error"`
-	Run               json.RawMessage `json:"run"`
-	DashboardSummary  json.RawMessage `json:"dashboard_summary"`
-	Readiness         json.RawMessage `json:"readiness"`
-	Source            json.RawMessage `json:"source"`
-	RouteTemplate     json.RawMessage `json:"route_template"`
-	Channel           json.RawMessage `json:"channel"`
-	EndpointProfile   json.RawMessage `json:"endpoint_profile"`
-	EgressSummary     json.RawMessage `json:"egress_profile_summary"`
-	Collection        json.RawMessage `json:"collection"`
-	View              json.RawMessage `json:"view"`
-	ViewDetail        json.RawMessage `json:"view_detail"`
-	ViewSnapshot      json.RawMessage `json:"view_snapshot"`
-	ViewItems         json.RawMessage `json:"view_items"`
-	CredentialInput   json.RawMessage `json:"credential_input"`
-	CredentialSummary json.RawMessage `json:"credential_summary"`
-	CredentialDetail  json.RawMessage `json:"credential_detail"`
-	BrowserBridge     json.RawMessage `json:"browser_bridge"`
-	Managed           json.RawMessage `json:"managed_resource"`
-	Bundle            json.RawMessage `json:"bundle"`
-	AdapterResult     json.RawMessage `json:"adapter_result"`
+	Problem               json.RawMessage `json:"problem"`
+	Operation             json.RawMessage `json:"operation"`
+	Envelope              json.RawMessage `json:"envelope"`
+	Item                  json.RawMessage `json:"item"`
+	Observation           json.RawMessage `json:"observation"`
+	Coverage              json.RawMessage `json:"coverage"`
+	Error                 json.RawMessage `json:"error"`
+	Run                   json.RawMessage `json:"run"`
+	DashboardSummary      json.RawMessage `json:"dashboard_summary"`
+	Readiness             json.RawMessage `json:"readiness"`
+	Source                json.RawMessage `json:"source"`
+	RouteTemplate         json.RawMessage `json:"route_template"`
+	Channel               json.RawMessage `json:"channel"`
+	EndpointProfile       json.RawMessage `json:"endpoint_profile"`
+	EgressSummary         json.RawMessage `json:"egress_profile_summary"`
+	Collection            json.RawMessage `json:"collection"`
+	View                  json.RawMessage `json:"view"`
+	ViewDetail            json.RawMessage `json:"view_detail"`
+	ViewSnapshot          json.RawMessage `json:"view_snapshot"`
+	ViewItems             json.RawMessage `json:"view_items"`
+	CredentialInput       json.RawMessage `json:"credential_input"`
+	CredentialSummary     json.RawMessage `json:"credential_summary"`
+	CredentialDetail      json.RawMessage `json:"credential_detail"`
+	BrowserBridge         json.RawMessage `json:"browser_bridge"`
+	BrowserAuthorization  json.RawMessage `json:"browser_authorization_descriptor"`
+	BrowserRevokeRequest  json.RawMessage `json:"browser_revoke_permission_request"`
+	BrowserRevokeResponse json.RawMessage `json:"browser_revoke_permission_response"`
+	Managed               json.RawMessage `json:"managed_resource"`
+	Bundle                json.RawMessage `json:"bundle"`
+	AdapterResult         json.RawMessage `json:"adapter_result"`
 }
 
 type Artifacts struct {
@@ -110,8 +114,10 @@ func generateArtifacts(includeDashboard bool) (Artifacts, error) {
 		&schemas.ViewSnapshot: reflect.TypeFor[ViewSnapshotResponse](), &schemas.ViewItems: reflect.TypeFor[ViewItemsResponse](),
 		&schemas.Channel: reflect.TypeFor[core.Channel](), &schemas.CredentialInput: reflect.TypeFor[core.CredentialInput](),
 		&schemas.CredentialSummary: reflect.TypeFor[core.CredentialSummary](), &schemas.CredentialDetail: reflect.TypeFor[core.CredentialDetail](),
-		&schemas.BrowserBridge: reflect.TypeFor[core.BrowserBridge](), &schemas.Managed: reflect.TypeFor[core.ManagedResource](),
-		&schemas.Bundle: reflect.TypeFor[core.Bundle](), &schemas.AdapterResult: reflect.TypeFor[core.AdapterResult](),
+		&schemas.BrowserBridge: reflect.TypeFor[core.BrowserBridge](), &schemas.BrowserAuthorization: reflect.TypeFor[browser.AuthorizationDescriptor](),
+		&schemas.BrowserRevokeRequest: reflect.TypeFor[browser.RevokePermissionRequest](), &schemas.BrowserRevokeResponse: reflect.TypeFor[browser.RevokePermissionResponse](),
+		&schemas.Managed: reflect.TypeFor[core.ManagedResource](),
+		&schemas.Bundle:  reflect.TypeFor[core.Bundle](), &schemas.AdapterResult: reflect.TypeFor[core.AdapterResult](),
 	} {
 		generated, generateErr := schemaFor(typ)
 		if generateErr != nil {
@@ -196,6 +202,8 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 		"view_detail": reflect.TypeFor[subscription.ViewDetail](), "view_input": reflect.TypeFor[ViewInput](),
 		"snapshot": reflect.TypeFor[ViewSnapshotResponse](), "items": reflect.TypeFor[ViewItemsResponse](),
 		"runs": reflect.TypeFor[[]core.Run](), "run": reflect.TypeFor[core.Run](), "run_input": reflect.TypeFor[CreateRunInput](),
+		"browser_bridge": reflect.TypeFor[core.BrowserBridge](), "browser_authorization": reflect.TypeFor[browser.AuthorizationDescriptor](),
+		"browser_revoke_input": reflect.TypeFor[browser.RevokePermissionRequest](), "browser_revoke_response": reflect.TypeFor[browser.RevokePermissionResponse](),
 	}
 	schemas := make(map[string]json.RawMessage, len(types))
 	for name, typ := range types {
@@ -244,6 +252,13 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 	revokeCredential := revisionActionEndpoint("revokeCredential", "清除 Credential 值并禁用记录。", schemas["credential_summary"], problem)
 	revokeCredential["responses"].(map[string]any)["200"].(map[string]any)["headers"].(map[string]any)["Cache-Control"] = map[string]any{"schema": map[string]any{"type": "string"}}
 	paths["/v1/credentials/{id}/revoke"] = map[string]any{"post": revokeCredential}
+	paths["/v1/browser-bridges"] = map[string]any{"get": readEndpoint("getBrowserBridge", "读取当前 Chrome Browser Bridge 实时状态。", schemas["browser_bridge"], problem, false)}
+	paths["/v1/channels/{id}/chrome/authorization-descriptor"] = map[string]any{"get": readEndpoint("getBrowserAuthorizationDescriptor", "读取受信任 Channel 的 Chrome 授权描述。", schemas["browser_authorization"], problem, true)}
+	paths["/v1/browser-bridges/{id}/permissions/revoke"] = map[string]any{"post": map[string]any{
+		"operationId": "revokeBrowserPermission", "summary": "经在线 Chrome Bridge 撤销一个受信任 origin permission。",
+		"parameters": []any{pathParameter("id")}, "requestBody": jsonRequest(schemas["browser_revoke_input"]),
+		"responses": withProblems(map[string]any{"200": jsonResponse("Latest Browser Bridge permission status", schemas["browser_revoke_response"])}, problem, "400", "403", "404", "409", "413", "415", "500"),
+	}}
 	paths["/v1/views/{id}/snapshot"] = map[string]any{"get": snapshotEndpoint("getViewSnapshot", "读取 View 当前 Snapshot。", schemas["snapshot"], problem)}
 	paths["/v1/views/{id}/items"] = map[string]any{"get": snapshotEndpoint("getViewItems", "读取 View 当前 Item。", schemas["items"], problem)}
 	paths["/v1/views/{id}/refresh"] = map[string]any{"post": runActionEndpoint("refreshView", "创建 View refresh Run。", schemas["run"], problem, false)}
@@ -552,6 +567,13 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 		if kind := schema.Properties["kind"]; kind != nil {
 			value := any(subscription.RunKindQuery)
 			kind.Const = &value
+		}
+	}
+	if typ == reflect.TypeFor[browser.RevokePermissionRequest]() {
+		schema.Required = []string{"permission_origin_pattern"}
+		if origin := schema.Properties["permission_origin_pattern"]; origin != nil {
+			minimum := 1
+			origin.MinLength = &minimum
 		}
 	}
 }

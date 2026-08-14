@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/management"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
@@ -30,6 +31,13 @@ type ReadinessFunc func(context.Context) (readiness.Report, error)
 // 不把主动网络诊断降级为一次同步 Adapter 调用。
 type ProbeFunc func(context.Context, string, string) (core.Run, error)
 
+// BrowserBridgeClient 是 Dashboard 所需的最窄实时浏览器能力。HTTP 层只读
+// 当前连接状态或转发撤销动作，不保存 Chrome permission 的影子状态。
+type BrowserBridgeClient interface {
+	Status(context.Context) (browser.Status, error)
+	RevokePermission(context.Context, string) (browser.RevokePermissionResponse, error)
+}
+
 // DashboardHTTPDependencies 是完整本机 HTTP surface 的显式装配边界。
 // DevOrigin 只服务于分离开发服务器；生产 Dashboard 保持同源。
 type DashboardHTTPDependencies struct {
@@ -39,6 +47,7 @@ type DashboardHTTPDependencies struct {
 	Subscription *subscription.Service
 	Readiness    ReadinessFunc
 	Probe        ProbeFunc
+	Browser      BrowserBridgeClient
 	Version      string
 	InstanceID   string
 	DevOrigin    string
@@ -222,7 +231,7 @@ func allowedMethods(path string) string {
 	}
 	if len(segments) == 2 && segments[0] == "v1" {
 		switch segments[1] {
-		case "sources", "route-templates", "readiness":
+		case "sources", "route-templates", "readiness", "browser-bridges":
 			return http.MethodGet
 		case "channels", "endpoint-profiles", "egress-profiles", "credentials", "collections", "views", "runs":
 			return "GET, POST"
@@ -245,6 +254,14 @@ func allowedMethods(path string) string {
 			return http.MethodPost
 		}
 		if segments[1] == "credentials" && segments[3] == "revoke" {
+			return http.MethodPost
+		}
+	}
+	if len(segments) == 5 && segments[0] == "v1" && segments[2] != "" {
+		if segments[1] == "channels" && segments[3] == "chrome" && segments[4] == "authorization-descriptor" {
+			return http.MethodGet
+		}
+		if segments[1] == "browser-bridges" && segments[3] == "permissions" && segments[4] == "revoke" {
 			return http.MethodPost
 		}
 	}
@@ -290,6 +307,18 @@ func (server *dashboardHTTPServer) serveDashboard(writer http.ResponseWriter, re
 		server.serveReadiness(writer, request)
 		return
 	}
+	if len(segments) == 2 && segments[1] == "browser-bridges" {
+		server.serveBrowserBridge(writer, request)
+		return
+	}
+	if len(segments) == 5 && segments[1] == "channels" && segments[3] == "chrome" && segments[4] == "authorization-descriptor" {
+		server.serveBrowserAuthorization(writer, request, segments[2])
+		return
+	}
+	if len(segments) == 5 && segments[1] == "browser-bridges" && segments[3] == "permissions" && segments[4] == "revoke" {
+		server.serveBrowserPermissionRevoke(writer, request, segments[2])
+		return
+	}
 	if segments[1] == "channels" && len(segments) == 4 && segments[3] == "probe" {
 		server.serveProbe(writer, request, segments[2])
 		return
@@ -326,6 +355,104 @@ func (server *dashboardHTTPServer) serveDashboard(writer http.ResponseWriter, re
 	default:
 		writeProblemCode(writer, http.StatusNotFound, "Not Found", "endpoint_not_found", "the requested endpoint does not exist")
 	}
+}
+
+func (server *dashboardHTTPServer) serveBrowserBridge(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		methodNotAllowed(writer, http.MethodGet)
+		return
+	}
+	result := core.BrowserBridge{ID: browser.BridgeID, Browser: "chrome"}
+	if server.dependencies.Browser == nil {
+		result.LastError = &core.Error{Code: core.ErrorBrowserUnavailable, Message: "Chrome Browser Bridge is unavailable", Retryable: true}
+		writeJSON(writer, http.StatusOK, result)
+		return
+	}
+	status, err := server.dependencies.Browser.Status(request.Context())
+	if err != nil {
+		if !errors.Is(err, browser.ErrBrowserUnavailable) {
+			writeDashboardError(writer, err)
+			return
+		}
+		result.LastError = &core.Error{Code: core.ErrorBrowserUnavailable, Message: "Chrome Browser Bridge is unavailable", Retryable: true}
+		writeJSON(writer, http.StatusOK, result)
+		return
+	}
+	result.Connected = status.Connected
+	result.ProfileLabel = status.ProfileLabel
+	result.GrantedOrigins = append([]string(nil), status.GrantedOrigins...)
+	result.LastSeenAt = status.LastSeenAt
+	if !status.Connected {
+		result.LastError = &core.Error{Code: core.ErrorBrowserUnavailable, Message: "Chrome Browser Bridge is unavailable", Retryable: true}
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (server *dashboardHTTPServer) serveBrowserAuthorization(writer http.ResponseWriter, request *http.Request, channelID string) {
+	if request.Method != http.MethodGet {
+		methodNotAllowed(writer, http.MethodGet)
+		return
+	}
+	catalog, err := server.dependencies.LoadCatalog(request.Context())
+	if err != nil {
+		writeDashboardError(writer, err)
+		return
+	}
+	if _, ok := catalog.Channel(channelID); !ok {
+		writeDashboardError(writer, repository.ErrNotFound)
+		return
+	}
+	descriptor, err := browser.AuthorizationForChannel(catalog, channelID)
+	writeDashboardResult(writer, http.StatusOK, descriptor, err)
+}
+
+func (server *dashboardHTTPServer) serveBrowserPermissionRevoke(writer http.ResponseWriter, request *http.Request, bridgeID string) {
+	if request.Method != http.MethodPost {
+		methodNotAllowed(writer, http.MethodPost)
+		return
+	}
+	if bridgeID != browser.BridgeID {
+		writeDashboardError(writer, repository.ErrNotFound)
+		return
+	}
+	var input browser.RevokePermissionRequest
+	if !decodeDashboardJSON(writer, request, &input) {
+		return
+	}
+	if input.PermissionOriginPattern == "" {
+		writeProblemCode(writer, http.StatusBadRequest, "Bad Request", "invalid_request", "permission_origin_pattern is required")
+		return
+	}
+	catalog, err := server.dependencies.LoadCatalog(request.Context())
+	if err != nil {
+		writeDashboardError(writer, err)
+		return
+	}
+	trusted := false
+	for _, template := range catalog.RouteTemplates() {
+		if !catalog.TemplateTrusted(template.RouteTemplateID) || template.Auth.Kind != "browser_cookie" || template.Auth.Browser != "chrome" {
+			continue
+		}
+		for _, origin := range template.Auth.PermissionOrigins {
+			if origin == input.PermissionOriginPattern {
+				trusted = true
+				break
+			}
+		}
+		if trusted {
+			break
+		}
+	}
+	if !trusted {
+		writeDashboardError(writer, browser.ErrScopeInvalid)
+		return
+	}
+	if server.dependencies.Browser == nil {
+		writeDashboardError(writer, browser.ErrBrowserUnavailable)
+		return
+	}
+	response, err := server.dependencies.Browser.RevokePermission(request.Context(), input.PermissionOriginPattern)
+	writeDashboardResult(writer, http.StatusOK, response, err)
 }
 
 func (server *dashboardHTTPServer) serveSummary(writer http.ResponseWriter, request *http.Request) {
@@ -1264,6 +1391,12 @@ func writeDeleteResult(writer http.ResponseWriter, err error) {
 
 func writeDashboardError(writer http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, browser.ErrBrowserUnavailable):
+		writeProblemCode(writer, http.StatusConflict, "Conflict", string(browser.ErrorBrowserUnavailable), "Chrome Browser Bridge is unavailable")
+	case errors.Is(err, browser.ErrBrowserPermissionMissing):
+		writeProblemCode(writer, http.StatusConflict, "Conflict", string(browser.ErrorBrowserPermissionMissing), "Chrome origin permission is missing")
+	case errors.Is(err, browser.ErrScopeInvalid):
+		writeProblemCode(writer, http.StatusConflict, "Conflict", string(browser.ErrorScopeInvalid), "the requested browser scope is not allowed by the current catalog")
 	case errors.Is(err, repository.ErrNotFound):
 		writeProblemCode(writer, http.StatusNotFound, "Not Found", "resource_not_found", "the requested resource does not exist")
 	case errors.Is(err, repository.ErrInUse):

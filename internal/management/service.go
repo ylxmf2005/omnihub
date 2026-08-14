@@ -146,7 +146,12 @@ func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentia
 	if input.ExpectedRevision < 0 {
 		return core.CredentialSummary{}, fmt.Errorf("%w: expected revision must not be negative", managedCredentialError(provider, authKind))
 	}
-	if err := validateManagedCredential(provider, authKind, input.Value); err != nil {
+	chromeCookie := authKind == "chrome_cookie"
+	if chromeCookie {
+		if input.Value != "" || !service.supportsChromeCookieCredential(provider) {
+			return core.CredentialSummary{}, fmt.Errorf("%w: chrome_cookie requires a trusted Chrome RouteTemplate and no value", managedCredentialError(provider, authKind))
+		}
+	} else if err := validateManagedCredential(provider, authKind, input.Value); err != nil {
 		return core.CredentialSummary{}, err
 	}
 	id := strings.TrimSpace(input.ID)
@@ -156,8 +161,11 @@ func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentia
 	now := time.Now().UTC()
 	var credential core.Credential
 	if input.ExpectedRevision == 0 {
-		value := input.Value
-		credential, err = store.CreateCredential(ctx, core.Credential{ID: id, Provider: provider, AuthKind: authKind, Label: strings.TrimSpace(input.Label), Value: &value, Enabled: input.Enabled, CreatedAt: now, UpdatedAt: now})
+		var value *string
+		if !chromeCookie {
+			value = &input.Value
+		}
+		credential, err = store.CreateCredential(ctx, core.Credential{ID: id, Provider: provider, AuthKind: authKind, Label: strings.TrimSpace(input.Label), Value: value, Enabled: input.Enabled, CreatedAt: now, UpdatedAt: now})
 	} else {
 		existing, getErr := store.GetCredential(ctx, id)
 		if getErr != nil {
@@ -172,8 +180,11 @@ func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentia
 		if existing.Revision != input.ExpectedRevision {
 			return core.CredentialSummary{}, fmt.Errorf("%w: credential %s revision is %d, expected %d", repository.ErrConflict, id, existing.Revision, input.ExpectedRevision)
 		}
-		value := input.Value
-		credential, err = store.UpdateCredential(ctx, repository.UpdateCredential{ID: id, ExpectedRevision: input.ExpectedRevision, Value: &value, Enabled: input.Enabled, UpdatedAt: now})
+		var value *string
+		if !chromeCookie {
+			value = &input.Value
+		}
+		credential, err = store.UpdateCredential(ctx, repository.UpdateCredential{ID: id, ExpectedRevision: input.ExpectedRevision, Value: value, Enabled: input.Enabled, UpdatedAt: now})
 	}
 	if err != nil {
 		return core.CredentialSummary{}, fmt.Errorf("save credential: %w", err)
@@ -182,6 +193,9 @@ func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentia
 }
 
 func managedCredentialError(provider, authKind string) error {
+	if authKind == "chrome_cookie" {
+		return ErrInvalidProviderConfig
+	}
 	if provider == "egress" || authKind == "basic" {
 		return ErrInvalidEgress
 	}
@@ -226,12 +240,31 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 			credential.Provider == "egress" && credential.AuthKind == "basic" ||
 			credential.Provider == "github-api" && credential.AuthKind == "token" ||
 			credential.Provider == "tavily" && credential.AuthKind == "api_key" ||
-			credential.Provider == "xurl" && credential.AuthKind == "app_only" {
+			credential.Provider == "xurl" && credential.AuthKind == "app_only" ||
+			credential.AuthKind == "chrome_cookie" && service.supportsChromeCookieCredential(credential.Provider) {
 			result = append(result, summarizeCredential(credential))
 		}
 	}
 	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
 	return result, nil
+}
+
+// supportsChromeCookieCredential 只接受当前 Catalog 中已经过 trust overlay
+// 裁决的 Chrome 模板，避免 Dashboard 为任意 Provider 创建浏览器授权占位符。
+func (service Service) supportsChromeCookieCredential(providerID string) bool {
+	if service.Catalog == nil {
+		return false
+	}
+	provider, ok := service.Catalog.Provider(providerID)
+	if !ok || !provider.Enabled {
+		return false
+	}
+	for _, template := range service.Catalog.RouteTemplates() {
+		if template.Provider == providerID && template.Auth.Kind == "browser_cookie" && template.Auth.Browser == "chrome" && service.Catalog.TemplateEnabled(template.RouteTemplateID) && service.Catalog.TemplateTrusted(template.RouteTemplateID) {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyEgressProfile 创建或更新一个显式出口。Storage 允许引用在升级期间

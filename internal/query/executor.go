@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/adapter"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/router"
@@ -56,13 +58,29 @@ type XURLExecutor interface {
 	Execute(context.Context, adapter.XURLRequest) core.AdapterResult
 }
 
+// CookieReader 是 Query Plane 对当前用户 Chrome Bridge 的唯一依赖。
+// scope 只能由已经选中的 RouteTemplate 生成，不能接受 Adapter 自报范围。
+type CookieReader interface {
+	ReadCookies(context.Context, browser.ReadCookiesRequest) (browser.ReadCookiesResponse, error)
+}
+
+var _ CookieReader = (*browser.Client)(nil)
+
+// BrowserCookieExecutor 是用于验证执行边界的窄 mock consumer；没有注册
+// 真实 Provider，也不会把 Cookie 变成任意 Adapter 可获取的通用 Credential。
+type BrowserCookieExecutor interface {
+	Execute(context.Context, adapter.BrowserCookieRequest) core.AdapterResult
+}
+
 type Service struct {
-	Feed   FeedExecutor
-	RSSHub RSSHubExecutor
-	GitHub GitHubExecutor
-	Tavily TavilyExecutor
-	XURL   XURLExecutor
-	Now    func() time.Time
+	Feed          FeedExecutor
+	RSSHub        RSSHubExecutor
+	GitHub        GitHubExecutor
+	Tavily        TavilyExecutor
+	XURL          XURLExecutor
+	CookieReader  CookieReader
+	BrowserCookie BrowserCookieExecutor
+	Now           func() time.Time
 }
 
 // Execute 从同一份 Catalog 和 Operation 构建路由计划，并把所有已选择路径的
@@ -279,6 +297,34 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Credential: credential, Egress: egress,
 		})
+	case "browser_cookie":
+		// 先确认明确的 consumer，避免配置错误时仍读取用户 Cookie。Reader
+		// 离线属于当前 Channel 的可观察失败，不应中止 aggregate 的其他路径。
+		if run.service.BrowserCookie == nil {
+			return false, fmt.Errorf("%w: browser cookie executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		if decision.RouteTemplate.Auth.Kind != "browser_cookie" || decision.RouteTemplate.Auth.Browser != "chrome" || credential == nil || credential.AuthKind != "chrome_cookie" || credential.Value != nil {
+			result = browserCookieConfigFailure()
+			break
+		}
+		if run.service.CookieReader == nil {
+			result = browserCookieFailure(browser.ErrBrowserUnavailable)
+			break
+		}
+		authorization, requestErr := browser.AuthorizationForChannel(run.catalog, decision.Channel.ID)
+		if requestErr != nil {
+			result = browserCookieConfigFailure()
+			break
+		}
+		requestID, requestIDErr := core.NewRequestID()
+		if requestIDErr != nil {
+			return false, requestIDErr
+		}
+		request := browser.ReadCookiesRequest{
+			RequestID: "browser" + requestID, ChannelID: decision.Channel.ID,
+			PermissionOriginPattern: authorization.PermissionOriginPattern, CookieScope: authorization.CookieScope,
+		}
+		result = run.executeBrowserCookie(childContext, request, decision)
 	default:
 		reason := "unsupported_adapter"
 		execution.Status = core.ExecutionFailed
@@ -365,6 +411,109 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		})
 	}
 	return false, nil
+}
+
+// executeBrowserCookie 在 Operation 边界再次检查 Client 返回的 scope，并在
+// consumer 返回后清掉短生命周期值。任何结果面反射 Cookie 都整体丢弃。
+func (run *executionRun) executeBrowserCookie(ctx context.Context, request browser.ReadCookiesRequest, decision router.Decision) core.AdapterResult {
+	response, err := run.service.CookieReader.ReadCookies(ctx, request)
+	if err != nil {
+		clearCookieValues(response.Cookies)
+		return browserCookieFailure(err)
+	}
+	if response.RequestID != request.RequestID {
+		clearCookieValues(response.Cookies)
+		return browserCookieFailure(browser.ErrProtocol)
+	}
+	cookies := response.Cookies
+	defer clearCookieValues(cookies)
+	if err := browser.ValidateCookies(request, cookies); err != nil {
+		return browserCookieFailure(err)
+	}
+
+	values := make([]string, len(cookies))
+	for index := range cookies {
+		values[index] = cookies[index].Value
+	}
+	defer clear(values)
+	result := run.service.BrowserCookie.Execute(ctx, adapter.BrowserCookieRequest{
+		Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate, Cookies: cookies,
+	})
+	if adapterResultContainsAny(result, values) {
+		return browserCookieFailure(browser.ErrProtocol)
+	}
+	if result.ProviderState == nil {
+		result.ProviderState = make(map[string]string)
+	}
+	result.ProviderState["auth_used"] = "true"
+	return result
+}
+
+func browserCookieConfigFailure() core.AdapterResult {
+	return core.AdapterResult{Errors: []core.Error{{
+		Code: core.ErrorConfig, Message: "browser cookie route is not configured for the trusted Chrome scope", Retryable: false,
+	}}}
+}
+
+func browserCookieFailure(err error) core.AdapterResult {
+	problem := core.Error{Code: core.ErrorInternal, Message: "browser cookie execution failed", Retryable: false}
+	switch {
+	case errors.Is(err, browser.ErrBrowserUnavailable), errors.Is(err, browser.ErrBridgeAlreadyActive):
+		problem.Code, problem.Message, problem.Retryable = core.ErrorBrowserUnavailable, "Chrome browser bridge is unavailable", true
+	case errors.Is(err, browser.ErrBrowserPermissionMissing):
+		problem.Code, problem.Message = core.ErrorBrowserPermission, "Chrome origin permission is missing"
+	case errors.Is(err, browser.ErrCookieMissing):
+		problem.Code, problem.Message = core.ErrorCookieMissing, "required Chrome cookies are missing"
+	case errors.Is(err, browser.ErrScopeInvalid), errors.Is(err, browser.ErrProtocol):
+		problem.Code, problem.Message = core.ErrorProtocol, "Chrome browser bridge violated the authorized cookie scope"
+	case errors.Is(err, context.DeadlineExceeded):
+		problem.Code, problem.Message, problem.Retryable = core.ErrorTimeout, "Chrome browser bridge timed out", true
+	}
+	return core.AdapterResult{Errors: []core.Error{problem}}
+}
+
+func clearCookieValues(cookies []browser.Cookie) {
+	for index := range cookies {
+		cookies[index].Value = ""
+	}
+}
+
+// adapterResultContainsAny 只检查 JSON 可观察的字符串值和 key；数值 1 不会
+// 与值为 "1" 的 Cookie 误判。contains 语义也能拦住带前后缀的反射。
+func adapterResultContainsAny(result core.AdapterResult, sensitiveValues []string) bool {
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return true
+	}
+	var observable any
+	if err := json.Unmarshal(encoded, &observable); err != nil {
+		return true
+	}
+	return jsonValueContainsAny(observable, sensitiveValues)
+}
+
+func jsonValueContainsAny(value any, sensitiveValues []string) bool {
+	switch typed := value.(type) {
+	case string:
+		for _, sensitive := range sensitiveValues {
+			if sensitive != "" && strings.Contains(typed, sensitive) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if jsonValueContainsAny(item, sensitiveValues) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range typed {
+			if jsonValueContainsAny(key, sensitiveValues) || jsonValueContainsAny(item, sensitiveValues) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizeAdapterResult(result core.AdapterResult, decision router.Decision, retrievedAt time.Time, allowDynamicSource bool) (core.AdapterResult, error) {

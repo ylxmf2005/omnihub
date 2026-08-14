@@ -171,9 +171,11 @@ Channel 是 Dashboard 的一级管理资源。用户可以创建、启停、探�
 
 健康必须同时返回 `desired_state`、派生 `readiness`、分层 `checks[]`、`action_required` 与独立的 `last_execution`。静态模板、登录成功或 Endpoint 200 均不能单独把 Channel 标为 ready；只有未过期的真实 Channel Probe 证据可以。
 
+Bridge 离线或 Chrome origin permission 缺失是当前执行依赖缺失，依赖它的 Channel 必须为 `blocked`，即使存在近期成功 Probe。已有成功 Snapshot 是否仍可分发由 View 的 `fresh | stale` 与最近刷新结果单独表达，不能反向把当前 Channel 标成可执行。
+
 ### REQ-026：Chrome 直接 Cookie 获取
 
-v1 只支持用户当前操作的 Google Chrome 常规 Profile。MV3 Companion Extension 声明 `cookies`，在用户手势下按 origin 请求 optional host permission；获准后，每次 Cookie Channel Execute/Probe 通过 `chrome.cookies` 读取 RouteTemplate allowlist 中的 cookie name/domain/store/partition，并只在当前执行内存中转发。CLI 与 `serve` 都通过同一个用户级 Browser Bridge IPC 使用该能力；无 Bridge 时不能假装回退成直接读浏览器数据库。禁止常驻 `<all_urls>`、`debugger`、默认 Profile CDP、浏览器数据库扫描和自行 OS 解密。
+v1 只支持用户当前操作的 Google Chrome 常规 Profile。MV3 Companion Extension 声明 `cookies`，在用户手势下按 origin 请求 optional host permission；获准后，每次 Cookie Channel Execute/Probe 通过 `chrome.cookies` 读取 RouteTemplate allowlist 中的 cookie name/domain/store/partition，并只在当前执行内存中转发。permission 与 scope URL 必须是同一个精确 HTTPS host；allowed domain 去掉可选前导点后也必须等于该 host，v0.1 不用父域 Cookie 扩大 scope。CLI 与 `serve` 都通过同一个用户级 Browser Bridge IPC 使用该能力；无 Bridge 时不能假装回退成直接读浏览器数据库。禁止常驻 `<all_urls>`、`debugger`、默认 Profile CDP、浏览器数据库扫描和自行 OS 解密。
 
 Dashboard 的“去登录”只负责打开模板声明的 login URL。登录后用户执行一次“允许 OmniHub 读取此站点”；Chrome 的 origin permission 是授权事实，可被同一 Profile 中、allowlist 为其子集的 Channel 复用。Cookie 不写 SQLite，不返回 Dashboard/API，不进入日志或 Run。
 
@@ -205,11 +207,11 @@ Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoi
 
 ### REQ-031：本地 semantic grouping
 
-`similarity_grouping=semantic` 必须显式引用用户配置的 embedding profile；默认 `off`。MVP 复用现有 SQLite，以 little-endian `float32` BLOB 缓存 embedding，并只在同一 provider、model、dimension 与 index revision cohort 内计算精确 cosine。Embedding 输入是有界、可复现的 title + summary/content，不包含 Cookie、Credential、请求头或 Browser Bridge 数据。
+`similarity_grouping=semantic` 必须显式引用用户配置的 embedding profile；默认 `off`。MVP 复用现有 SQLite，以 little-endian `float32` BLOB 缓存 embedding，并只在同一 provider、model、dimension 与 index revision cohort 内计算精确 cosine。Embedding 输入固定为 title + summary；summary 缺失时才回退 content.text，并按 UTF-8 截断到总计 8 KiB。该输入配方属于 index revision，不包含 Cookie、Credential、请求头或 Browser Bridge 数据。
 
-该路线已经过 2026-08-14 的近期本地方案重评，证据见 `shape/evidence/local-vector-study.md`。`sqlite-vec`、Chromem、LanceDB 与 Qdrant 当前均未在单次最多 100 个 Item、pure-Go 三平台发布约束下提供相称收益。单 cohort 达到约 10,000 条、semantic p95 超过 150ms，或出现跨 Snapshot ANN 需求时，优先重新 spike `sqlite-vec`；阈值未到前不为“向量数据库”标签增加第二 Store、CGO 或 sidecar。
+该路线已经过 2026-08-15 的近期本地方案复核，证据见 `shape/evidence/local-vector-study.md`。当前 Driver 已能通过 `modernc.org/sqlite/vec` 无 CGO 注册 sqlite-vec，但其 pre-v1 vec0 对当前最多 100 个 Item 仍是 exact scan，并会增加虚拟表与迁移状态；Chromem、LanceDB 与 Qdrant 同样没有相称收益。单 cohort 达到约 10,000 条、semantic p95 超过 150ms，或出现跨 Snapshot KNN 需求时，优先 spike 现有 Driver 的 vec 包；阈值未到前不为“向量数据库”标签增加状态。
 
-本地优先使用用户已有的 Ollama/OpenAI-compatible Endpoint；外部 Endpoint 是显式数据外发，必须显示 Endpoint、model 与 Egress，不自动下载模型、启动 daemon、切换 Provider 或从本地回退云端。semantic 只写 `group_id/strategy/score`，保留全部 Item；embedding 不可用时保留检索结果并使 Envelope `partial`，不得伪装 grouping 已完成。
+v0.1 只实现 OpenAI-compatible embedding wire contract；用户已有的 Ollama 通过 `/v1/embeddings` 接入，不另增原生 `/api/embed` dialect，也不自动探测协议。外部 Endpoint 是显式数据外发，必须显示 Endpoint、model 与 Egress，不自动下载模型、启动 daemon、切换 Provider 或从本地回退云端。semantic 只写 `group_id/strategy/score`，保留全部 Item；embedding 不可用时保留检索结果并使 Envelope `partial`，不得伪装 grouping 已完成。
 
 写入 cache 前必须校验响应条数、dimension、有限分量与非零范数；BLOB 长度/字节序/解码失败也视为不可用。失败向量不写 cache、不参与 grouping，不允许 NaN/Inf score。
 
@@ -274,11 +276,11 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 16. **出站 fail-closed**：不隐式 fallback、直连、公共 DoH、公共代理或关闭 TLS；真正 System Proxy/PAC、VPN/TUN 与最快线路不在 Stage A。Probe/readiness/Execution 绑定 Endpoint×Egress，输出脱敏的 profile 事实。
 17. **主动 Probe 成本**：只有显式 Channel Probe 执行 DNS→TCP→TLS→HTTP→Feed parse 分层诊断；正常 Query 不自动运行。
 18. **迁移与 readiness**：已有资源缺 Egress 绑定即 fail-closed，不自动补 direct/environment；单 Channel 按固定绑定裁决。Stage C 有持久 Probe facts 与聚合消费者后，跨绑定可用但依赖特定出口时为 `ready_dependent`。
-19. **semantic MVP**：近期本地向量方案调研后仍复用 SQLite BLOB + 精确 cosine，支持用户显式配置的本地 Ollama/OpenAI-compatible embedding；默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务；达到具名规模/延迟/ANN 阈值再重评 `sqlite-vec`。
+19. **semantic MVP**：近期本地向量方案调研后仍复用 SQLite BLOB + 精确 cosine，只实现 OpenAI-compatible embedding wire contract；本地 Ollama 经 `/v1/embeddings` 接入。默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务；达到具名规模/延迟/ANN 阈值再重评 `sqlite-vec`。
 20. **代表 Provider**：GitHub repository metadata 且 Token 可选；Tavily basic 默认、最多 20 条、动态 hostname Source；xurl 只支持可诚实控制的 direct/environment/http_proxy。
 21. **Dashboard 默认值**：生产同源、开发单一显式 loopback Origin；普通资源不级联删除；严格 route group 才聚合 `ready_dependent`；成功/瞬时失败 Probe TTL 为 15/5 分钟。
 22. **保留与发布**：每个 View 只暴露当前 Snapshot；30 天 Run/Probe、180 天 tombstone、30 天孤立 embedding；非当前 immutable Snapshot 暂不暴露或清理；Chrome Host 精确 Extension ID、mock consumer；引用保证止于 OmniHub 输出；首发 `0.1.x` preview、archive/checksum/`go install`，普通卸载保留用户数据。
-23. **升级与外部运行时**：SQLite 自动执行事务化、仅向前 migration，不支持 downgrade；OmniHub 只连接和诊断用户已有的 Ollama/OpenAI-compatible Endpoint，不负责安装、下载模型或启动 daemon。
+23. **升级与外部运行时**：SQLite 自动执行事务化、仅向前 migration，不支持 downgrade；OmniHub 只连接和诊断用户已有的 OpenAI-compatible Endpoint，包括 Ollama `/v1/embeddings`，不负责安装、下载模型或启动 daemon。
 
 ## 7. 决策收口
 

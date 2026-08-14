@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/management"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
@@ -353,6 +354,10 @@ func TestFrozenContractFieldsAreProjected(t *testing.T) {
 	assertProperties(t, artifacts.Schemas.Run, "id", "kind", "resource", "status", "request_id", "idempotency_key", "created_at", "started_at", "finished_at", "claimed_by", "lease_expires_at", "attempt", "progress", "result", "last_error", "revision")
 	assertProperties(t, artifacts.Schemas.Coverage, "source", "channel_id", "route_template_id", "scope", "from", "to", "examined", "returned", "exhaustive", "truncated", "limitations")
 	assertProperties(t, artifacts.Schemas.Error, "code", "message", "source", "provider", "channel_id", "route_template_id", "retryable", "retry_after_ms", "details")
+	assertProperties(t, artifacts.Schemas.BrowserBridge, "id", "browser", "connected", "profile_label", "granted_origins", "last_seen_at", "last_error")
+	assertProperties(t, artifacts.Schemas.BrowserAuthorization, "login_url", "permission_origin_pattern", "cookie_scope")
+	assertProperties(t, artifacts.Schemas.BrowserRevokeRequest, "permission_origin_pattern")
+	assertProperties(t, artifacts.Schemas.BrowserRevokeResponse, "request_id", "status")
 	errorProperties := schemaObject(t, artifacts.Schemas.Error)["properties"].(map[string]any)
 	if got := errorProperties["code"].(map[string]any)["enum"].([]any); len(got) != 13 {
 		t.Fatalf("error code enum = %v, want 13 stable codes", got)
@@ -384,34 +389,37 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, methods := range map[string][]string{
-		"/v1/dashboard/summary":       {"get"},
-		"/v1/sources":                 {"get"},
-		"/v1/sources/{id}":            {"get"},
-		"/v1/route-templates":         {"get"},
-		"/v1/route-templates/{id}":    {"get"},
-		"/v1/channels":                {"get", "post"},
-		"/v1/channels/{id}":           {"get", "put", "delete"},
-		"/v1/channels/{id}/probe":     {"post"},
-		"/v1/endpoint-profiles":       {"get", "post"},
-		"/v1/endpoint-profiles/{id}":  {"get", "put", "delete"},
-		"/v1/egress-profiles":         {"get", "post"},
-		"/v1/egress-profiles/{id}":    {"get", "put", "delete"},
-		"/v1/credentials":             {"get", "post"},
-		"/v1/credentials/{id}":        {"get", "put", "delete"},
-		"/v1/credentials/{id}/revoke": {"post"},
-		"/v1/collections":             {"get", "post"},
-		"/v1/collections/{id}":        {"get", "put", "delete"},
-		"/v1/views":                   {"get", "post"},
-		"/v1/views/{id}":              {"get", "put", "delete"},
-		"/v1/views/{id}/snapshot":     {"get"},
-		"/v1/views/{id}/items":        {"get"},
-		"/v1/views/{id}/refresh":      {"post"},
-		"/v1/runs":                    {"get", "post"},
-		"/v1/runs/{id}":               {"get"},
-		"/v1/readiness":               {"get"},
-		"/feeds/{view}.json":          {"get"},
-		"/feeds/{view}.rss":           {"get"},
-		"/feeds/{view}.atom":          {"get"},
+		"/v1/dashboard/summary":    {"get"},
+		"/v1/sources":              {"get"},
+		"/v1/sources/{id}":         {"get"},
+		"/v1/route-templates":      {"get"},
+		"/v1/route-templates/{id}": {"get"},
+		"/v1/channels":             {"get", "post"},
+		"/v1/channels/{id}":        {"get", "put", "delete"},
+		"/v1/channels/{id}/probe":  {"post"},
+		"/v1/channels/{id}/chrome/authorization-descriptor": {"get"},
+		"/v1/browser-bridges":                               {"get"},
+		"/v1/browser-bridges/{id}/permissions/revoke":       {"post"},
+		"/v1/endpoint-profiles":                             {"get", "post"},
+		"/v1/endpoint-profiles/{id}":                        {"get", "put", "delete"},
+		"/v1/egress-profiles":                               {"get", "post"},
+		"/v1/egress-profiles/{id}":                          {"get", "put", "delete"},
+		"/v1/credentials":                                   {"get", "post"},
+		"/v1/credentials/{id}":                              {"get", "put", "delete"},
+		"/v1/credentials/{id}/revoke":                       {"post"},
+		"/v1/collections":                                   {"get", "post"},
+		"/v1/collections/{id}":                              {"get", "put", "delete"},
+		"/v1/views":                                         {"get", "post"},
+		"/v1/views/{id}":                                    {"get", "put", "delete"},
+		"/v1/views/{id}/snapshot":                           {"get"},
+		"/v1/views/{id}/items":                              {"get"},
+		"/v1/views/{id}/refresh":                            {"post"},
+		"/v1/runs":                                          {"get", "post"},
+		"/v1/runs/{id}":                                     {"get"},
+		"/v1/readiness":                                     {"get"},
+		"/feeds/{view}.json":                                {"get"},
+		"/feeds/{view}.rss":                                 {"get"},
+		"/feeds/{view}.atom":                                {"get"},
 	} {
 		entry, ok := artifacts.OpenAPI.Paths[path]
 		if !ok {
@@ -427,12 +435,6 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 			t.Errorf("OpenAPI %s exposes forbidden PATCH compatibility", path)
 		}
 	}
-	for _, forbidden := range []string{"/v1/browser-bridges", "/v1/channels/{id}/chrome/authorization-descriptor"} {
-		if _, exists := artifacts.OpenAPI.Paths[forbidden]; exists {
-			t.Errorf("OpenAPI prematurely exposes Stage D path %s", forbidden)
-		}
-	}
-
 	channelCreate := artifacts.OpenAPI.Paths["/v1/channels"]["post"].(map[string]any)
 	channelSchema := requestSchema(channelCreate)
 	if _, exists := channelSchema["properties"].(map[string]any)["expected_revision"]; exists {
@@ -476,6 +478,18 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 	if _, ok := probeResponses["501"]; !ok {
 		t.Fatal("Probe OpenAPI misses unconfigured 501")
 	}
+	revokeBrowser := artifacts.OpenAPI.Paths["/v1/browser-bridges/{id}/permissions/revoke"]["post"].(map[string]any)
+	if hasParameter(revokeBrowser, "If-Match") || hasParameter(revokeBrowser, "Idempotency-Key") {
+		t.Fatal("Browser permission revoke incorrectly uses resource revision or execution idempotency")
+	}
+	revokeProperties := requestSchema(revokeBrowser)["properties"].(map[string]any)
+	if len(revokeProperties) != 1 || revokeProperties["permission_origin_pattern"] == nil {
+		t.Fatalf("Browser revoke input properties = %v", revokeProperties)
+	}
+	revokeRequired := requestSchema(revokeBrowser)["required"].([]any)
+	if len(revokeRequired) != 1 || revokeRequired[0] != "permission_origin_pattern" || revokeProperties["permission_origin_pattern"].(map[string]any)["minLength"] != float64(1) {
+		t.Fatalf("Browser revoke required contract = %v, property=%v", revokeRequired, revokeProperties["permission_origin_pattern"])
+	}
 	feedResponses := artifacts.OpenAPI.Paths["/feeds/{view}.json"]["get"].(map[string]any)["responses"].(map[string]any)
 	for _, status := range []string{"200", "304", "409", "503"} {
 		if _, ok := feedResponses[status]; !ok {
@@ -493,6 +507,13 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" || !strings.Contains(response.Header().Get("Vary"), "Origin") {
 		t.Fatalf("dev readiness response = %d, ACAO=%q, Vary=%q", response.Code, response.Header().Get("Access-Control-Allow-Origin"), response.Header().Get("Vary"))
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/browser-bridges", nil)
+	request.Header.Set("Origin", "http://localhost:5173")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
+		t.Fatalf("dev Browser Bridge response = %d, ACAO=%q", response.Code, response.Header().Get("Access-Control-Allow-Origin"))
 	}
 
 	for _, path := range []string{"/v1/search", "/mcp", "/feeds/view.json"} {
@@ -513,6 +534,15 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 	handler.ServeHTTP(preflightResponse, preflight)
 	if preflightResponse.Code != http.StatusNoContent || !strings.Contains(preflightResponse.Header().Get("Access-Control-Allow-Methods"), http.MethodPut) {
 		t.Fatalf("preflight response = %d, methods=%q", preflightResponse.Code, preflightResponse.Header().Get("Access-Control-Allow-Methods"))
+	}
+	browserPreflight := httptest.NewRequest(http.MethodOptions, "http://127.0.0.1:8080/v1/browser-bridges/chrome_default/permissions/revoke", nil)
+	browserPreflight.Header.Set("Origin", "http://localhost:5173")
+	browserPreflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	browserPreflight.Header.Set("Access-Control-Request-Headers", "content-type")
+	browserPreflightResponse := httptest.NewRecorder()
+	handler.ServeHTTP(browserPreflightResponse, browserPreflight)
+	if browserPreflightResponse.Code != http.StatusNoContent || !strings.Contains(browserPreflightResponse.Header().Get("Access-Control-Allow-Methods"), http.MethodPost) {
+		t.Fatalf("Browser revoke preflight = %d, methods=%q", browserPreflightResponse.Code, browserPreflightResponse.Header().Get("Access-Control-Allow-Methods"))
 	}
 
 	for name, ifMatch := range map[string]string{"bare": "3", "weak": `W/"3"`, "wildcard": "*", "noncanonical": `"03"`} {
@@ -597,6 +627,147 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 	}
 }
 
+func TestBrowserDashboardRoutesUseTrustedCatalogAndLiveBridge(t *testing.T) {
+	now := time.Date(2026, 8, 15, 1, 2, 3, 0, time.UTC)
+	offline := &dashboardBrowserFake{statusErr: browser.ErrBrowserUnavailable}
+	dependencies := dashboardTestDependencies("")
+	dependencies.LoadCatalog = func(context.Context) (*registry.Catalog, error) {
+		return browserDashboardCatalog(t, true, true, true), nil
+	}
+	dependencies.Browser = offline
+	handler, err := NewDashboardHTTPHandler(dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bridge 离线是可展示的实时 health，而不是一次失败的管理读取。
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/browser-bridges", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("offline Browser Bridge response = %d: %s", response.Code, response.Body.String())
+	}
+	var bridgeHealth core.BrowserBridge
+	if err := json.Unmarshal(response.Body.Bytes(), &bridgeHealth); err != nil {
+		t.Fatal(err)
+	}
+	if bridgeHealth.ID != browser.BridgeID || bridgeHealth.Browser != "chrome" || bridgeHealth.Connected || bridgeHealth.LastError == nil || bridgeHealth.LastError.Code != core.ErrorBrowserUnavailable {
+		t.Fatalf("offline Browser Bridge health = %+v", bridgeHealth)
+	}
+
+	// Descriptor 只由当前 enabled/trusted 的 Chrome cookie template 投影；
+	// Bridge 是否在线或是否已授权不会混入这个静态描述。
+	for name, test := range map[string]struct {
+		catalog *registry.Catalog
+		channel string
+		status  int
+		code    string
+	}{
+		"trusted":           {browserDashboardCatalog(t, true, true, true), "channel_browser", http.StatusOK, ""},
+		"untrusted":         {browserDashboardCatalog(t, false, true, true), "channel_browser", http.StatusConflict, string(browser.ErrorScopeInvalid)},
+		"disabled template": {browserDashboardCatalog(t, true, false, true), "channel_browser", http.StatusConflict, string(browser.ErrorScopeInvalid)},
+		"disabled channel":  {browserDashboardCatalog(t, true, true, false), "channel_browser", http.StatusConflict, string(browser.ErrorScopeInvalid)},
+		"unknown channel":   {browserDashboardCatalog(t, true, true, true), "channel_unknown", http.StatusNotFound, "resource_not_found"},
+	} {
+		t.Run("descriptor "+name, func(t *testing.T) {
+			dependencies := dashboardTestDependencies("")
+			dependencies.LoadCatalog = func(context.Context) (*registry.Catalog, error) { return test.catalog, nil }
+			dependencies.Browser = &dashboardBrowserFake{status: browser.Status{Connected: true, GrantedOrigins: []string{"https://social.example/*"}, LastSeenAt: now}}
+			handler, err := NewDashboardHTTPHandler(dependencies)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/channels/"+test.channel+"/chrome/authorization-descriptor", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("descriptor response = %d: %s", response.Code, response.Body.String())
+			}
+			if test.code != "" {
+				if got := problemCode(t, response); got != test.code {
+					t.Fatalf("descriptor problem code = %q, want %q", got, test.code)
+				}
+				return
+			}
+			var descriptor browser.AuthorizationDescriptor
+			if err := json.Unmarshal(response.Body.Bytes(), &descriptor); err != nil {
+				t.Fatal(err)
+			}
+			if descriptor.LoginURL != "https://social.example/login" || descriptor.PermissionOriginPattern != "https://social.example/*" || descriptor.CookieScope.URL != "https://social.example/" {
+				t.Fatalf("authorization descriptor = %+v", descriptor)
+			}
+			if strings.Contains(response.Body.String(), "connected") || strings.Contains(response.Body.String(), "granted_origins") {
+				t.Fatalf("authorization descriptor claims live permission state: %s", response.Body.String())
+			}
+		})
+	}
+
+	// Revoke 只接受固定 Bridge 和当前 trusted scope；If-Match 不参与这个
+	// 非资源 action，成功响应直接回传 Extension 的最新 permission 状态。
+	success := &dashboardBrowserFake{revokeResponse: browser.RevokePermissionResponse{
+		RequestID: "browserreq_revoke", Status: browser.Status{Connected: true, ProfileLabel: "Current Chrome profile", GrantedOrigins: []string{}, LastSeenAt: now},
+	}}
+	dependencies.Browser = success
+	handler, err = NewDashboardHTTPHandler(dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/browser-bridges/chrome_default/permissions/revoke", strings.NewReader(`{"permission_origin_pattern":"https://social.example/*"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `W/"999"`)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("ETag") != "" {
+		t.Fatalf("successful revoke response = %d, ETag=%q: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	var revoked browser.RevokePermissionResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if success.revokedOrigin != "https://social.example/*" || revoked.RequestID != "browserreq_revoke" || len(revoked.Status.GrantedOrigins) != 0 {
+		t.Fatalf("successful revoke = %+v, forwarded origin=%q", revoked, success.revokedOrigin)
+	}
+
+	for name, test := range map[string]struct {
+		client *dashboardBrowserFake
+		path   string
+		body   string
+		status int
+		code   string
+	}{
+		"offline":            {&dashboardBrowserFake{revokeErr: browser.ErrBrowserUnavailable}, browser.BridgeID, `{"permission_origin_pattern":"https://social.example/*"}`, http.StatusConflict, string(browser.ErrorBrowserUnavailable)},
+		"permission missing": {&dashboardBrowserFake{revokeErr: browser.ErrBrowserPermissionMissing}, browser.BridgeID, `{"permission_origin_pattern":"https://social.example/*"}`, http.StatusConflict, string(browser.ErrorBrowserPermissionMissing)},
+		"untrusted origin":   {&dashboardBrowserFake{}, browser.BridgeID, `{"permission_origin_pattern":"https://evil.example/*"}`, http.StatusConflict, string(browser.ErrorScopeInvalid)},
+		"unknown field":      {&dashboardBrowserFake{}, browser.BridgeID, `{"permission_origin_pattern":"https://social.example/*","unexpected":true}`, http.StatusBadRequest, "invalid_json"},
+		"missing origin":     {&dashboardBrowserFake{}, browser.BridgeID, `{}`, http.StatusBadRequest, "invalid_request"},
+		"null origin":        {&dashboardBrowserFake{}, browser.BridgeID, `{"permission_origin_pattern":null}`, http.StatusBadRequest, "invalid_request"},
+		"empty origin":       {&dashboardBrowserFake{}, browser.BridgeID, `{"permission_origin_pattern":""}`, http.StatusBadRequest, "invalid_request"},
+		"unknown bridge":     {&dashboardBrowserFake{}, "chrome_other", `{"permission_origin_pattern":"https://social.example/*"}`, http.StatusNotFound, "resource_not_found"},
+	} {
+		t.Run("revoke "+name, func(t *testing.T) {
+			dependencies := dashboardTestDependencies("")
+			dependencies.LoadCatalog = func(context.Context) (*registry.Catalog, error) {
+				return browserDashboardCatalog(t, true, true, true), nil
+			}
+			dependencies.Browser = test.client
+			handler, err := NewDashboardHTTPHandler(dependencies)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/browser-bridges/"+test.path+"/permissions/revoke", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.status || problemCode(t, response) != test.code {
+				t.Fatalf("revoke response = %d: %s", response.Code, response.Body.String())
+			}
+			if name == "untrusted origin" && test.client.revokeCalls != 0 {
+				t.Fatal("untrusted origin reached Browser Bridge")
+			}
+		})
+	}
+}
+
 func TestLegacyHTTPHandlerDoesNotAdvertiseDashboardRoutes(t *testing.T) {
 	handler, err := NewHTTPHandler(func(context.Context, core.Operation) (core.Envelope, error) {
 		return core.Envelope{}, nil
@@ -676,6 +847,56 @@ func dashboardTestDependencies(devOrigin string) DashboardHTTPDependencies {
 		},
 		Version: "0.1.0", InstanceID: "instance_test", DevOrigin: devOrigin,
 	}
+}
+
+type dashboardBrowserFake struct {
+	status         browser.Status
+	statusErr      error
+	revokeResponse browser.RevokePermissionResponse
+	revokeErr      error
+	revokedOrigin  string
+	revokeCalls    int
+}
+
+func (fake *dashboardBrowserFake) Status(context.Context) (browser.Status, error) {
+	return fake.status, fake.statusErr
+}
+
+func (fake *dashboardBrowserFake) RevokePermission(_ context.Context, origin string) (browser.RevokePermissionResponse, error) {
+	fake.revokeCalls++
+	fake.revokedOrigin = origin
+	return fake.revokeResponse, fake.revokeErr
+}
+
+func browserDashboardCatalog(t *testing.T, trusted, templateEnabled, channelEnabled bool) *registry.Catalog {
+	t.Helper()
+	source := core.Source{ID: "social", Origin: "user", Enabled: true}
+	provider := core.Provider{ID: "browser-fixture", Capabilities: []string{"search"}, Enabled: true}
+	template := core.RouteTemplate{
+		RouteTemplateID: "browser-cookie-search", Origin: "imported",
+		SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"social"}},
+		Provider:         "browser-fixture", Adapter: "browser-fixture", Capabilities: []string{"search"}, ContentLevel: "body",
+		Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "unsupported"},
+		Auth: core.AuthDescriptor{
+			Kind: "browser_cookie", Required: true, LoginURL: "https://social.example/login", Browser: "chrome",
+			PermissionOrigins: []string{"https://social.example/*"},
+			CookieScope: &core.CookieScope{
+				URL: "https://social.example/", AllowedDomains: []string{"social.example"}, Names: []string{"session"},
+				Store: "current", Partitions: []string{"unpartitioned"},
+			},
+		},
+		Cost: "free", Trust: "user_authorized",
+	}
+	channel := core.Channel{ID: "channel_browser", Source: "social", RouteTemplateID: template.RouteTemplateID, Enabled: channelEnabled, Revision: 1}
+	overlay := core.TemplateOverlay{RouteTemplateID: template.RouteTemplateID, Enabled: templateEnabled, Trusted: trusted, Revision: 1}
+	catalog, err := registry.NewCatalog(
+		[]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{template}, []core.Channel{channel},
+		nil, nil, nil, nil, []core.TemplateOverlay{overlay},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
 }
 
 func requestSchema(operation map[string]any) map[string]any {

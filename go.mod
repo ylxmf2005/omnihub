@@ -3,11 +3,13 @@ module github.com/ylxmf2005/omnihub
 go 1.25.0
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/google/jsonschema-go v0.4.3
 	github.com/mmcdole/gofeed v1.3.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	go.yaml.in/yaml/v3 v3.0.3
 	golang.org/x/net v0.57.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.56.0
 	sigs.k8s.io/yaml v1.6.0
 )
@@ -30,7 +32,6 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.74.4 // indirect

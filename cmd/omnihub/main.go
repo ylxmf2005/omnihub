@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/adapter"
+	"github.com/ylxmf2005/omnihub/internal/browser"
 	"github.com/ylxmf2005/omnihub/internal/config"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/health"
@@ -64,6 +65,8 @@ const usage = `usage:
   omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json|jsonl]
   omnihub refresh VIEW_ID --idempotency-key KEY
   omnihub maintenance prune [--apply]
+  omnihub chrome-host run
+  omnihub chrome-host install --extension-id ID
   omnihub mcp
   omnihub serve [--listen 127.0.0.1:8787] [--dev-origin ORIGIN]
 
@@ -107,6 +110,11 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// Chrome 直接启动 manifest 中的同一二进制时，会把调用方 Extension
+	// origin 作为首个参数；Native Host 不能依赖 wrapper script 才能工作。
+	if len(args) > 0 && strings.HasPrefix(args[0], "chrome-extension://") {
+		return runChromeHost(stdin, stdout, stderr)
+	}
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
 		return exitParameter
@@ -745,6 +753,43 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return 0
 
+	case "chrome-host":
+		if len(args) < 2 {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		switch args[1] {
+		case "run":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			return runChromeHost(stdin, stdout, stderr)
+		case "install":
+			flags := flag.NewFlagSet("chrome-host install", flag.ContinueOnError)
+			flags.SetOutput(stderr)
+			extensionID := ""
+			flags.StringVar(&extensionID, "extension-id", extensionID, "one exact Chrome Extension ID")
+			if err := flags.Parse(args[2:]); err != nil || flags.NArg() != 0 || extensionID == "" {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: resolve native host executable: %v\n", err)
+				return exitConfig
+			}
+			result, err := browser.InstallHost(executable, extensionID)
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: install Chrome native host: %v\n", err)
+				return exitConfig
+			}
+			value = result
+		default:
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+
 	case "serve":
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -782,6 +827,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "omnihub: create serve instance identity: %v\n", err)
 			return exitInternal
 		}
+		browserClient := browser.NewClient(paths.RuntimeDir)
 		execute := func(ctx context.Context, operation core.Operation) (core.Envelope, error) {
 			current, loadErr := load(ctx)
 			if loadErr != nil {
@@ -811,7 +857,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				}
 				records = append(records, values...)
 			}
-			return readiness.FromProbeHealth(current, records, now), nil
+			report := readiness.FromProbeHealth(current, records, now)
+			bridge := core.BrowserBridge{ID: browser.BridgeID, Browser: "chrome"}
+			status, statusErr := browserClient.Status(ctx)
+			if statusErr == nil {
+				bridge.Connected = status.Connected
+				bridge.ProfileLabel = status.ProfileLabel
+				bridge.GrantedOrigins = append([]string(nil), status.GrantedOrigins...)
+				bridge.LastSeenAt = status.LastSeenAt
+			} else if !errors.Is(statusErr, browser.ErrBrowserUnavailable) {
+				return readiness.Report{}, statusErr
+			}
+			return readiness.WithBrowserBridge(report, current, bridge, now), nil
 		}
 		probe := func(ctx context.Context, channelID, idempotencyKey string) (core.Run, error) {
 			current, loadErr := load(ctx)
@@ -831,7 +888,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		handler, err := transport.NewDashboardHTTPHandler(transport.DashboardHTTPDependencies{
 			Execute: execute, LoadCatalog: load, Management: managementService, Subscription: subscriptionService,
-			Readiness: readinessReport, Probe: probe, Version: "0.1.0", InstanceID: instanceID, DevOrigin: devOrigin,
+			Readiness: readinessReport, Probe: probe, Browser: browserClient,
+			Version: "0.1.0", InstanceID: instanceID, DevOrigin: devOrigin,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: construct Dashboard HTTP server: %v\n", err)
@@ -945,7 +1003,7 @@ func executeCatalogOperation(ctx context.Context, catalog *registry.Catalog, ope
 	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
 	service := query.Service{
 		Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}, GitHub: adapter.GitHubAdapter{},
-		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{},
+		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, CookieReader: browser.NewClient(paths.RuntimeDir),
 	}
 	return service.Execute(ctx, catalog, operation)
 }
@@ -1328,5 +1386,24 @@ func resolveCLIPaths() (config.Paths, error) {
 		}
 		paths.CacheDir = value
 	}
+	if value, exists := os.LookupEnv("OMNIHUB_RUNTIME_DIR"); exists {
+		if value == "" {
+			return config.Paths{}, errors.New("OMNIHUB_RUNTIME_DIR must not be empty")
+		}
+		paths.RuntimeDir = value
+	}
 	return paths, nil
+}
+
+func runChromeHost(stdin io.Reader, stdout, stderr io.Writer) int {
+	paths, err := resolveCLIPaths()
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: resolve Chrome host paths: %v\n", err)
+		return exitConfig
+	}
+	if err := browser.RunHost(context.Background(), stdin, stdout, paths.RuntimeDir, time.Now); err != nil {
+		fmt.Fprintf(stderr, "omnihub: run Chrome native host: %v\n", err)
+		return exitFailed
+	}
+	return 0
 }
