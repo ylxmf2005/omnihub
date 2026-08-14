@@ -129,9 +129,7 @@ const (
 type SimilarityGrouping string
 
 const (
-	SimilarityOff     SimilarityGrouping = "off"
-	SimilarityTitle   SimilarityGrouping = "title"
-	SimilarityContent SimilarityGrouping = "content"
+	SimilarityOff SimilarityGrouping = "off"
 )
 
 // Envelope 是同步执行和持久 Run 终态共享的结果模型。

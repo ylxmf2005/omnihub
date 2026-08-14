@@ -4,7 +4,7 @@
 
 规划 OmniHub 的实现：用容易扩展的接入层统一搜索、最近更新和单条读取，并通过 API、CLI、MCP、RSS/Atom/JSON Feed、配套 Skill 与综合 Web Dashboard 对外提供能力。大量来源可以走 RSS/RSSHub，但用户可能不愿在本机安装 RSSHub，也可能使用需要 key 的远程实例；同一来源应允许 Direct Feed、RSSHub、原生 API、专项 CLI/MCP 或通用 Web Search 等不同路线。统一格式和扩展机制要优先吸收成熟项目的做法，而不是从零发明。
 
-继续执行请求：用户离开后不再回答问题，授权 Agent 自主完成技术与产品取舍；优先简单可发布的本地 MVP、复用现有能力并完成必要的新技术调研，使用 Ponytail 控制复杂度。最终目标是实现全部当前范围、为每个宣称支持的来源与功能提供测试、完成独立审核和发布准备，并以可验收纵切阶段性交付。
+继续执行请求：用户离开后不再回答问题，授权 Agent 自主完成技术与产品取舍；优先简单可发布的本地 MVP、复用现有能力并完成必要的新技术调研，使用 Ponytail full 控制复杂度。最终目标是实现全部当前范围、为每个宣称支持的来源与功能提供测试、完成独立审核和发布准备，并以可验收纵切阶段性交付和 push。
 
 来源：当前对话中用户显式调用 `$shape` 并要求先充分调查、产出 Shape 草稿、再进入 Grill；项目名与目标仓库已确定为 `OmniHub` / `ylxmf2005/omnihub`。
 
@@ -25,11 +25,15 @@
 - Chrome 现实：普通 localhost Dashboard 受同源与 HttpOnly 限制，无法读取其他站点 Cookie；可支持的正式路径是 Chrome MV3 Companion Extension 请求 optional host permission，通过 `chrome.cookies` 按执行直接读取，再经长连接 Native Messaging 与当前用户专属 IPC 交给 CLI/`serve`。Chrome 105+ 在 `connectNative()` 端口存活时会保持 Extension Service Worker；Chrome 关闭或 Bridge 断开时，依赖 Cookie 的 Channel 必须明确不可用。
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
-- 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。MVP 复用现有 pure-Go SQLite，以 `float32` BLOB 缓存 embedding 并对单次最多 100 个结果做精确余弦比较；不引入第二数据库、CGO 或外部向量服务。Embedding 通过用户显式配置的本地 Ollama/OpenAI-compatible Endpoint 获取，不自动下载模型、不自动从本地回退云端。
-- 实施状态：Shape 与 Grill 已收口；Stage 0—3 已提交并推送。Stage A 已完成显式 EgressProfile、固定 Endpoint/Channel 绑定、四种可信 transport、Direct/RSSHub 分层 Channel Probe、CLI/OPML 显式出口与 Adapter fail-closed；全量 test/race/vet、真实 CLI E2E、四平台构建、Schema、Ponytail 与独立安全复核均已闭合。NodeSeek 由独立 side 任务处理；Stage B 以前仍不宣称 GitHub/Tavily/X、HTTP/MCP/Skill 或 Dashboard 已实现。
+- 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。2026-08-14 已重新调研 `sqlite-vec`、Chromem、LanceDB 与 Qdrant：当前 Go/三平台/单二进制约束下，新方案要么仍是 exact scan，要么引入 C extension、第二持久状态或 sidecar，无法给单次最多 100 个结果带来相称收益。MVP 因而复用现有 pure-Go SQLite，以 little-endian `float32` BLOB 缓存 embedding 并做精确余弦比较；达到单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时优先重评 `sqlite-vec`。Embedding 通过用户显式配置的本地 Ollama/OpenAI-compatible Endpoint 获取，不自动安装/下载/启动模型，也不自动从本地回退云端。
+- 实施状态：Shape 与 Grill 已收口；Stage 0—A 已提交并推送。Stage B 已在当前工作树完成 GitHub/Tavily/xurl、Provider 管理、统一 Query Service、CLI fetch/JSONL、REST/OpenAPI、MCP、Skill 与 Feed Source Bundle；全量 test/race/vet、真实匿名 GitHub/V2EX、REST、四平台构建和独立 Review 已闭合。Tavily/X 因无用户真实凭据只声明 fixture 证据；Dashboard、Chrome 与 semantic grouping 仍分别等待 Stage C—E。NodeSeek 由独立 side 任务处理。
 - 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
 - Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；跨绑定 `ready_dependent` 等待 Stage C 的 Probe health 持久化与 Dashboard aggregate consumer，不能用无调用者 helper 或伪历史提前实现。
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
+- Stage B 的代表 Provider 已冻结为窄能力：GitHub 只检索 Repository metadata 并按仓库读取 metadata，Token 可选；Tavily 默认 basic、最多 20 条且不取 answer/raw content/images，结果 Source 取规范化目标 hostname、Provider 固定为 tavily；xurl 只接受 direct/environment/http_proxy，SOCKS5 fail-closed，命令执行不伪造分层网络观测。
+- Stage C 的管理边界已冻结：生产 Dashboard 与 Backend 同源，开发态只允许一个显式 loopback Origin；删除不级联或静默解绑，Credential 撤销会清值并阻断依赖 Channel；`ready_dependent` 只聚合除 Egress 外完全相同的执行路线，成功 Probe TTL 为 15 分钟、瞬时失败为 5 分钟；每个 View 只保留最新成功 Snapshot，Run/Probe 30 天、identity tombstone 180 天、孤立 embedding 30 天，由显式 maintenance/启动清理或外部 cron 执行。
+- Stage D 只交付可安装的 Chrome Bridge/Native Host、安全合同和 mock consumer，不为演示增加通用 Cookie Adapter；Host 安装必须接收一个精确 Extension ID。OmniHub v1 只保证自身 Item/Observation 引用可追溯，不宣称审计任意 Agent 最终文本。首发使用三平台 archive、checksum 与 `go install`，不把包管理器和平台签名纳入完成条件。
+- 已确认剩余 MVP 默认值：`serve` 只提供前台 loopback 进程，不实现三平台服务管理器；View 优先遵守上游 freshness hint，无 hint 时使用 15 分钟，不增加 per-View 覆盖项；SQLite 自动执行事务化、仅向前 migration，不支持降级；普通卸载保留用户数据。首个公开版本按 `0.1.x` preview 准备，传输 Schema 保持独立版本，正式 1.0 前完成 compatibility review。
 
 ## Goal
 
@@ -64,6 +68,7 @@
 - v1 只支持 Google Chrome 常规 Profile；不直接解密浏览器 Cookie 数据库，不用 remote debugging/CDP 绕过 Chrome 保护，不默认扫描全部 Profile、域名或 Cookie，不支持 Firefox/Safari/Edge 与 Incognito。
 - v1 不接入系统 Keychain/Secret Service/Credential Manager；API Key/Token 的保护边界就是 loopback 进程、SQLite 文件权限和用户本机账号。Cookie 不持久化，因此 Chrome 未运行时不承诺依赖 Cookie 的后台刷新。
 - 不实现基于向量的删除式去重、rerank、自动模型下载或云端 fallback；semantic 只建立可解释分组，exact identity 仍是唯一删除规则。
+- v1 不安装或托管 Ollama/embedding 模型，不实现 launchd/systemd/Windows service manager，也不在普通卸载中删除 SQLite、配置或缓存。
 - Stage 3 不实现 EgressProfile、HTTP/SOCKS5 代理或 DNS/TCP/TLS 分层 Probe。后续 Stage A 也不实现真正的 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
 - v1 不引入 sqlite-vec、Chromem、Qdrant、LanceDB 或独立 ANN 服务；当单模型 cohort 达到约一万条，或语义比较 p95 超过 150ms，再依据真实数据重新选择索引。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
@@ -88,11 +93,12 @@
 ## Current Artifacts
 
 - `shape/evidence/reference-study.md`：`ready`，参考项目、标准、许可证与来源实测。
+- `shape/evidence/local-vector-study.md`：`ready`，近期本地向量方案、发布约束与重评阈值。
 - `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
 - `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
 - `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`ready`，Stage 0—A 已完成，下一入口为 Stage B。
-- `dev/implementation.md`：`completed`，Stage A 固定出口与分层 Probe 已实现并通过聚焦反馈。
-- `test/test-plan.md`：`completed`，TC-A01—A08 已执行。
-- `test/test-report.md`：`passed`，四 mode、分层 Probe、fail-closed、脱敏 CLI E2E、四平台构建与 Schema 已闭合。
-- `review/review.md`：`approve`，Stage A 当前完整对象无未解决 P0–P2。
+- `plan.md`：`ready`，Stage 0—B 已完成，下一入口为 Stage C。
+- `dev/implementation.md`：`completed`，Stage B 三个代表 Provider 与 Agent Query 发布面已实现并通过聚焦反馈。
+- `test/test-plan.md`：`completed`，TC-B01—B08 已执行。
+- `test/test-report.md`：`passed`，Provider、aggregate、CLI/REST/MCP/JSONL/Skill/Bundle、真实 smoke、四平台构建与质量闸已闭合。
+- `review/review.md`：`approve`，Stage B 当前完整对象无未解决 P0–P2。

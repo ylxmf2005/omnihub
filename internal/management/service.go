@@ -34,12 +34,13 @@ const (
 )
 
 var (
-	ErrInvalidDirectFeed   = errors.New("invalid direct feed")
-	ErrInvalidEgress       = errors.New("invalid egress profile")
-	ErrInvalidRSSHub       = errors.New("invalid RSSHub configuration")
-	ErrRSSHubUnavailable   = errors.New("RSSHub resource unavailable")
-	ErrInvalidOPML         = errors.New("invalid OPML")
-	ErrUnsupportedTemplate = errors.New("unsupported route template")
+	ErrInvalidDirectFeed     = errors.New("invalid direct feed")
+	ErrInvalidEgress         = errors.New("invalid egress profile")
+	ErrInvalidRSSHub         = errors.New("invalid RSSHub configuration")
+	ErrInvalidProviderConfig = errors.New("invalid provider configuration")
+	ErrRSSHubUnavailable     = errors.New("RSSHub resource unavailable")
+	ErrInvalidOPML           = errors.New("invalid OPML")
+	ErrUnsupportedTemplate   = errors.New("unsupported route template")
 )
 
 // routingStore 是管理写服务所需的最窄 Repository 视图。所有写操作都先
@@ -120,8 +121,8 @@ type ApplyRSSHubChannelInput struct {
 	ExpectedRevision   int64          `json:"expected_revision"`
 }
 
-// ApplyCredentialInput 是 RSSHub API key 与 Egress basic auth 共用的最窄
-// 本机写入口；列表仍只返回掩码摘要，不提供 secret detail 回显路径。
+// ApplyCredentialInput 是受信任内建 Provider 与 Egress 共用的本机写入口；
+// 列表仍只返回掩码摘要，不提供 secret detail 回显路径。
 type ApplyCredentialInput struct {
 	ID               string `json:"id"`
 	Provider         string `json:"provider"`
@@ -181,13 +182,19 @@ func managedCredentialError(provider, authKind string) error {
 	if provider == "egress" || authKind == "basic" {
 		return ErrInvalidEgress
 	}
+	if provider == "github-api" || provider == "tavily" || provider == "xurl" {
+		return ErrInvalidProviderConfig
+	}
 	return ErrInvalidRSSHub
 }
 
 func validateManagedCredential(provider, authKind, value string) error {
 	switch {
-	case provider == "rsshub" && authKind == "api_key":
-		if strings.TrimSpace(value) != "" {
+	case provider == "rsshub" && authKind == "api_key",
+		provider == "github-api" && authKind == "token",
+		provider == "tavily" && authKind == "api_key",
+		provider == "xurl" && authKind == "app_only":
+		if strings.TrimSpace(value) != "" && strings.IndexFunc(value, unicode.IsControl) < 0 {
 			return nil
 		}
 	case provider == "egress" && authKind == "basic":
@@ -212,7 +219,11 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 	}
 	result := make([]core.CredentialSummary, 0, len(credentials))
 	for _, credential := range credentials {
-		if credential.Provider == "rsshub" && credential.AuthKind == "api_key" || credential.Provider == "egress" && credential.AuthKind == "basic" {
+		if credential.Provider == "rsshub" && credential.AuthKind == "api_key" ||
+			credential.Provider == "egress" && credential.AuthKind == "basic" ||
+			credential.Provider == "github-api" && credential.AuthKind == "token" ||
+			credential.Provider == "tavily" && credential.AuthKind == "api_key" ||
+			credential.Provider == "xurl" && credential.AuthKind == "app_only" {
 			result = append(result, summarizeCredential(credential))
 		}
 	}

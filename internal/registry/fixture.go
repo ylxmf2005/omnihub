@@ -15,11 +15,13 @@ func BuiltinCatalog() *Catalog {
 		{ID: "nodeseek", Origin: "builtin", Enabled: true},
 		{ID: "v2ex", Origin: "builtin", Enabled: true},
 		{ID: "x", Origin: "builtin", Enabled: true},
+		{ID: "tavily-discovery", DisplayName: "Tavily Web Discovery", Origin: "builtin", Enabled: true},
 	}
 	providers := []core.Provider{
 		{ID: "direct-feed", Capabilities: []string{"latest", "search"}, Enabled: true},
 		{ID: "rsshub", Capabilities: []string{"latest"}, Enabled: true},
 		{ID: "github-api", Capabilities: []string{"search", "fetch"}, Enabled: true},
+		{ID: "tavily", Capabilities: []string{"search"}, AllowsGlobalDiscovery: true, Enabled: true},
 		{ID: "xurl", Capabilities: []string{"search"}, Enabled: true},
 	}
 	templates := []core.RouteTemplate{
@@ -47,8 +49,9 @@ func BuiltinCatalog() *Catalog {
 			},
 			Cost: "free", Trust: "configured_endpoint", Limitations: []string{"upstream_retention_unknown", "rsshub_route_metadata_version_dependent"},
 		},
-		{RouteTemplateID: "github-native-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "http-json", Capabilities: []string{"search", "fetch"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "provider_defined"}, Auth: core.AuthDescriptor{Kind: "token", Required: true}, Cost: "rate_limited", Trust: "official_api"},
-		{RouteTemplateID: "x-xurl-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "command", Capabilities: []string{"search"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "recent_window"}, Auth: core.AuthDescriptor{Kind: "x_developer_app", Required: true}, Cost: "metered", Trust: "local_executable"},
+		{RouteTemplateID: "github-native-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "github", Capabilities: []string{"search", "fetch"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "page"}, TimeRange: core.TimeRangeDescriptor{Kind: "unsupported"}, Auth: core.AuthDescriptor{Kind: "token", Required: false}, EndpointRequired: true, Cost: "rate_limited", Trust: "official_api", Limitations: []string{"github_repository_metadata_only"}},
+		{RouteTemplateID: "tavily-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"tavily-discovery"}}, Provider: "tavily", Adapter: "tavily", Capabilities: []string{"search"}, ContentLevel: "snippet", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "unsupported"}, Auth: core.AuthDescriptor{Kind: "api_key", Required: true}, EndpointRequired: true, ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"search_depth": map[string]any{"type": "string", "enum": []any{"basic", "advanced"}}, "exclude_domains": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 20}}}, Cost: "metered", Trust: "official_api", Limitations: []string{"web_index_coverage_unknown", "candidate_results_only", "tavily_max_20"}},
+		{RouteTemplateID: "x-xurl-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "xurl", Capabilities: []string{"search"}, ContentLevel: "body", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "recent_window"}, Auth: core.AuthDescriptor{Kind: "app_only", Required: true}, Cost: "metered", Trust: "local_executable", Limitations: []string{"x_recent_search_window", "xurl_shortcut_no_continuation"}},
 	}
 	catalog, err := NewCatalog(sources, providers, templates, nil, nil, nil, nil, nil, nil)
 	if err != nil {
@@ -66,16 +69,19 @@ func BuiltinFixture() *Catalog {
 		{ID: "channel_v2ex_direct", Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", EgressProfileID: "egress-direct", Priority: 100, Enabled: true, Revision: 1},
 		{ID: "channel_v2ex_rsshub", Source: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: "rsshub-local", Parameters: map[string]any{"path": "/v2ex/topics/latest"}, Priority: 50, FallbackChannelIDs: []string{"channel_v2ex_direct"}, Enabled: true, Revision: 1},
 		{ID: "channel_github_official", Source: "github", RouteTemplateID: "github-native-search", EndpointProfileID: "github-official", CredentialID: "cred_github", Priority: 100, Enabled: true, Revision: 1},
+		{ID: "channel_tavily", Source: "tavily-discovery", RouteTemplateID: "tavily-search", EndpointProfileID: "tavily-official", CredentialID: "cred_tavily", Priority: 100, Enabled: true, Revision: 1},
 		{ID: "channel_x_official", Source: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-direct", CredentialID: "cred_x", Priority: 100, Enabled: true, Revision: 1},
 	}
 	endpoints := []core.EndpointProfile{
 		{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", EgressProfileID: "egress-direct", Trust: "local", Enabled: true, Revision: 1},
 		{ID: "github-official", Provider: "github-api", BaseURL: "https://api.github.com", EgressProfileID: "egress-direct", Trust: "official", Enabled: true, Revision: 1},
+		{ID: "tavily-official", Provider: "tavily", BaseURL: "https://api.tavily.com", EgressProfileID: "egress-direct", Trust: "official", Enabled: true, Revision: 1},
 	}
 	egressProfiles := []core.EgressProfile{{ID: "egress-direct", DisplayName: "Direct", Mode: core.EgressModeDirect, Enabled: true, Revision: 1}}
 	credentials := []core.Credential{
 		{ID: "cred_github", Provider: "github-api", AuthKind: "token", Label: "GitHub fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
-		{ID: "cred_x", Provider: "xurl", AuthKind: "api_key", Label: "X fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "cred_tavily", Provider: "tavily", AuthKind: "api_key", Label: "Tavily fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "cred_x", Provider: "xurl", AuthKind: "app_only", Label: "X fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
 	}
 	catalog, err := NewCatalog(builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(), channels, endpoints, egressProfiles, credentials, nil, nil)
 	if err != nil {

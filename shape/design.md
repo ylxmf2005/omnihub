@@ -254,9 +254,9 @@ Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder�
 
 ### 9.2 Similarity Grouping
 
-semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。其复杂度上限清楚，且复用现有事务、备份、权限与三平台纯 Go 发布链。
+semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 little-endian `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。`shape/evidence/local-vector-study.md` 已比较近期 `sqlite-vec`、Chromem、LanceDB 与 Qdrant；当前候选要么仍是 exact scan，要么需要 C extension、第二持久状态或 sidecar，不能改善这条真实路径。其复杂度上限清楚，且复用现有事务、备份、权限与三平台纯 Go 发布链。
 
-SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；本地 Ollama 和云端 OpenAI-compatible Endpoint 都经现有 Endpoint/Egress/Credential 边界。模型或输入规范变化提升 index revision，旧向量保持 stale 而不混算。embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。
+SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；本地 Ollama 和云端 OpenAI-compatible Endpoint 都经现有 Endpoint/Egress/Credential 边界。OmniHub 不安装 Ollama、不下载模型、不启动 daemon。模型或输入规范变化提升 index revision，旧向量保持 stale 而不混算。embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec` 的 driver 与发布矩阵。
 
 ## 10. 状态、缓存与增量一致性
 
@@ -330,11 +330,11 @@ Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Ret
 
 已确认 v1 使用 on-demand stale-while-revalidate，而非内置 scheduler：
 
-1. fresh snapshot 直接返回；
+1. 上游有效 TTL/Cache-Control/Expires 决定 freshness；没有 hint 时使用 15 分钟，v1 不提供 per-View 覆盖项；fresh snapshot 直接返回；
 2. stale snapshot 立即返回，并对该 View singleflight 后台 refresh；
 3. 无 snapshot 时做一次有总 deadline 的阻塞 refresh；
 4. refresh 失败保留旧 snapshot、checkpoint 和错误状态；
-5. 用户仍可显式 `refresh`，或用 cron/systemd timer/launchd/Agent 调度。
+5. 用户仍可显式 `refresh`，或用 cron/systemd timer/launchd/Agent 调度。`omnihub serve` 自身只以前台 loopback 进程运行，不安装系统服务。
 
 若未来选择内置 scheduler，需要额外 Shape 重试、错过执行、休眠恢复、任务租约、告警和监控；不能把一个 ticker 当成已完成的调度系统。
 
@@ -399,9 +399,9 @@ omnihub doctor --channel channel_x_official --format json
 |---|---|---|---|
 | 任意 Feed、V2EX、linux.do | Direct Feed | RSSHub 可选 | Feed parse、conditional GET、window coverage |
 | V2EX | Direct Atom Channel | RSSHub latest Channel | 同 Source 多 Channel、fallback、Endpoint optional |
-| GitHub | Native API/`gh` | Tavily discovery | search、pagination、rate limit、metadata |
+| GitHub | 官方 REST API | Tavily discovery | repository search、first-window coverage、rate limit、metadata |
 | Open Web | Tavily | 无 | Provider 与目标 Source、candidate coverage |
-| X | xurl command/MCP | RSSHub latest；twscrape opt-in | 官方 recent search、auth、第三方边界 |
+| X | xurl command | RSSHub latest；twscrape opt-in | 官方 recent search、固定 argv、auth、第三方边界；OmniHub MCP 只是公共出口 |
 | NodeSeek | 当前 unavailable probe | 用户配置第三方 Feed | 不能把 Manifest/URL 当 readiness |
 
 arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充 Source Bundle，不阻塞核心 v1。
@@ -412,7 +412,7 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 |---|---|---|---|
 | 技术底座 | Go 单二进制 + SQLite Repository；未来 MySQL Store | 现在需认真定义事务/ID/revision；不维护第二实现 | 已确认 |
 | 运行平面 | Query 无状态 + Subscription 有状态 | 两种运行模式需清楚文档 | 已确认 |
-| Feed 新鲜度 | stale-while-revalidate + 显式/外部调度 | 不提供一站式 scheduler/监控 | 已确认 |
+| Feed 新鲜度 | 上游 hint；无 hint 15 分钟；stale-while-revalidate + 显式/外部调度 | 不提供 per-View TTL、scheduler/监控 | 已确认 |
 | 个性化来源 | Direct Feed 与 RSSHub Channel/参数均可管理 | 管理 API 与配置校验面扩大 | 已确认 |
 | Dashboard | loopback 单实例；Credential/Channel/配置管理 + Query Workbench；Run 轮询；前端独立 | 信任本机账号与 SQLite 权限 | 已确认 |
 | Channel | RouteTemplate 静态只读，Channel 才可配置、授权、探测和执行 | 新增配置与健康读模型 | 已确认 |
@@ -421,6 +421,15 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 | RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
 | EgressProfile | Endpoint 固定绑定；无 Endpoint Channel 固定绑定；Operation 无覆盖；缺绑定 fail-closed | 同一 BaseURL 多出口需多个 EndpointProfile | 已确认 |
 | 扩展 | 窄 Built-in + Manifest + command/MCP；同形 API 出现后再抽取 | 首批会有少量专用 Adapter；不另造协议/DSL | 已确认 |
-| 去重 | identity 默认；semantic 显式 opt-in，只分组；SQLite BLOB + exact cosine | 相似内容仍占多条；约 1 万向量或 p95>150ms 再评估 ANN | 已确认 |
+| 去重 | identity 默认；semantic 显式 opt-in，只分组；调研后采用 SQLite BLOB + exact cosine | 相似内容仍占多条；约 1 万向量、p95>150ms 或跨 Snapshot ANN 再评估 `sqlite-vec` | 已确认 |
 | v1 纵切 | Feed、V2EX/RSSHub、GitHub、Tavily、X/xurl | 首版不宣称大量平台 ready | 已确认 |
 | 测试文件 | 允许必要 `*_test.go`、Repository contract test 与 fixture | 增加维护量但形成可重放合同证据 | 已确认 |
+| GitHub | Repository Search + metadata fetch；Token 可选 | 匿名只有公开数据与较低配额 | 已确认 |
+| Tavily | basic 默认、advanced 显式、最多 20；Source 取结果 hostname | 不读取 answer/raw content/images | 已确认 |
+| xurl 出站 | direct/environment/http_proxy；无分层 Probe | SOCKS5 fail-closed，命令网络证据较窄 | 已确认 |
+| Dashboard Origin | 生产同源；开发单一显式 loopback Origin | 不支持任意跨域前端 | 已确认 |
+| 保留 | 最新 Snapshot；Run/Probe 30 天；tombstone 180 天；孤立 embedding 30 天 | 不提供历史归档 | 已确认 |
+| Chrome v1 | Host/Bridge + mock consumer；安装时固定一个 Extension ID | 不为演示增加 Cookie Adapter | 已确认 |
+| 发布 | 三平台 archive/checksum + `go install` | 包管理器与签名后置 | 已确认 |
+| 服务生命周期 | 前台 loopback `serve`；用户现有 OS 工具可外部托管 | v1 不提供自启动管理 | 已确认 |
+| 版本与迁移 | 首发 `0.1.x` preview；SQLite 自动、事务化、仅向前 migration | 不支持 downgrade；普通卸载保留数据 | 已确认 |

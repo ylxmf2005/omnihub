@@ -1,6 +1,7 @@
 package readiness
 
 import (
+	"os/exec"
 	"strings"
 	"time"
 
@@ -201,13 +202,26 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 	}
 	addCheck("channel_configured", CheckPassed, nil)
 
-	// Feed Adapter 随二进制发布，因此安装状态可以确定；但普通 doctor 仍不
-	// 发起网络请求，不能把“内建依赖存在”提升成“这个 Channel 已可达”。
-	if template.Adapter == "feed" || template.Adapter == "rsshub" {
+	// 内建 Go Adapter 随二进制发布，因此安装状态可以确定；但普通 doctor
+	// 仍不发起网络请求，不能把“依赖存在”提升成“这个 Channel 已可达”。
+	switch {
+	case template.Origin == "builtin" && (template.Adapter == "feed" || template.Adapter == "rsshub" || template.Adapter == "github" || template.Adapter == "tavily"):
 		addCheck("dependency_installed", CheckPassed, nil)
 		code := "upstream_not_probed"
 		addCheck("channel_probe", CheckUnknown, &code)
-	} else {
+	case template.Origin == "builtin" && template.Adapter == "xurl":
+		if _, err := exec.LookPath("xurl"); err != nil {
+			code := "dependency_unavailable"
+			addCheck("dependency_installed", CheckFailed, &code)
+			addCheck("channel_probe", CheckUnknown, &code)
+			result.Readiness = StateBlocked
+			result.ActionRequired = &ActionRequired{Kind: "install_dependency"}
+			return result
+		}
+		addCheck("dependency_installed", CheckPassed, nil)
+		code := "upstream_not_probed"
+		addCheck("channel_probe", CheckUnknown, &code)
+	default:
 		code := "dependency_not_probed"
 		addCheck("dependency_installed", CheckUnknown, &code)
 	}

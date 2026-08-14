@@ -3,8 +3,10 @@ package core
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
+	"unicode"
 )
 
 var ErrInvalidOperation = errors.New("invalid operation")
@@ -33,17 +35,29 @@ func (operation Operation) Validate() error {
 		if operation.Query != nil {
 			return fmt.Errorf("%w: fetch does not accept query", ErrInvalidOperation)
 		}
-		if parsed, err := url.Parse(*operation.Target); err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
-			return fmt.Errorf("%w: fetch target must be an http(s) URL", ErrInvalidOperation)
+		if !validFetchTarget(*operation.Target) {
+			return fmt.Errorf("%w: fetch target must be an http(s) URL or an upstream identifier", ErrInvalidOperation)
 		}
 	default:
 		return fmt.Errorf("%w: unsupported operation %q", ErrInvalidOperation, operation.Operation)
 	}
 
-	// Stage 1 还没有可供 Router 匹配的 domain 元数据。显式拒绝可以避免把
-	// domain-only 请求静默广播到所有 Channel；后续补齐映射能力后再开放。
-	if len(operation.Scope.Domains) > 0 {
-		return fmt.Errorf("%w: domain scope is not supported", ErrInvalidOperation)
+	if len(operation.Scope.Domains) > 20 {
+		return fmt.Errorf("%w: domain scope accepts at most 20 domains", ErrInvalidOperation)
+	}
+	if len(operation.Scope.Domains) > 0 && operation.Operation != OperationSearch {
+		return fmt.Errorf("%w: domain scope is only valid for search", ErrInvalidOperation)
+	}
+	seenDomains := make(map[string]bool, len(operation.Scope.Domains))
+	for _, domain := range operation.Scope.Domains {
+		if !validDomain(domain) {
+			return fmt.Errorf("%w: domain scope contains an invalid hostname", ErrInvalidOperation)
+		}
+		normalized := strings.ToLower(strings.TrimSuffix(domain, "."))
+		if seenDomains[normalized] {
+			return fmt.Errorf("%w: domain scope must not contain duplicates", ErrInvalidOperation)
+		}
+		seenDomains[normalized] = true
 	}
 	// Stage 1 尚未签发或验证 continuation token。接受任意非空字符串会把
 	// Adapter cursor 误当成 OmniHub token，因此在签发器落地前显式拒绝。
@@ -69,14 +83,51 @@ func (operation Operation) Validate() error {
 	if operation.IdentityDedupe != IdentityNone && operation.IdentityDedupe != IdentityExact {
 		return fmt.Errorf("%w: unsupported identity_dedupe %q", ErrInvalidOperation, operation.IdentityDedupe)
 	}
-	if operation.SimilarityGrouping != SimilarityOff && operation.SimilarityGrouping != SimilarityTitle && operation.SimilarityGrouping != SimilarityContent {
+	if operation.SimilarityGrouping != SimilarityOff {
 		return fmt.Errorf("%w: unsupported similarity_grouping %q", ErrInvalidOperation, operation.SimilarityGrouping)
 	}
 	return nil
 }
 
 func (scope Scope) hasSelection() bool {
-	return len(scope.Channels) > 0 || len(scope.Sources) > 0 || len(scope.Providers) > 0 || scope.Collection != nil
+	return len(scope.Channels) > 0 || len(scope.Sources) > 0 || len(scope.Providers) > 0 || len(scope.Domains) > 0 || scope.Collection != nil
+}
+
+func validFetchTarget(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 2048 || strings.ContainsFunc(value, unicode.IsControl) {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return false
+	}
+	if parsed.IsAbs() {
+		return (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) && parsed.Hostname() != "" && !parsedURLContainsCredentialMaterial(parsed)
+	}
+	// Provider-specific Adapter 再校验 identifier 的语法；Core 只接受一个
+	// 不含 URL 控制面的稳定、非空相对标识。
+	return parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil && parsed.Path == value && !strings.HasPrefix(value, "/")
+}
+
+func validDomain(value string) bool {
+	if value == "" || len(value) > 253 || value != strings.TrimSpace(value) || value != strings.ToLower(value) || strings.ContainsAny(value, "/:@?#") || strings.HasSuffix(value, ".") {
+		return false
+	}
+	parsed, err := url.Parse("https://" + value)
+	if err != nil || parsed.Host != value || parsed.Hostname() == "" || parsed.Port() != "" || net.ParseIP(parsed.Hostname()) != nil {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character != '-' && (character < 'a' || character > 'z') && (character < '0' || character > '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (policy RoutePolicy) validate() error {

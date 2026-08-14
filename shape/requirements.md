@@ -127,6 +127,8 @@ Query Plane 不强制 SQLite。Subscription Plane 的 Channel State 按 Channel�
 
 Feed/HTTP Adapter 支持 ETag、Last-Modified，并尊重可用的 RSS TTL、Cache-Control、Expires 与 Retry-After。每 Channel execution 独立 timeout，总 deadline 覆盖整次请求；不无限重试。
 
+View freshness 优先采用上游有效的 TTL/Cache-Control/Expires；没有可用 hint 时使用 15 分钟。v1 不增加 per-View freshness 覆盖项。`serve` 只提供前台 loopback 进程；需要常驻时由用户现有的 launchd/systemd/任务工具托管，OmniHub 不实现三平台服务管理器。
+
 ### REQ-018：分页与截断
 
 Adapter cursor 为 Channel 内部 Provider 私有且不冒充全局 cursor。无状态多 Channel 查询 v1 只承诺有界首窗；不能稳定续页时 `continuation` 为空并在 coverage 标记 truncated。只有保存了各 Channel cursor 与 merge buffer 的服务端 Query Session/View 才可签发全局 opaque cursor。
@@ -205,16 +207,30 @@ Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoi
 
 `similarity_grouping=semantic` 必须显式引用用户配置的 embedding profile；默认 `off`。MVP 复用现有 SQLite，以 little-endian `float32` BLOB 缓存 embedding，并只在同一 provider、model、dimension 与 index revision cohort 内计算精确 cosine。Embedding 输入是有界、可复现的 title + summary/content，不包含 Cookie、Credential、请求头或 Browser Bridge 数据。
 
+该路线已经过 2026-08-14 的近期本地方案重评，证据见 `shape/evidence/local-vector-study.md`。`sqlite-vec`、Chromem、LanceDB 与 Qdrant 当前均未在单次最多 100 个 Item、pure-Go 三平台发布约束下提供相称收益。单 cohort 达到约 10,000 条、semantic p95 超过 150ms，或出现跨 Snapshot ANN 需求时，优先重新 spike `sqlite-vec`；阈值未到前不为“向量数据库”标签增加第二 Store、CGO 或 sidecar。
+
 本地优先使用用户已有的 Ollama/OpenAI-compatible Endpoint；外部 Endpoint 是显式数据外发，必须显示 Endpoint、model 与 Egress，不自动下载模型、启动 daemon、切换 Provider 或从本地回退云端。semantic 只写 `group_id/strategy/score`，保留全部 Item；embedding 不可用时保留检索结果并使 Envelope `partial`，不得伪装 grouping 已完成。
 
 写入 cache 前必须校验响应条数、dimension、有限分量与非零范数；BLOB 长度/字节序/解码失败也视为不可用。失败向量不写 cache、不参与 grouping，不允许 NaN/Inf score。
+
+### REQ-032：代表 Provider 的窄能力
+
+GitHub v1 只提供 Repository Search 与 Repository metadata fetch；Credential 可省略以访问公开数据，但匿名低配额和私有数据不可见必须进入执行限制。Tavily 默认 `basic`、单次最多 20 条，只允许显式 `advanced`，并固定关闭 answer、raw content、images 与 auto parameters；其结果只作为 candidate/snippet，Source 由结果 URL 的规范化 hostname 推导，Provider 始终为 `tavily`。xurl 只支持 `direct | environment | http_proxy` 子进程环境，SOCKS5 在发进程前失败；命令路线不得伪造 DNS/TCP/TLS 分层事实。
+
+### REQ-033：Dashboard 同源、删除与健康默认值
+
+生产 Dashboard 构建产物由同一 loopback `serve` Origin 提供；开发态只允许一个用户显式配置的 loopback Origin，拒绝 wildcard 与 `null`。资源删除不级联、不静默解绑；有引用的普通资源返回 `409 resource_in_use`，Credential 撤销必须清除值并让依赖 Channel 进入 blocked。`ready_dependent` 只聚合 Source、RouteTemplate、规范化目标、参数与 Credential revision 相同且仅 Egress 不同的路线。真实 Probe 成功证据默认 15 分钟、瞬时失败 5 分钟，本地确定事实随资源 revision 失效，过期不触发自动 Probe。
+
+### REQ-034：有界保留与发布边界
+
+每个 View 只保留最新成功 Snapshot；Run 与 Probe 历史保留 30 天，identity tombstone 180 天，无引用 embedding cache 30 天。清理由显式 maintenance、进程启动或外部 cron 触发，不增加内置 scheduler。Chrome v1 交付 Bridge、Native Host、安全校验与 mock consumer，Host manifest 只接受安装时给出的一个精确 Extension ID；没有真实 Cookie Channel 时不得宣称某来源已可用。OmniHub 只保证自身 Item/Observation URL 可追溯，并由 Skill 要求 Agent 披露 coverage，不审计任意最终自然语言。首个公开版本按 `0.1.x` preview 准备；首发交付三平台 archive、checksum 与 `go install`，包管理器和平台签名后置。普通卸载只移除二进制/Native Host 注册并保留用户数据。
 
 ## 4. 非功能要求
 
 - 同一输入与同一上游响应产生确定性的规范化、排序和 identity dedupe。
 - Channel 执行并发受全局与 Endpoint 两级限制；rate limit、费用和隐私属性参与选择。
 - stdout 只放机器结果，stderr 放日志；Agent Host 能从固定 argv/MCP Tool Call 识别 query、scope 与终态。
-- SQLite 写入事务化；失败刷新保留最近成功快照和旧 checkpoint。
+- SQLite 写入事务化；Schema 自动执行仅向前 migration，不支持降级；失败刷新保留最近成功快照和旧 checkpoint。
 - RouteTemplate Descriptor 和 Channel readiness 分离，静态声明不构成运行成功证明。
 - SQLite 启用 WAL、busy timeout 和单写入边界；这些是当前 Store 的实现事实，不泄漏到领域 Repository。
 - Credential SQLite 与其目录使用当前用户专属权限（Unix 目录 `0700`、文件 `0600`；Windows 当前用户 ACL）；这是文件访问边界，不是额外加密或 Keychain。Stage 0 只实现并验证 Unix mode，Windows ACL 必须在 Windows 发布前完成，当前跨平台构建成功不代表该运行时边界已通过。
@@ -232,25 +248,25 @@ v1 不按平台数量验收，而用五条互补路径证实架构：
 
 1. **Direct Feed**：通用 RSS/Atom/JSON Feed；用 V2EX 与 linux.do 验证不同 Feed，并记录 NodeSeek 的可达性失败。
 2. **RSSHub**：V2EX `latest` Route；验证未配置 Endpoint、错误 key、Route 解析和 Direct Feed 回退。
-3. **GitHub**：原生 API/`gh` Route；验证 search、分页、鉴权、rate limit 和结构化 metadata。
+3. **GitHub**：官方 REST API Route；验证 search、首页覆盖、鉴权、rate limit 和结构化 metadata。
 4. **Open Web**：Tavily；验证 Provider 与目标 Source 分离，以及 candidate/coverage 语义。
-5. **X**：官方 `xurl` 为首选 Provider，验证 recent search 与 MCP/command binding；`twscrape` 仅作为用户明确授权的可选 Provider。
+5. **X**：官方 `xurl` command 为首选 Provider，验证 recent search、固定 argv 与隔离凭据；OmniHub 自身 MCP 出口可调用该 Channel，但 v1 不实现第三方 xurl MCP client binding。`twscrape` 仅作为用户明确授权的可选 Provider。
 
 Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSeek 等接到已证明的 Route 类型上；没有真实探测证据时不标记 ready。
 
 ## 6. 已确认决策
 
 1. **技术底座**：Go 单二进制；v1 使用 SQLite，并通过 Repository/Unit of Work 为未来 MySQL Store 隔离持久层。第一阶段落实 ID/revision/idempotency/Run lease 等分布式前置不变量，但不实现或宣称 MySQL/多实例可用。
-2. **产品平面与 Feed 新鲜度**：Query Plane 无状态；Subscription Plane 使用 SQLite。`serve` 对 View 采用 stale-while-revalidate：已有快照先返回并 singleflight 刷新，无快照时做有 deadline 的阻塞刷新；保留显式 refresh 与外部 cron，v1 不内置 scheduler。
+2. **产品平面与 Feed 新鲜度**：Query Plane 无状态；Subscription Plane 使用 SQLite。`serve` 对 View 采用 stale-while-revalidate：已有快照先返回并 singleflight 刷新，无快照时做有 deadline 的阻塞刷新；优先使用上游 freshness hint，无 hint 时 15 分钟；保留显式 refresh 与外部 cron，v1 不内置 scheduler 或服务管理器。
 3. **个性化 Feed/RSSHub 配置**：Direct Feed、RSSHub Endpoint、RSSHub Route/参数、Collection 和 View 都由用户配置；内建清单只是模板。
 4. **Dashboard 责任拆分**：产品包含综合 Dashboard；当前 Task 交付后端与前后端合同，前端由另一 Agent 实现。
-5. **v1 部署形态**：当前仍是 SQLite 单机、单 `serve` 实例；MySQL/多实例属于后续 Store 与部署演进。
+5. **v1 部署形态**：当前仍是 SQLite 单机、单个前台 `serve` 实例；MySQL/多实例与三平台后台服务管理属于后续部署演进。
 6. **Dashboard 网络与写入**：v1 只管理当前 loopback 实例；允许管理 user-owned Channel、Endpoint、Credential value、Collection、View 和 import。builtin RouteTemplate 只读，可 disable/overlay。
 7. **Dashboard 运行体验**：Refresh 与 Query Workbench 创建持久 Run，返回 `202 + run_id`；v1 轮询 Run，不引入 SSE/WebSocket。Workbench 必须显式选择 scope/Provider 并展示费用、信任和 coverage。
 8. **RSSHub 生命周期**：只连接用户配置的本地/远程 Endpoint，不自动安装/启动，也不提供默认公共实例。
 9. **Provider 扩展**：采用内建 Adapter + Manifest + 固定 command/MCP binding；不新增 External Adapter Protocol，不采用 Go plugin。
 10. **首批验证与 X**：Direct Feed、RSSHub/V2EX、GitHub、Tavily、X/xurl；twscrape 只 opt-in，NodeSeek 先作为 unavailable/readiness 样本。
-11. **测试授权**：允许新增必要的 `*_test.go`、Repository contract tests 与合同 fixture。
+11. **测试边界**：每个宣称来源与功能都要有可重放测试；本 Task 只扩展已有 `*_test.go` 与合同 fixture，不新增 test 文件。
 12. **渠道与 Chrome 授权方向**：Channel 是 Dashboard 一级管理对象；需要 Cookie 的 Channel 在用户授予 Chrome origin permission 后按每次执行直接读取，Cookie 不持久化。Dashboard 可打开登录链接并显示分层健康；Chrome Extension 客户端由独立 Agent/工作流实现，本 Task 负责后端 Bridge/合同。
 13. **本地 MVP Credential**：Dashboard 直接录入 API Key/Token，SQLite 保存真实值，不使用 Keychain、受保护 secret store 或 opaque handle。Credential 列表只返回掩码；只有 detail 请求显式传入 `include_value=true` 时才返回完整值，并设置 `Cache-Control: no-store`。日志、Run 与诊断不回显原值。
 14. **轻量本机信任模型**：只监听 loopback，保留 Host/Origin/CORS、SQLite 文件权限和日志脱敏；v1 不实现 Dashboard 登录、bootstrap session 或复杂 CSRF token。
@@ -258,8 +274,12 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 16. **出站 fail-closed**：不隐式 fallback、直连、公共 DoH、公共代理或关闭 TLS；真正 System Proxy/PAC、VPN/TUN 与最快线路不在 Stage A。Probe/readiness/Execution 绑定 Endpoint×Egress，输出脱敏的 profile 事实。
 17. **主动 Probe 成本**：只有显式 Channel Probe 执行 DNS→TCP→TLS→HTTP→Feed parse 分层诊断；正常 Query 不自动运行。
 18. **迁移与 readiness**：已有资源缺 Egress 绑定即 fail-closed，不自动补 direct/environment；单 Channel 按固定绑定裁决。Stage C 有持久 Probe facts 与聚合消费者后，跨绑定可用但依赖特定出口时为 `ready_dependent`。
-19. **semantic MVP**：复用 SQLite BLOB + 精确 cosine，支持用户显式配置的本地 Ollama/OpenAI-compatible embedding；默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务。
+19. **semantic MVP**：近期本地向量方案调研后仍复用 SQLite BLOB + 精确 cosine，支持用户显式配置的本地 Ollama/OpenAI-compatible embedding；默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务；达到具名规模/延迟/ANN 阈值再重评 `sqlite-vec`。
+20. **代表 Provider**：GitHub repository metadata 且 Token 可选；Tavily basic 默认、最多 20 条、动态 hostname Source；xurl 只支持可诚实控制的 direct/environment/http_proxy。
+21. **Dashboard 默认值**：生产同源、开发单一显式 loopback Origin；普通资源不级联删除；严格 route group 才聚合 `ready_dependent`；成功/瞬时失败 Probe TTL 为 15/5 分钟。
+22. **保留与发布**：最新 Snapshot、30 天 Run/Probe、180 天 tombstone、30 天孤立 embedding；Chrome Host 精确 Extension ID、mock consumer；引用保证止于 OmniHub 输出；首发 `0.1.x` preview、archive/checksum/`go install`，普通卸载保留用户数据。
+23. **升级与外部运行时**：SQLite 自动执行事务化、仅向前 migration，不支持 downgrade；OmniHub 只连接和诊断用户已有的 Ollama/OpenAI-compatible Endpoint，不负责安装、下载模型或启动 daemon。
 
 ## 7. 决策收口
 
-用户已确认采用显式回显方案：Credential 列表只返回掩码；只有 detail 请求带 `include_value=true` 时返回完整 API Key/Token，并设置 `Cache-Control: no-store`。用户离开前授权 Agent 按简单、复用与可发布 MVP 原则完成余下技术取舍；Egress 绑定、迁移、readiness 与 semantic grouping 选择已按上述合同收敛，不再保留承重未决项。
+Credential 列表只返回掩码；只有 detail 请求带 `include_value=true` 时返回完整 API Key/Token，并设置 `Cache-Control: no-store`。Egress、迁移、readiness、Provider 能力、Dashboard 默认值、保留、Chrome 与 semantic grouping 已按上述合同收敛，不再保留承重未决项。

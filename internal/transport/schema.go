@@ -126,11 +126,27 @@ func Generate() (Artifacts, error) {
 }
 
 func operationEndpoint(operation, description string, input, output json.RawMessage) map[string]any {
+	problem := map[string]any{
+		"type": "object", "additionalProperties": false,
+		"required": []any{"type", "title", "status", "detail"},
+		"properties": map[string]any{
+			"type": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"},
+			"status": map[string]any{"type": "integer"}, "detail": map[string]any{"type": "string"},
+		},
+	}
 	return map[string]any{
 		"operationId": operation + "Operation",
 		"summary":     description,
 		"requestBody": map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": decode(input)}}},
-		"responses":   map[string]any{"200": map[string]any{"description": "Operation result", "content": map[string]any{"application/json": map[string]any{"schema": decode(output)}}}},
+		"responses": map[string]any{
+			"200": map[string]any{"description": "Complete or partial Operation result", "content": map[string]any{"application/json": map[string]any{"schema": decode(output)}}},
+			"400": map[string]any{"description": "Invalid request", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"403": map[string]any{"description": "Untrusted Host or Origin", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"409": map[string]any{"description": "Configuration prevents execution", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"413": map[string]any{"description": "Request body is too large", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"415": map[string]any{"description": "Unsupported request media type", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"502": map[string]any{"description": "All selected Channels failed", "content": map[string]any{"application/json": map[string]any{"schema": decode(output)}}},
+		},
 	}
 }
 
@@ -161,9 +177,10 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 		property.Pattern = `.*\S.*`
 	}
 	if property := schema.Properties["target"]; property != nil {
-		minimum := 1
+		minimum, maximum := 1, 2048
 		property.MinLength = &minimum
-		property.Pattern = `^https?://`
+		property.MaxLength = &maximum
+		property.Pattern = `^(https?://[^\s/?#@]+(?:[/?#].*)?|[^\s/:?#]+/[^\s/?#]+)$`
 	}
 	if property := schema.Properties["limit"]; property != nil {
 		minimum, maximum := 1.0, 100.0
@@ -203,14 +220,16 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 
 func applyScopeConstraints(scope *jsonschema.Schema) {
 	if domains := scope.Properties["domains"]; domains != nil {
-		zero := 0
-		domains.MaxItems = &zero
+		twenty, maximum := 20, 253
+		domains.MaxItems, domains.UniqueItems = &twenty, true
+		domains.Items = &jsonschema.Schema{Type: "string", MaxLength: &maximum, Pattern: `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$`}
 	}
 	one := 1
 	scope.AnyOf = []*jsonschema.Schema{
 		{Required: []string{"channels"}, Properties: map[string]*jsonschema.Schema{"channels": {Type: "array", MinItems: &one}}},
 		{Required: []string{"sources"}, Properties: map[string]*jsonschema.Schema{"sources": {Type: "array", MinItems: &one}}},
 		{Required: []string{"providers"}, Properties: map[string]*jsonschema.Schema{"providers": {Type: "array", MinItems: &one}}},
+		{Required: []string{"domains"}, Properties: map[string]*jsonschema.Schema{"domains": {Type: "array", MinItems: &one}}},
 		{Required: []string{"collection"}, Properties: map[string]*jsonschema.Schema{"collection": {Type: "string"}}},
 	}
 }
@@ -362,7 +381,7 @@ func schemaOptions() *jsonschema.ForOptions {
 		reflect.TypeFor[core.RouteMode]():          enumSchema(string(core.RouteAuto), string(core.RoutePrefer), string(core.RouteOnly), string(core.RouteExclude)),
 		reflect.TypeFor[core.SelectorKind]():       enumSchema(string(core.SelectorChannel), string(core.SelectorProvider)),
 		reflect.TypeFor[core.IdentityDedupe]():     enumSchema(string(core.IdentityNone), string(core.IdentityExact)),
-		reflect.TypeFor[core.SimilarityGrouping](): enumSchema(string(core.SimilarityOff), string(core.SimilarityTitle), string(core.SimilarityContent)),
+		reflect.TypeFor[core.SimilarityGrouping](): enumSchema(string(core.SimilarityOff)),
 		reflect.TypeFor[core.Status]():             enumSchema(string(core.StatusComplete), string(core.StatusPartial), string(core.StatusFailed)),
 		reflect.TypeFor[core.ContentRole]():        enumSchema(string(core.ContentSnippet), string(core.ContentSummary), string(core.ContentBody)),
 		reflect.TypeFor[core.ExecutionStatus]():    enumSchema(string(core.ExecutionCompleted), string(core.ExecutionFailed), string(core.ExecutionSkipped)),

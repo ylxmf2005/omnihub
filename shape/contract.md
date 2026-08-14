@@ -39,8 +39,8 @@
 约束：
 
 - `operation` 为 `search | latest | fetch`；`health` 通过 doctor/readiness 合同暴露，`refresh` 是 View 编排操作，不是 Provider Capability。
-- `search` 要求 `query`；`fetch` 要求 `target`；`latest` 不接受 query。
-- `scope` 至少给出 Channel、Source、Provider 或 Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。`domains` 字段为后续通用 Web Search 保留；Stage 2 尚无 domain→Channel 元数据，非空时在上游调用前返回参数错误。
+- `search` 要求 `query`；`fetch` 要求 HTTP(S) URL 或由所选 Adapter 进一步校验的稳定上游标识；`latest` 不接受 query。
+- `scope` 至少给出 Channel、Source、Provider、Domain 或 Collection 之一。非空 `domains` 只允许 search，最多 20 个不重复 hostname，并且 Router 只选择 `allows_global_discovery=true` 的 Provider；v1 由 Tavily 映射为 `include_domains`，不会广播给 Feed、GitHub 或 xurl。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
 - `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | semantic`，默认 `off`。semantic 只分组，不删除、折叠或 rerank 不同 Item；Stage E 完成前运行时仍只接受 `off`。
@@ -58,7 +58,7 @@
     "schema_version": "1.0",
     "operation": "search",
     "query": "agent search infrastructure",
-    "scope": {"sources": ["github"]},
+    "scope": {"providers": ["github-api", "tavily"]},
     "route_policy": {"mode": "auto", "aggregate": true, "allow_fallback": true},
     "limit": 20,
     "time_range": {},
@@ -66,7 +66,7 @@
     "similarity_grouping": "off",
     "deadline_ms": 30000
   },
-  "selected_channel_ids": ["channel_github_official", "channel_github_tavily"],
+  "selected_channel_ids": ["channel_github_official", "channel_tavily"],
   "executions": [{
     "channel_id": "channel_github_official",
     "route_template_id": "github-native-search",
@@ -79,12 +79,12 @@
     "duration_ms": 700,
     "examined": 10,
     "returned": 0,
-    "auth": {"required": true, "used": true, "credential_id": "cred_github"},
-    "egress": {"profile_id": "egress_environment", "mode": "environment", "proxied": false}
+    "auth": {"required": false, "used": false},
+    "egress": {"profile_id": "egress-direct", "mode": "direct", "proxied": false}
   }, {
-    "channel_id": "channel_github_tavily",
-    "route_template_id": "web-via-tavily",
-    "source": "github",
+    "channel_id": "channel_tavily",
+    "route_template_id": "tavily-search",
+    "source": "tavily-discovery",
     "provider": "tavily",
     "capability": "search",
     "selection": "aggregate",
@@ -94,17 +94,17 @@
     "examined": 0,
     "returned": 0,
     "auth": {"required": true, "used": true, "credential_id": "cred_tavily"},
-    "egress": {"profile_id": "egress_environment", "mode": "environment", "proxied": false}
+    "egress": {"profile_id": "egress-direct", "mode": "direct", "proxied": false}
   }],
   "items": [],
   "coverage": [],
   "errors": [{
     "code": "rate_limited",
     "message": "a secondary selected channel was rate limited",
-    "source": "github",
+    "source": "tavily-discovery",
     "provider": "tavily",
-    "channel_id": "channel_github_tavily",
-    "route_template_id": "web-via-tavily",
+    "channel_id": "channel_tavily",
+    "route_template_id": "tavily-search",
     "retryable": true,
     "retry_after_ms": 60000
   }],
@@ -138,23 +138,22 @@
 
 ```json
 {
-  "route_template_id": "x-xurl-recent-search",
+  "route_template_id": "x-xurl-search",
   "origin": "builtin",
   "source_constraint": {"kind": "exact", "values": ["x"]},
   "provider": "xurl",
-  "adapter": "command",
+  "adapter": "xurl",
   "capabilities": ["search"],
-  "content_level": "metadata",
-  "pagination": {"kind": "cursor", "globally_mergeable": false},
+  "content_level": "body",
+  "pagination": {"kind": "none", "globally_mergeable": false},
   "time_range": {"kind": "recent_window", "value": "provider_defined"},
   "auth": {
-    "kind": "x_developer_app",
-    "required": true,
-    "login_url": "https://developer.x.com/en/portal/dashboard"
+    "kind": "app_only",
+    "required": true
   },
   "cost": "metered",
   "trust": "local_executable",
-  "limitations": ["x_recent_search_window"]
+  "limitations": ["x_recent_search_window", "xurl_shortcut_no_continuation"]
 }
 ```
 
@@ -164,10 +163,9 @@ RouteTemplate 只是能力声明。用户 Channel 才绑定实际配置：
 {
   "id": "channel_x_official",
   "source": "x",
-  "route_template_id": "x-xurl-recent-search",
-  "endpoint_profile_id": "xurl-default",
+  "route_template_id": "x-xurl-search",
+  "egress_profile_id": "egress_environment",
   "credential_id": "cred_x_developer",
-  "parameters": {"max_results": 20},
   "priority": 100,
   "fallback_channel_ids": [],
   "enabled": true,
@@ -263,11 +261,11 @@ Observation 记录每条获取路径：
 
 ```json
 {
-  "source": "github",
+  "source": "github.com",
   "provider": "tavily",
-  "channel_id": "channel_web_tavily",
-  "route_template_id": "web-via-tavily",
-  "endpoint": "tavily-default",
+  "channel_id": "channel_tavily",
+  "route_template_id": "tavily-search",
+  "endpoint": "tavily-official",
   "upstream_id": null,
   "original_url": "https://github.com/owner/repo",
   "canonical_url": "https://github.com/owner/repo",
@@ -279,7 +277,7 @@ Observation 记录每条获取路径：
 }
 ```
 
-`verification` 为 `candidate | metadata | body`。identity 合并必须保留全部 Observation；Tavily 发现 GitHub URL 时，Source 是 `github` 或目标域名，Provider 仍是 `tavily`。
+`verification` 为 `candidate | metadata | body`。identity 合并必须保留全部 Observation；全局 discovery Provider 的 Item Source 是规范化结果 hostname，例如 Tavily 发现 GitHub URL 时为 `github.com`，Provider 仍是 `tavily`。Execution/Coverage 继续记录所配置的 discovery Channel，不动态创建持久 Source 资源。
 
 ## 5. Coverage
 
@@ -539,6 +537,7 @@ spec:
 - 写 cache 前必须验证响应条数、每条 dimension 与 profile 完全一致，所有分量为有限数且向量范数大于零；BLOB 长度、字节序或解码失败同样拒绝。失败条目不写 cache、不参与 grouping，并产生 `similarity_unavailable`，不得让 NaN/Inf 进入 score。
 - 单次 Operation 最多 100 个 Item，使用精确 cosine，不建立 ANN 索引。每个分组 Item 保留自己的 ID/Observation，`similarity.strategy` 为 `semantic:<profile-id>:<model>`，并记录与组代表的 score。
 - embedding 失败时保留全部检索 Item，Envelope 为 `partial` 并报告 `similarity_unavailable`；不得静默关闭 grouping 或伪装成功。
+- 该路线已按 `shape/evidence/local-vector-study.md` 对近期本地候选重新裁决。单 cohort 达到约 10,000 条、semantic p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec`；此前不引入第二 Store、CGO 或 sidecar。
 
 ## 8. Provider Binding
 
@@ -549,6 +548,8 @@ v1 不定义新的 External Adapter Protocol。
 - `feed`：RSS/Atom/JSON Feed。
 - `rsshub`：RSSHub Route 与 Endpoint 元数据。
 - `github`、`tavily`：首批高价值 Provider 的窄专用 HTTP Adapter。通用 `http-json` 等第二个真实同形 API 出现后再抽取，不在 v1 先做 mapping DSL。
+- `github` 只请求官方 Repository Search 与 Repository metadata fetch；Token 可选，匿名路线明确披露低配额与公开数据边界。它不执行 code/issue/PR/commit/release search，不读取 README 或文件正文，不自动重试或遍历分页。
+- `tavily` 只请求官方 Search，默认 `basic`、最多 20 条，`advanced` 必须由 Channel 显式选择；answer、raw content、images 与 auto parameters 固定关闭。返回是 `candidate/snippet`，不是正文验证或全网 exhaustive。
 
 ### 8.2 Command binding
 
@@ -556,11 +557,14 @@ v1 不定义新的 External Adapter Protocol。
 binding:
   type: command
   executable: xurl
+  credential_seed: {argv: [auth, app-only, -], stdin: credential.value, isolated_home: true}
   argv:
     - {literal: search}
     - {from: request.query}
     - {literal: --max-results}
     - {from: request.limit, format: decimal}
+    - {literal: --auth}
+    - {literal: app}
   output:
     format: json
     itemsPointer: /data
@@ -571,6 +575,7 @@ binding:
 - Credential value 不得出现在 argv；binding 只能声明受信任的 environment/stdin/auth-field mapping，任何诊断只显示 Credential ID。
 - stdout 只接受 JSON/JSONL，stderr 是日志；超时、退出码和输出大小受限。
 - binding 可以映射一个受支持的第三方 JSON schema，或要求 executable 直接输出 OmniHub Adapter Result；这只是输出合同，不新增进程握手/生命周期协议。
+- xurl 每次在 `0700` 临时 HOME 中经 stdin 写入 app-only Token，再执行 recent search，结束后删除临时 store；不读取用户真实 `.xurl`/`.twurlrc`。v1 只支持 direct/environment/http_proxy，拒绝 SOCKS5 和带认证代理，不宣称 command 路线具备 DNS/TCP/TLS 分层 Probe。
 
 ### 8.3 MCP binding
 
@@ -602,10 +607,11 @@ API Key/Token 值不进入 key；Credential revision 变化会隔离旧 cache/ch
 
 已确认的 `serve` 行为：
 
+- freshness 优先使用上游有效 TTL/Cache-Control/Expires；没有 hint 时为 15 分钟，v1 不接受 per-View 覆盖项。
 - 有未过期快照：直接返回。
 - 有过期快照：返回 stale snapshot，并对同一 View singleflight 后台 refresh。
 - 无快照：执行一次受 deadline 限制的阻塞 refresh；失败则返回明确错误，不生成空 Feed 冒充成功。
-- 显式 `omnihub refresh <view>` 与外部 cron 始终可用；v1 不内置 scheduler。
+- 显式 `omnihub refresh <view>` 与外部 cron 始终可用；v1 不内置 scheduler 或三平台 service manager，`serve` 只以前台 loopback 进程运行。
 
 Feed 路径：
 
@@ -816,6 +822,8 @@ Chrome 或 Bridge 离线时，依赖 Cookie 的 Channel 立即以 check/error co
 - HTTP：预执行校验/配置错误用 RFC 9457 4xx；同步 `complete/partial` 为 200 + Envelope；合法执行但所有 Channel 失败为 502 + `failed` Envelope。异步操作返回 202 + Run，由 Run 终态承载 Envelope。
 - MCP：`complete/partial` 使用 `isError=false` 和 structured content；请求无效或完全失败使用 tool error，并附可解析错误/Envelope。
 - JSONL：逐行 Item 之外必须有显式 header/trailer 或 event type，不能因流式输出丢掉 Channel Execution、RouteTemplate、Coverage 与终态。
+- 运行时 `serve` 只监听 literal loopback，提供 `/v1/search|latest|fetch`、`/openapi.json` 与 stateless `/mcp`；Query POST 必须是 `application/json`，Host 与非空 Origin 必须同属当前 loopback Origin。JSONL 固定投影 `start → execution* → item* → end`，其中 `end` 保留 status、coverage、errors、continuation 与 meta。
+- 配套 Skill 优先调用三个固定 MCP Tool，CLI fallback 使用同名命令与严格 JSON stdin。最终引用只能来自 Item/Observation 实际 URL，并披露 partial/truncated；OmniHub 不宣称审计 Agent 另行生成的自然语言链接。
 
 ## 15. 分页合同
 

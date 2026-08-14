@@ -172,6 +172,9 @@ func filterReason(catalog *registry.Catalog, operation core.Operation, channel c
 	if !providerExists || !provider.Enabled {
 		return "provider_unavailable"
 	}
+	if len(operation.Scope.Domains) > 0 && !provider.AllowsGlobalDiscovery {
+		return "outside_domain_scope"
+	}
 	if !slices.Contains(template.Capabilities, string(operation.Operation)) {
 		return "capability_mismatch"
 	}

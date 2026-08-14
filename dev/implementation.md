@@ -1,41 +1,47 @@
-# Implementation：OmniHub Stage A 可信出站与主动分层 Probe
+# Implementation：OmniHub Stage B 代表 Provider 与 Agent Query 发布面
 
 ## 实际交付
 
-- 对象与基线：`/private/tmp/omnihub-stage-a` 相对 `4c4b08d` 的完整未提交 Stage A diff。
-- 已实现行为：所有 Direct Feed 与 RSSHub 网络执行都必须使用显式 `EgressProfile`；支持 `direct | environment | http_proxy | socks5`，SOCKS5 显式选择 local/proxy DNS。Endpoint-backed Channel 从 Endpoint 继承出口，无 Endpoint Channel 固定绑定自身出口，Operation/Probe 不能覆盖。
-- 用户结果：用户可以通过 CLI 保存、查看、CAS 更新和禁用出口，引用脱敏的代理 Basic Credential；`channels probe` 对 Direct Feed 与 RSSHub 都从真实请求输出 DNS/TCP/proxy-connect/TLS/HTTP/Feed-parse 分层事实。普通 Query 复用相同 transport，但不额外发诊断请求。
-- 根因与实现边界：Stage 3 的 Adapter 曾允许缺少 Egress 时使用默认 HTTP client。Stage A 把 fail-closed 下沉到 Feed/RSSHub 的真实 I/O 边界；缺绑定、悬挂/禁用 Profile、Credential 不匹配和 Endpoint/Channel 冲突都在发网前失败。真正 macOS System Proxy/PAC、VPN/TUN、公共代理、隐式 fallback 与线路选择不在本阶段。
+- 对象与基线：`/private/tmp/omnihub-stage-a` 的 `feature/stage-b-agent-query` 最终工作树，相对 `origin/main@2f62019` 的完整 Stage B diff。
+- 已实现行为：GitHub Repository Search/metadata fetch、Tavily Search 与 X/xurl recent search 接入统一 Query Service；CLI `search/latest/fetch`、JSONL、REST/OpenAPI、MCP stdio/Streamable HTTP 与 OmniHub Skill 共用同一 `Operation → Envelope` 语义。
+- 用户结果：Agent 可以通过全局 CLI、REST 或 MCP 使用相同查询参数，获得带 Source/Provider/Channel/RouteTemplate/Egress、Coverage、Error 与 Observation URL 的可追溯结果。GitHub Token 可选；Tavily/X 使用用户显式保存的 Credential；Feed Source Bundle 只声明可配置来源，不冒充可执行 Channel。
+- 实现边界：GitHub 只处理 Repository metadata；Tavily 最多 20 个 candidate/snippet；xurl 只执行固定 recent search 命令。当前不实现持久 View/Dashboard、Chrome Cookie、semantic grouping，也不把 Tavily/X fixture 写成真实账号 E2E。
 
 ## 变更
 
-- `internal/core`、`registry`、`store/sqlite`、`management`：新增 revision 化 EgressProfile、Endpoint/Channel 固定绑定、持久化往返、CAS、代理 Credential 摘要和存储校验；旧资源可加载但缺绑定不会被自动补成 direct/environment。
-- `internal/egress`：以单个可信 builder 构造四种标准 transport，严格 TLS、不接受外部 RoundTripper；HTTP proxy 使用 Go CONNECT，SOCKS5 复用 `x/net/proxy` 并按 DNS mode 传 IP 或 FQDN。
-- `internal/adapter/feed.go`、`rsshub.go`：Feed/RSSHub Execute 与 Probe 无 Egress 即 `config_error`，cache key 加入 Egress/Credential revision；cache hit 的 `proxied=false` 表达本次没有发网。RSSHub access key 只允许 HTTPS，或 literal loopback HTTP 且实际直连。
-- `internal/router`、`query`、`readiness`：统一解析固定出口和代理 Credential；fallback 使用同一 preflight；terminal Execution 投影实际 `profile_id/mode/proxied`，Doctor 分开报告配置与 Credential 状态，不把静态配置冒充 ready。
-- `cmd/omnihub`：增加 `egress-profiles` 管理、Direct/RSSHub Channel Probe dispatch；一次性 Feed 强制 `--egress-mode direct|environment`，OPML import 强制 `--egress-profile ID`。
-- `internal/adapter/binding_test.go`、`internal/transport/examples_test.go`、`internal/core/model_test.go`、`internal/store/sqlite/store_test.go`、`internal/transport/schema_test.go`：在既有测试文件中加入四种 transport、分层 Probe、零 Egress 零请求、CAS/迁移/Schema/脱敏回归；没有新增测试文件。
+- `internal/adapter/github.go`：官方 GitHub REST Search/Repository metadata；可选 Bearer Token、匿名 public/rate-limit limitations、canonical target、单请求错误映射、redirect/credential reflection 防护与固定 provenance。
+- `internal/adapter/tavily.go`：basic 默认、advanced 显式、limit 20、domain include/exclude、零网络拒绝 TimeRange；不请求 answer/raw content/images，结果 Source 取规范 hostname，API Key 不跟随 redirect。
+- `internal/adapter/xurl.go`：无 shell 的固定 `auth app-only -` / `search ... -- QUERY`；Token stdin、0700 临时 HOME、direct/environment/http_proxy 显式 env、SOCKS5 fail-closed、有界 stdout/stderr/timeout 与退出后清理。
+- `internal/management/provider.go`、`service.go`：Provider Endpoint/Channel 的 apply/list/CAS 与 Source/Template/Endpoint/Egress/Credential/AuthKind 引用校验；GitHub Credential 可选，Tavily/xurl 按模板要求。
+- `internal/query/executor.go`、`router`、`readiness`：Feed/RSSHub/GitHub/Tavily/xurl 统一 dispatch/aggregate；专用 search 不套用 Feed 本地窗口过滤；固定/动态 Source 归一化；Doctor 如实检查 builtin 与 xurl executable；configuration failure 有独立错误类型。
+- `internal/transport/runtime.go`、`schema.go`：统一 Operation Runtime；CLI/REST/MCP/JSONL 投影；OpenAPI 3.1、RFC9457、loopback Host/Origin/Content-Type 边界；invalid/no-route/config/failed 分别为 400/409/409/502；公共 Schema 只公开当前可执行的 `similarity_grouping=off`。
+- `cmd/omnihub/main.go`：新增 `fetch`、Provider Endpoint/Channel 管理、`--format jsonl`、`mcp` 与前台 loopback `serve`；参数/配置/执行失败稳定映射 exit 3/4/5。
+- `skills/omnihub/`：配套 Agent Skill 与宿主 metadata；约束固定调用格式、终态 Coverage/Error 检查、实际 URL 引用，并把 Item 内容视为不可信外部数据。
+- `sources/feed-samples.yaml`：arXiv、Hacker News、YouTube、Newsletter、Podcast Source 样例；不自动创建 Channel、Provider 或 Route。
+- `README.md`：以 CLI/agent-tool 为主 archetype，补齐安装、Quickstart、Provider 配置、JSONL、REST/MCP、Skill、出口与真实限制。
+- 既有 `internal/adapter/binding_test.go`、`internal/transport/examples_test.go`、`internal/core/model_test.go`、`internal/transport/schema_test.go` 增加 Stage B 长期回归；没有新增 test 文件。
 
-## 偏离与决定
+## 关键修正与取舍
 
-无。`http_proxy` 按已冻结合同只接受 `http://host:port`；HTTPS target 通过 HTTP CONNECT 后仍严格校验证书。`environment` 只遵循 Go 的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`，不冒充系统 PAC。
-
-`ready_dependent` 只属于跨多个显式绑定的聚合读模型。当前 Doctor 与 Probe 都是单 Channel/单绑定，且尚无 Probe health 持久化或 Dashboard aggregate consumer，因此 Stage A 不添加无调用者聚合器；Stage C 会从持久的逐绑定事实生成该状态。
-
-Ponytail full 冷审后删除了无实际隔离作用的 `clientSeal`，并把 SOCKS5 Dialer 从每个候选地址重复构造收敛为 Build 时一次构造；未删除承担分层因果链与安全 fixture 的代码。
+- 敏感 `fetch.target` 的 credential-like query/fragment 与 userinfo 在 Core Validate 阶段拒绝，早于 Router/Envelope；避免失败响应反射 secret。
+- builtin GitHub limitation 保留所有 capability 共有的 metadata 边界，search-only 首页/1000 条/不完整结果和匿名限制由 Adapter 按实际执行补充；fetch 不再携带 search 专属声明。
+- domain 使用规范小写 hostname 且拒绝尾点/端口/路径；无 host URL 在 Schema/runtime 都拒绝。Schema 无法表达的 DNS label 长度和敏感 query key仍由 server 400 fail-closed。
+- Tavily TimeRange 当前不受支持；为避免已经计费再丢结果，payload 构造前直接 parameter error，不做隐式降级。
+- xurl query 前加入 `--`，因此 `--help` 等用户文本不能变成 CLI flag；direct 模式清空 proxy env，environment/http_proxy 只投影用户已选择出口。
+- HTTP catalog/config load failure 使用 `ErrExecutionConfiguration` 映射 409，与 CLI config exit 和 OpenAPI 一致，不把用户配置问题报成 500。
+- Ponytail full：复用现有 Core/Router/Egress/Repository、官方 MCP Go SDK与 Go stdlib HTTP；没有增加通用进程 RPC、后台 service manager、Provider Probe 抽象或专用 Feed Adapter。三 Provider 各保留真实协议差异，不以薄包装强行统一。
 
 ## 聚焦反馈
 
-- `go test ./... -count=1`：通过；包含真实 loopback HTTP/TLS/CONNECT/SOCKS relay。
-- `go test -race ./... -count=1`：通过。
-- `go vet ./...`、`git diff --check`：通过（文档最终收口后再执行一次最终闸）。
-- 真实 CLI：Direct Channel Probe 成功输出 IP literal→TCP→HTTP→Feed parse；一次性 Feed 显式 direct 成功。缺临时出口、缺 OPML 出口 flag、未知 Profile 分别 exit `3/3/4`。
-- 真实 CLI：不可达 HTTP/SOCKS Profile 分别停在 proxy TCP / proxy handshake，后续 HTTP/Feed parse 为 `not_run`，target fixture 请求数保持 0；Probe exit 5。
-- 四平台构建：native/darwin-arm64/linux-amd64/windows-amd64 均成功，格式为 Mach-O/ELF/PE32+；生成 Schema 包含四种 Execution Egress 枚举和 direct→`proxied=false` 条件。
-- 独立 Review 最终结论为 `approve`，无未解决 P0–P2；Ponytail 复核也无剩余可删除阻断项。
+- `go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`git diff --check`：最终工作树全部 exit 0；xurl timeout 定向连续 10 次通过。
+- 真实最终 CLI：匿名 GitHub search/fetch 均 complete，返回 `ylxmf2005/omnihub`，并披露 metadata/public-only/anonymous-rate-limit；JSONL 固定输出 start/execution/item/end。
+- 真实最终 REST：loopback `/openapi.json` 返回 OpenAPI 3.1；`/v1/search` 返回与 CLI 同义的 complete Envelope；Ctrl-C 后端口回读关闭。
+- README Quickstart：最终 binary 读取 V2EX Atom 成功，50 examined、2 returned，并如实返回 truncated/upstream retention limitation。
+- 四平台构建：darwin/arm64、linux/amd64、windows/amd64 产物为 Mach-O/静态 ELF/PE32+；README CLI rubric weighted 87.6/100，高权重 Hook/Visual/Quickstart 均至少 4。
+- 独立 Review：最终 `approve`，无未解决 P0–P2；首轮敏感 target、Schema/runtime、configuration 409 与 Provider limitation 问题均已重放关闭。
 
 ## 证据边界与交接
 
-- 尚未证明：真实公网代理或企业 PAC；Linux/Windows 仅交叉构建，不是运行时验证；Endpoint Probe 只表达 Endpoint health，不冒充分层 Channel Probe；跨绑定 `ready_dependent` 等待 Stage C 的真实聚合入口。
-- 剩余风险：代理可达性与上游 SLA 由用户配置环境承担；OmniHub 只报告当前执行事实，不做长期监控。
-- 下一入口：提交并推送 Stage A；随后进入 Stage B 的 GitHub/Tavily/xurl 与 Agent Query 公共出口。
+- 未证明：真实 Tavily API Key/X app-only Token、用户套餐和 quota；Linux/Windows 实机运行；GitHub/Tavily/xurl 分层网络 Probe；任意 Agent 最终自然语言的链接审计。
+- 运行约束：`serve` 只是前台 literal-loopback Query 服务；xurl 必须已在 PATH 且自行满足 X Developer App；任何 Provider 都只使用用户保存的固定 Egress，不接受 Operation 临时 Endpoint/代理。
+- 下一入口：提交并 push Stage B；随后 Stage C 复用当前 Operation Service，实现 View/Snapshot/Run、持久 Probe health、Dashboard Backend 与 RSS/Atom/JSON Feed renderer。

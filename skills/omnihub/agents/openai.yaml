@@ -1,0 +1,4 @@
+interface:
+  display_name: "OmniHub Search"
+  short_description: "通过可追溯的多来源检索获得 Agent 可引用结果"
+  default_prompt: "Use $omnihub to search configured sources and return traceable citations with coverage limits."

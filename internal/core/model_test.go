@@ -12,6 +12,7 @@ import (
 func TestOperationValidation(t *testing.T) {
 	query := "agent search"
 	target := "https://example.com/post"
+	repositoryTarget := "owner/repo"
 	base := Operation{
 		SchemaVersion:      SchemaVersion,
 		Operation:          OperationSearch,
@@ -34,9 +35,27 @@ func TestOperationValidation(t *testing.T) {
 		{name: "latest", operation: replace(base, func(value *Operation) { value.Operation = OperationLatest; value.Query = nil })},
 		{name: "latest with query", operation: replace(base, func(value *Operation) { value.Operation = OperationLatest }), wantError: true},
 		{name: "fetch", operation: replace(base, func(value *Operation) { value.Operation = OperationFetch; value.Query = nil; value.Target = &target })},
+		{name: "fetch secret query", operation: replace(base, func(value *Operation) {
+			secretTarget := "https://example.com/post?access_token=must-not-enter-envelope"
+			value.Operation = OperationFetch
+			value.Query = nil
+			value.Target = &secretTarget
+		}), wantError: true},
+		{name: "fetch upstream identifier", operation: replace(base, func(value *Operation) {
+			value.Operation = OperationFetch
+			value.Query = nil
+			value.Target = &repositoryTarget
+		})},
 		{name: "fetch without target", operation: replace(base, func(value *Operation) { value.Operation = OperationFetch; value.Query = nil }), wantError: true},
 		{name: "missing scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{} }), wantError: true},
-		{name: "domain scope unsupported", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"example.com"}} }), wantError: true},
+		{name: "domain search scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"example.com"}} })},
+		{name: "domain latest scope", operation: replace(base, func(value *Operation) {
+			value.Operation = OperationLatest
+			value.Query = nil
+			value.Scope = Scope{Domains: []string{"example.com"}}
+		}), wantError: true},
+		{name: "invalid domain scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"https://example.com"}} }), wantError: true},
+		{name: "duplicate domain scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"example.com", "EXAMPLE.COM"}} }), wantError: true},
 		{name: "continuation unsupported", operation: replace(base, func(value *Operation) { token := "adapter-cursor"; value.Continuation = &token }), wantError: true},
 		{name: "untyped selector", operation: replace(base, func(value *Operation) { value.RoutePolicy.Prefer = []RouteSelector{{ID: "github"}} }), wantError: true},
 		{name: "auto with prefer hint", operation: replace(base, func(value *Operation) {

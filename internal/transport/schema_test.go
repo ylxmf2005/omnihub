@@ -62,8 +62,26 @@ func TestOperationProjection(t *testing.T) {
 	}
 
 	for _, operation := range []string{"search", "latest", "fetch"} {
-		if _, ok := artifacts.OpenAPI.Paths["/v1/"+operation]; !ok {
+		path, ok := artifacts.OpenAPI.Paths["/v1/"+operation]
+		if !ok {
 			t.Errorf("OpenAPI misses /v1/%s", operation)
+			continue
+		}
+		responses := path["post"].(map[string]any)["responses"].(map[string]any)
+		for _, status := range []string{"200", "400", "409", "502"} {
+			if _, ok := responses[status]; !ok {
+				t.Errorf("OpenAPI /v1/%s misses response %s", operation, status)
+			}
+		}
+		for _, status := range []string{"400", "409"} {
+			content := responses[status].(map[string]any)["content"].(map[string]any)
+			if _, ok := content["application/problem+json"]; !ok {
+				t.Errorf("OpenAPI /v1/%s response %s misses RFC 9457", operation, status)
+			}
+		}
+		failedContent := responses["502"].(map[string]any)["content"].(map[string]any)
+		if _, ok := failedContent["application/json"]; !ok {
+			t.Errorf("OpenAPI /v1/%s response 502 misses Envelope", operation)
 		}
 	}
 	post := artifacts.OpenAPI.Paths["/v1/search"]["post"].(map[string]any)
@@ -90,20 +108,47 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	if err := searchSchema.Validate(&validSearch); err != nil {
 		t.Fatalf("valid search schema input failed: %v", err)
 	}
+	validDomainSearch := cloneJSONMap(t, validSearch)
+	validDomainSearch["scope"] = map[string]any{"domains": []any{"docs.example.com"}}
+	if err := searchSchema.Validate(&validDomainSearch); err != nil {
+		t.Fatalf("valid domain search schema input failed: %v", err)
+	}
+	fetchSchema := resolvedSchema(t, artifacts.CLI.Commands[2].InputSchema)
+	validFetch := map[string]any{
+		"schema_version": core.SchemaVersion, "target": "octo/repository", "scope": map[string]any{"channels": []any{"github"}},
+		"route_policy": map[string]any{"mode": "auto", "aggregate": false, "allow_fallback": false}, "deadline_ms": float64(30000),
+	}
+	if err := fetchSchema.Validate(&validFetch); err != nil {
+		t.Fatalf("valid owner/repository fetch schema input failed: %v", err)
+	}
 	for _, forbidden := range []string{"egress", "egress_profile_id", "proxy", "proxy_url"} {
 		if _, exists := schemaObject(t, artifacts.CLI.Commands[0].InputSchema)["properties"].(map[string]any)[forbidden]; exists {
 			t.Fatalf("search input exposes forbidden egress override %q", forbidden)
 		}
 	}
+	for name, target := range map[string]string{"missing host": "http:///", "missing authority": "https://?query"} {
+		invalid := cloneJSONMap(t, validFetch)
+		invalid["target"] = target
+		if err := fetchSchema.Validate(&invalid); err == nil {
+			t.Fatalf("fetch schema accepted %s target %q", name, target)
+		}
+	}
 	for name, mutate := range map[string]func(map[string]any){
-		"wrong version":   func(value map[string]any) { value["schema_version"] = "2.0" },
-		"empty query":     func(value map[string]any) { value["query"] = "" },
-		"blank query":     func(value map[string]any) { value["query"] = " " },
-		"oversized limit": func(value map[string]any) { value["limit"] = float64(101) },
-		"empty scope":     func(value map[string]any) { value["scope"] = map[string]any{} },
-		"null scope list": func(value map[string]any) { value["scope"] = map[string]any{"sources": nil} },
-		"domain scope":    func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{"example.com"}} },
-		"continuation":    func(value map[string]any) { value["continuation"] = "provider-cursor" },
+		"wrong version":      func(value map[string]any) { value["schema_version"] = "2.0" },
+		"empty query":        func(value map[string]any) { value["query"] = "" },
+		"blank query":        func(value map[string]any) { value["query"] = " " },
+		"oversized limit":    func(value map[string]any) { value["limit"] = float64(101) },
+		"empty scope":        func(value map[string]any) { value["scope"] = map[string]any{} },
+		"null scope list":    func(value map[string]any) { value["scope"] = map[string]any{"sources": nil} },
+		"domain with scheme": func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{"https://example.com"}} },
+		"domain with path":   func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{"example.com/path"}} },
+		"domain with port":   func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{"example.com:443"}} },
+		"uppercase domain":   func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{"Example.COM"}} },
+		"trailing dot domain": func(value map[string]any) {
+			value["scope"] = map[string]any{"domains": []any{"example.com."}}
+		},
+		"blank domain": func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{" "}} },
+		"continuation": func(value map[string]any) { value["continuation"] = "provider-cursor" },
 		"empty preferred": func(value map[string]any) {
 			value["route_policy"] = map[string]any{"mode": "prefer", "aggregate": false, "allow_fallback": true}
 		},
@@ -122,6 +167,13 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	validOperation["operation"] = "search"
 	if err := operationSchema.Validate(&validOperation); err != nil {
 		t.Fatalf("valid operation schema input failed: %v", err)
+	}
+	validFetchOperation := cloneJSONMap(t, validOperation)
+	validFetchOperation["operation"] = "fetch"
+	validFetchOperation["target"] = "octo/repository"
+	delete(validFetchOperation, "query")
+	if err := operationSchema.Validate(&validFetchOperation); err != nil {
+		t.Fatalf("valid owner/repository fetch operation failed schema: %v", err)
 	}
 	for name, mutate := range map[string]func(map[string]any){
 		"search target": func(value map[string]any) { value["target"] = "https://example.com" },

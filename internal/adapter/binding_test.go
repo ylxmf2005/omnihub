@@ -1263,6 +1263,845 @@ func TestRSSHubCredentialSignsThroughExplicitHTTPSProxy(t *testing.T) {
 	}
 }
 
+func TestGitHubAdapterSearchAndFetchContracts(t *testing.T) {
+	fixed := time.Date(2026, 8, 14, 8, 0, 0, 0, time.UTC)
+	query := "  agent search in:name  "
+	for _, test := range []struct {
+		name  string
+		token *string
+	}{
+		{name: "anonymous"},
+		{name: "token", token: stringPointer("github_pat_stage_b_secret_123456")},
+	} {
+		t.Run("search_"+test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				if request.Method != http.MethodGet || request.URL.Path != "/search/repositories" || request.URL.Query().Get("q") != query || request.URL.Query().Get("per_page") != "2" || request.URL.Query().Get("page") != "1" {
+					t.Errorf("GitHub search request = %s %s", request.Method, request.URL.String())
+				}
+				wantAuthorization := ""
+				if test.token != nil {
+					wantAuthorization = "Bearer " + *test.token
+				}
+				if request.Header.Get("Authorization") != wantAuthorization || request.Header.Get("Accept") != "application/vnd.github+json" || request.Header.Get("X-GitHub-Api-Version") != "2026-03-10" || request.Header.Get("User-Agent") != "OmniHub/1.0" {
+					t.Errorf("GitHub search headers = %#v", request.Header)
+				}
+				writeJSONFixture(t, writer, map[string]any{"total_count": 1, "incomplete_results": false, "items": []any{githubRepositoryFixture()}})
+			}))
+			defer server.Close()
+
+			operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 2}
+			result := (GitHubAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, test.token))
+			if requests.Load() != 1 || len(result.Errors) != 0 || len(result.Items) != 1 || len(result.Coverage) != 1 {
+				t.Fatalf("GitHub search result = %#v, requests=%d", result, requests.Load())
+			}
+			item, observation, coverage := result.Items[0], result.Items[0].Observations[0], result.Coverage[0]
+			if item.URL != "https://github.com/owner/repo" || item.Title != "owner/repo" || item.Summary == nil || *item.Summary != "Repository summary" || len(item.Authors) != 1 || item.Authors[0].Name != "owner" || item.Metrics["stargazers"] != 12 {
+				t.Fatalf("GitHub normalized item = %#v", item)
+			}
+			if observation.Source != "github" || observation.Provider != "github-api" || observation.Endpoint != "endpoint_github" || observation.UpstreamID == nil || *observation.UpstreamID != "R_fixture_repo_42" || observation.Verification != core.VerificationMetadata || observation.Rank == nil || *observation.Rank != 1 {
+				t.Fatalf("GitHub observation = %#v", observation)
+			}
+			if coverage.Scope != "github_repository_search_first_page" || coverage.Examined == nil || *coverage.Examined != 1 || coverage.Returned == nil || *coverage.Returned != 1 || coverage.Exhaustive == nil || !*coverage.Exhaustive || coverage.Truncated {
+				t.Fatalf("GitHub coverage = %#v", coverage)
+			}
+			wantLimitations := []string{"github_repository_metadata_only"}
+			if test.token == nil {
+				wantLimitations = append(wantLimitations, "github_public_repositories_only", "github_anonymous_rate_limit")
+			}
+			if !reflect.DeepEqual(coverage.Limitations, wantLimitations) || !reflect.DeepEqual(result.Limitations, wantLimitations) {
+				t.Fatalf("GitHub %s limitations = %#v / %#v", test.name, coverage.Limitations, result.Limitations)
+			}
+			wantAuthUsed := strconv.FormatBool(test.token != nil)
+			if result.ProviderState["auth_used"] != wantAuthUsed || result.ProviderState["egress_proxied"] != "false" {
+				t.Fatalf("GitHub provider state = %#v", result.ProviderState)
+			}
+			if test.token != nil {
+				assertSerializedSecretAbsent(t, result, *test.token)
+			}
+		})
+	}
+
+	for _, target := range []string{"owner/repo", "https://github.com/owner/repo"} {
+		t.Run("fetch_"+strings.ReplaceAll(target, "/", "_"), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodGet || request.URL.Path != "/repos/owner/repo" || request.URL.RawQuery != "" {
+					t.Errorf("GitHub fetch request = %s %s", request.Method, request.URL.String())
+				}
+				writeJSONFixture(t, writer, githubRepositoryFixture())
+			}))
+			defer server.Close()
+			operation := core.Operation{Operation: core.OperationFetch, Target: &target, Limit: 1}
+			result := (GitHubAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, nil))
+			if len(result.Errors) != 0 || len(result.Items) != 1 || len(result.Coverage) != 1 || result.Coverage[0].Scope != "github_repository_metadata" || result.Coverage[0].Exhaustive == nil || !*result.Coverage[0].Exhaustive {
+				t.Fatalf("GitHub fetch result = %#v", result)
+			}
+			if !reflect.DeepEqual(result.Coverage[0].Limitations, []string{"github_repository_metadata_only", "github_public_repositories_only", "github_anonymous_rate_limit"}) {
+				t.Fatalf("GitHub anonymous fetch limitations = %#v", result.Coverage[0].Limitations)
+			}
+		})
+	}
+}
+
+func TestGitHubAdapterRejectsInvalidTargetsAndEgressBeforeNetwork(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	for _, target := range []string{"", "owner", "owner/repo/extra", "https://example.com/owner/repo", "https://github.com/owner/repo?token=secret", "https://github.com/owner/repo/issues"} {
+		t.Run("target_"+strconv.Itoa(len(target)), func(t *testing.T) {
+			operation := core.Operation{Operation: core.OperationFetch, Target: &target, Limit: 1}
+			result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, nil))
+			assertAdapterError(t, result, core.ErrorParameter, false)
+		})
+	}
+	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	queryWithTime := "agent"
+	timeRangeOperation := core.Operation{Operation: core.OperationSearch, Query: &queryWithTime, Limit: 1, TimeRange: core.TimeRange{From: &from}}
+	result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(timeRangeOperation, nil))
+	assertAdapterError(t, result, core.ErrorParameter, false)
+
+	query := "agent"
+	operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+	for _, mutate := range []func(*GitHubRequest){
+		func(request *GitHubRequest) { request.Egress.Enabled = false },
+		func(request *GitHubRequest) { request.Endpoint.EgressProfileID = "another-egress" },
+		func(request *GitHubRequest) { request.Endpoint.BaseURL = server.URL },
+	} {
+		request := githubRequestFixture(operation, stringPointer("github_pat_zero_network_secret"))
+		mutate(&request)
+		result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), request)
+		assertAdapterError(t, result, core.ErrorConfig, false)
+		assertSerializedSecretAbsent(t, result, "github_pat_zero_network_secret")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("invalid GitHub requests reached network %d times", requests.Load())
+	}
+}
+
+func TestGitHubAdapterMapsFailuresAndCoverageWithoutRetryOrSecrets(t *testing.T) {
+	fixed := time.Unix(1_800_000_000, 0).UTC()
+	secret := "github_pat_reflected_secret_123456"
+	query := "agent"
+	tests := []struct {
+		name         string
+		status       int
+		headers      map[string]string
+		body         string
+		code         core.ErrorCode
+		retryable    bool
+		retryAfterMS int
+	}{
+		{name: "unauthorized", status: 401, body: `{"message":"bad credentials"}`, code: core.ErrorAuth},
+		{name: "ordinary_forbidden", status: 403, body: `{"message":"resource forbidden"}`, code: core.ErrorAuth},
+		{name: "primary_rate_limit", status: 403, headers: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": strconv.FormatInt(fixed.Add(time.Minute).Unix(), 10)}, body: `{"message":"API rate limit exceeded"}`, code: core.ErrorRateLimit, retryable: true, retryAfterMS: 60_000},
+		{name: "too_many_requests", status: 429, headers: map[string]string{"Retry-After": "7"}, body: `{}`, code: core.ErrorRateLimit, retryable: true, retryAfterMS: 7_000},
+		{name: "unprocessable", status: 422, body: `{}`, code: core.ErrorParameter},
+		{name: "not_found", status: 404, body: `{}`, code: core.ErrorUpstream},
+		{name: "unavailable", status: 503, body: `{}`, code: core.ErrorUpstream, retryable: true},
+		{name: "malformed", status: 200, body: `{"total_count":`, code: core.ErrorParse},
+		{name: "schema_invalid", status: 200, body: `{"total_count":1,"incomplete_results":false,"items":[{"id":0}]}`, code: core.ErrorProtocol},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				for name, value := range test.headers {
+					writer.Header().Set(name, value)
+				}
+				writer.WriteHeader(test.status)
+				_, _ = writer.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+			result := (GitHubAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, &secret))
+			assertAdapterError(t, result, test.code, test.retryable)
+			if requests.Load() != 1 {
+				t.Fatalf("GitHub %s requests = %d, want one", test.name, requests.Load())
+			}
+			if test.retryAfterMS == 0 {
+				if result.Errors[0].RetryAfterMS != nil {
+					t.Fatalf("GitHub %s retry_after = %v", test.name, *result.Errors[0].RetryAfterMS)
+				}
+			} else if result.Errors[0].RetryAfterMS == nil || *result.Errors[0].RetryAfterMS != test.retryAfterMS {
+				t.Fatalf("GitHub %s retry_after = %v, want %d", test.name, result.Errors[0].RetryAfterMS, test.retryAfterMS)
+			}
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+
+	t.Run("incomplete_over_1000", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writeJSONFixture(t, writer, map[string]any{"total_count": 1001, "incomplete_results": true, "items": []any{githubRepositoryFixture()}})
+		}))
+		defer server.Close()
+		operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+		result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, nil))
+		if len(result.Errors) != 0 || len(result.Coverage) != 1 || !result.Coverage[0].Truncated || result.Coverage[0].Exhaustive == nil || *result.Coverage[0].Exhaustive || !reflect.DeepEqual(result.Coverage[0].Limitations, []string{"github_repository_metadata_only", "github_public_repositories_only", "github_anonymous_rate_limit", "github_search_first_page_only", "github_search_max_1000", "github_search_incomplete_results"}) {
+			t.Fatalf("GitHub incomplete coverage = %#v", result)
+		}
+	})
+
+	t.Run("cross_origin_redirect", func(t *testing.T) {
+		var externalRequests atomic.Int32
+		external := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { externalRequests.Add(1) }))
+		defer external.Close()
+		origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Location", external.URL)
+			writer.WriteHeader(http.StatusFound)
+		}))
+		defer origin.Close()
+		operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+		result := (GitHubAdapter{testBaseURL: origin.URL}).Execute(context.Background(), githubRequestFixture(operation, &secret))
+		assertAdapterError(t, result, core.ErrorProtocol, false)
+		if externalRequests.Load() != 0 {
+			t.Fatal("GitHub followed a credentialed cross-origin redirect")
+		}
+		assertSerializedSecretAbsent(t, result, secret)
+	})
+
+	t.Run("reflected_credential", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.WriteHeader(http.StatusUnauthorized)
+			_, _ = writer.Write([]byte(fmt.Sprintf(`{"message":%q}`, secret)))
+		}))
+		defer server.Close()
+		operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+		result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, &secret))
+		assertAdapterError(t, result, core.ErrorProtocol, false)
+		assertSerializedSecretAbsent(t, result, secret)
+	})
+
+	t.Run("reflected_credential_header", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("X-RateLimit-Remaining", secret)
+			writer.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer server.Close()
+		operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 1}
+		result := (GitHubAdapter{testBaseURL: server.URL}).Execute(context.Background(), githubRequestFixture(operation, &secret))
+		assertAdapterError(t, result, core.ErrorProtocol, false)
+		assertSerializedSecretAbsent(t, result, secret)
+	})
+}
+
+func TestTavilyAdapterPayloadMappingAndCandidateProvenance(t *testing.T) {
+	secret := "tvly-stage-b-secret-123456"
+	fixed := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		operation  core.Operation
+		parameters map[string]any
+		want       tavilySearchPayload
+	}{
+		{
+			name: "basic_default",
+			operation: func() core.Operation {
+				query := "  agent search  "
+				return core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5}
+			}(),
+			want: tavilySearchPayload{Query: "agent search", SearchDepth: "basic", MaxResults: 5, IncludeDomains: []string{}, ExcludeDomains: []string{}, IncludeUsage: true},
+		},
+		{
+			name: "advanced_capped_domains",
+			operation: func() core.Operation {
+				query := "agents"
+				return core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 99, Scope: core.Scope{Domains: []string{"GitHub.COM.", "github.com", "Example.com"}}}
+			}(),
+			parameters: map[string]any{"search_depth": "advanced", "exclude_domains": []any{"Spam.example", "spam.example"}},
+			want:       tavilySearchPayload{Query: "agents", SearchDepth: "advanced", MaxResults: 20, IncludeDomains: []string{"github.com", "example.com"}, ExcludeDomains: []string{"spam.example"}, IncludeUsage: true},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				if request.Method != http.MethodPost || request.URL.Path != "/search" || request.URL.RawQuery != "" || request.Header.Get("Authorization") != "Bearer "+secret || request.Header.Get("Accept") != "application/json" || request.Header.Get("Content-Type") != "application/json" || request.Header.Get("User-Agent") != "OmniHub/1.0" {
+					t.Errorf("Tavily request = %s %s %#v", request.Method, request.URL.String(), request.Header)
+				}
+				var payload tavilySearchPayload
+				if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(payload, test.want) {
+					t.Errorf("Tavily payload = %#v, want %#v", payload, test.want)
+				}
+				writeJSONFixture(t, writer, map[string]any{"results": []any{
+					map[string]any{"title": " GitHub result ", "url": "https://GitHub.com/owner/repo#readme", "content": "snippet", "score": 0.9},
+					map[string]any{"title": "Example", "url": "https://Example.com/article", "content": "", "score": 0.5},
+				}})
+			}))
+			defer server.Close()
+
+			request := tavilyRequestFixture(test.operation, secret)
+			request.Channel.Parameters = test.parameters
+			result := (TavilyAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), request)
+			if requests.Load() != 1 || len(result.Errors) != 0 || len(result.Items) != 2 || len(result.Coverage) != 1 {
+				t.Fatalf("Tavily result = %#v, requests=%d", result, requests.Load())
+			}
+			first := result.Items[0]
+			if first.URL != "https://github.com/owner/repo" || first.Title != "GitHub result" || first.Content.Role != core.ContentSnippet || first.Content.Text == nil || *first.Content.Text != "snippet" || first.Observations[0].Source != "github.com" || first.Observations[0].Provider != "tavily" || first.Observations[0].Verification != core.VerificationCandidate || first.Observations[0].Endpoint != "endpoint_tavily" || !reflect.DeepEqual(first.Observations[0].Limitations, []string{"web_index_coverage_unknown", "candidate_results_only"}) {
+				t.Fatalf("Tavily candidate = %#v", first)
+			}
+			coverage := result.Coverage[0]
+			wantLimitations := []string{"web_index_coverage_unknown", "candidate_results_only"}
+			if test.operation.Limit > 20 {
+				wantLimitations = append(wantLimitations, "tavily_max_20")
+			}
+			if coverage.Scope != "tavily_web_index_candidates" || coverage.Examined == nil || *coverage.Examined != 2 || coverage.Returned == nil || *coverage.Returned != 2 || coverage.Exhaustive == nil || *coverage.Exhaustive || !coverage.Truncated || !reflect.DeepEqual(coverage.Limitations, wantLimitations) || !reflect.DeepEqual(result.Limitations, wantLimitations) || result.ProviderState["auth_used"] != "true" || result.ProviderState["egress_proxied"] != "false" {
+				t.Fatalf("Tavily coverage/state = %#v / %#v", coverage, result.ProviderState)
+			}
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+
+	t.Run("max_20_results", func(t *testing.T) {
+		results := make([]any, 21)
+		for index := range results {
+			results[index] = map[string]any{"title": fmt.Sprintf("Result %d", index), "url": fmt.Sprintf("https://example.com/%d", index), "content": "snippet"}
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writeJSONFixture(t, writer, map[string]any{"results": results})
+		}))
+		defer server.Close()
+		query := "agents"
+		operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 99}
+		result := (TavilyAdapter{testBaseURL: server.URL}).Execute(context.Background(), tavilyRequestFixture(operation, secret))
+		if len(result.Errors) != 0 || len(result.Items) != 20 || len(result.Coverage) != 1 || result.Coverage[0].Examined == nil || *result.Coverage[0].Examined != 21 || result.Coverage[0].Returned == nil || *result.Coverage[0].Returned != 20 || !reflect.DeepEqual(result.Limitations, []string{"web_index_coverage_unknown", "candidate_results_only", "tavily_max_20"}) {
+			t.Fatalf("Tavily max 20 result = %#v", result)
+		}
+	})
+}
+
+func TestTavilyAdapterMapsFailuresWithoutRetriesOrCredentialLeaks(t *testing.T) {
+	secret := "tvly-reflected-secret-123456"
+	query := "agents"
+	operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5}
+	tests := []struct {
+		name         string
+		status       int
+		retryAfter   string
+		body         string
+		code         core.ErrorCode
+		retryable    bool
+		retryAfterMS int
+	}{
+		{name: "bad_request", status: 400, body: `{}`, code: core.ErrorParameter},
+		{name: "unauthorized", status: 401, body: fmt.Sprintf(`{"error":%q}`, secret), code: core.ErrorAuth},
+		{name: "rate_limit", status: 429, retryAfter: "3", body: `{}`, code: core.ErrorRateLimit, retryable: true, retryAfterMS: 3_000},
+		{name: "plan_limit", status: 432, body: `{}`, code: core.ErrorUpstream},
+		{name: "credit_limit", status: 433, body: `{}`, code: core.ErrorUpstream},
+		{name: "unavailable", status: 503, body: `{}`, code: core.ErrorUpstream, retryable: true},
+		{name: "malformed", status: 200, body: `{"results":`, code: core.ErrorParse},
+		{name: "missing_results", status: 200, body: `{}`, code: core.ErrorProtocol},
+		{name: "invalid_result_url", status: 200, body: `{"results":[{"title":"bad","url":"javascript:alert(1)","content":"x"}]}`, code: core.ErrorProtocol},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				if test.retryAfter != "" {
+					writer.Header().Set("Retry-After", test.retryAfter)
+				}
+				writer.WriteHeader(test.status)
+				_, _ = writer.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			result := (TavilyAdapter{testBaseURL: server.URL}).Execute(context.Background(), tavilyRequestFixture(operation, secret))
+			assertAdapterError(t, result, test.code, test.retryable)
+			if requests.Load() != 1 {
+				t.Fatalf("Tavily %s requests = %d, want one", test.name, requests.Load())
+			}
+			if test.retryAfterMS > 0 && (result.Errors[0].RetryAfterMS == nil || *result.Errors[0].RetryAfterMS != test.retryAfterMS) {
+				t.Fatalf("Tavily %s retry_after = %v", test.name, result.Errors[0].RetryAfterMS)
+			}
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+
+	t.Run("reflected_credential", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("X-Reflected-Value", secret)
+			writeJSONFixture(t, writer, map[string]any{"results": []any{}})
+		}))
+		defer server.Close()
+		result := (TavilyAdapter{testBaseURL: server.URL}).Execute(context.Background(), tavilyRequestFixture(operation, secret))
+		assertAdapterError(t, result, core.ErrorProtocol, false)
+		assertSerializedSecretAbsent(t, result, secret)
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		var externalRequests atomic.Int32
+		external := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { externalRequests.Add(1) }))
+		defer external.Close()
+		origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Location", external.URL)
+			writer.WriteHeader(http.StatusTemporaryRedirect)
+		}))
+		defer origin.Close()
+		result := (TavilyAdapter{testBaseURL: origin.URL}).Execute(context.Background(), tavilyRequestFixture(operation, secret))
+		assertAdapterError(t, result, core.ErrorProtocol, false)
+		if externalRequests.Load() != 0 {
+			t.Fatal("Tavily followed a credentialed redirect")
+		}
+		assertSerializedSecretAbsent(t, result, secret)
+	})
+
+	for _, test := range []struct {
+		name      string
+		domains   []string
+		excluded  []string
+		resultURL string
+	}{
+		{name: "outside_include_domain", domains: []string{"github.com"}, resultURL: "https://example.com/result"},
+		{name: "inside_exclude_domain", excluded: []string{"example.com"}, resultURL: "https://sub.example.com/result"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writeJSONFixture(t, writer, map[string]any{"results": []any{map[string]any{"title": "escaped", "url": test.resultURL, "content": "snippet"}}})
+			}))
+			defer server.Close()
+			request := tavilyRequestFixture(operation, secret)
+			request.Operation.Scope.Domains = test.domains
+			if len(test.excluded) > 0 {
+				request.Channel.Parameters = map[string]any{"exclude_domains": test.excluded}
+			}
+			result := (TavilyAdapter{testBaseURL: server.URL}).Execute(context.Background(), request)
+			assertAdapterError(t, result, core.ErrorProtocol, false)
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+}
+
+func TestTavilyAdapterRejectsInvalidConfigurationBeforeNetwork(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	query := "agents"
+	operation := core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5}
+	tests := []struct {
+		name   string
+		code   core.ErrorCode
+		mutate func(*TavilyRequest)
+	}{
+		{name: "invalid_domain", code: core.ErrorParameter, mutate: func(request *TavilyRequest) { request.Operation.Scope.Domains = []string{"https://example.com"} }},
+		{name: "time_range", code: core.ErrorParameter, mutate: func(request *TavilyRequest) {
+			from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+			request.Operation.TimeRange.From = &from
+		}},
+		{name: "missing_credential", code: core.ErrorAuth, mutate: func(request *TavilyRequest) { request.Credential = nil }},
+		{name: "credential_whitespace", code: core.ErrorAuth, mutate: func(request *TavilyRequest) { request.Credential.Value = stringPointer("tvly secret with spaces") }},
+		{name: "disabled_egress", code: core.ErrorConfig, mutate: func(request *TavilyRequest) { request.Egress.Enabled = false }},
+		{name: "wrong_endpoint_egress", code: core.ErrorConfig, mutate: func(request *TavilyRequest) { request.Endpoint.EgressProfileID = "another" }},
+		{name: "non_official_endpoint", code: core.ErrorConfig, mutate: func(request *TavilyRequest) { request.Endpoint.BaseURL = server.URL }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := tavilyRequestFixture(operation, "tvly-zero-network-secret")
+			test.mutate(&request)
+			result := (TavilyAdapter{testBaseURL: server.URL}).Execute(context.Background(), request)
+			assertAdapterError(t, result, test.code, false)
+			assertSerializedSecretAbsent(t, result, "tvly-zero-network-secret")
+		})
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("invalid Tavily requests reached network %d times", requests.Load())
+	}
+}
+
+func TestXURLAdapterUsesFixedCommandsIsolatedHomeAndMapsResults(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake xurl executable is a POSIX shell fixture")
+	}
+	secret := "xurl-app-only-secret-123456"
+	realHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(realHome, ".twurlrc"), []byte("must-not-be-read"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", realHome)
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"} {
+		t.Setenv(name, "http://must-not-be-inherited.invalid:8080")
+	}
+	stdout := `{"data":[{"id":"123456","text":"hello from X","author_id":"u1","created_at":"2026-08-14T10:00:00Z","public_metrics":{"like_count":2},"entities":{"hashtags":[{"tag":"Go"},{"tag":"Go"}]} }],"includes":{"users":[{"id":"u1","name":"Alice","username":"alice"}]},"meta":{"result_count":1}}`
+	executable, record := writeFakeXURL(t, secret, fakeXURLBehavior{SearchStdout: stdout})
+	query := "  --help agent search  "
+	request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 7, DeadlineMS: 5_000}, secret, core.EgressModeDirect, "")
+	fixed := time.Date(2026, 8, 14, 10, 1, 0, 0, time.UTC)
+	result := (XURLAdapter{Executable: executable, Now: func() time.Time { return fixed }}).Execute(context.Background(), request)
+	if len(result.Errors) != 0 || len(result.Items) != 1 || len(result.Coverage) != 1 {
+		t.Fatalf("xurl success result = %#v", result)
+	}
+	item, observation, coverage := result.Items[0], result.Items[0].Observations[0], result.Coverage[0]
+	if item.URL != "https://x.com/alice/status/123456" || item.Content.Text == nil || *item.Content.Text != "hello from X" || item.Content.Role != core.ContentBody || len(item.Authors) != 1 || item.Authors[0].Name != "Alice" || !reflect.DeepEqual(item.Tags, []string{"Go"}) || item.Metrics["like_count"] != int64(2) {
+		t.Fatalf("xurl normalized item = %#v", item)
+	}
+	if observation.Source != "x" || observation.Provider != "xurl" || observation.UpstreamID == nil || *observation.UpstreamID != "123456" || observation.Verification != core.VerificationBody || observation.RetrievedAt != fixed {
+		t.Fatalf("xurl observation = %#v", observation)
+	}
+	if coverage.Scope != "x_recent_search_window" || coverage.Examined == nil || *coverage.Examined != 1 || coverage.Returned == nil || *coverage.Returned != 1 || coverage.Exhaustive == nil || *coverage.Exhaustive || !coverage.Truncated || result.ProviderState["auth_used"] != "true" || result.ProviderState["egress_proxied"] != "false" {
+		t.Fatalf("xurl coverage/state = %#v / %#v", coverage, result.ProviderState)
+	}
+
+	log := readFixtureFile(t, record)
+	if !strings.Contains(log, "argv=[auth][app-only][-]") || !strings.Contains(log, "argv=[search][--max-results][7][--auth][app][--][--help agent search]") || strings.Count(log, "stdin=ok") != 1 || strings.Count(log, "twurlrc=hidden") != 2 {
+		t.Fatalf("xurl command log = %s", log)
+	}
+	if strings.Contains(log, secret) || strings.Contains(log, realHome) || strings.Contains(log, "must-not-be-inherited") {
+		t.Fatalf("xurl inherited or recorded sensitive state: %s", log)
+	}
+	for _, fact := range []string{"http_proxy=[]", "https_proxy=[]", "http_proxy_lower=[]", "https_proxy_lower=[]"} {
+		if !strings.Contains(log, fact) {
+			t.Fatalf("direct xurl inherited proxy state (%s): %s", fact, log)
+		}
+	}
+	assertXURLHomesRemoved(t, log)
+	assertSerializedSecretAbsent(t, result, secret)
+}
+
+func TestXURLAdapterProjectsExplicitEgressEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake xurl executable is a POSIX shell fixture")
+	}
+	secret := "xurl-egress-secret-123456"
+	query := "agents"
+	emptyResult := `{"data":[],"meta":{"result_count":0}}`
+	tests := []struct {
+		name          string
+		mode          core.EgressMode
+		proxyEndpoint string
+		environment   map[string]string
+		wantProxied   string
+		wantLog       []string
+	}{
+		{
+			name: "environment", mode: core.EgressModeEnvironment,
+			environment: map[string]string{"HTTPS_PROXY": "http://127.0.0.1:7101", "HTTP_PROXY": "http://127.0.0.1:7102", "NO_PROXY": "localhost"},
+			wantProxied: "true", wantLog: []string{"https_proxy=[http://127.0.0.1:7101]", "http_proxy=[http://127.0.0.1:7102]", "no_proxy=[localhost]"},
+		},
+		{
+			name: "http_proxy", mode: core.EgressModeHTTPProxy, proxyEndpoint: "http://127.0.0.1:7201",
+			wantProxied: "true", wantLog: []string{"https_proxy=[http://127.0.0.1:7201]", "https_proxy_lower=[http://127.0.0.1:7201]", "http_proxy=[]"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"} {
+				t.Setenv(name, "")
+			}
+			for name, value := range test.environment {
+				t.Setenv(name, value)
+			}
+			executable, record := writeFakeXURL(t, secret, fakeXURLBehavior{SearchStdout: emptyResult})
+			request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 10}, secret, test.mode, test.proxyEndpoint)
+			result := (XURLAdapter{Executable: executable}).Execute(context.Background(), request)
+			if len(result.Errors) != 0 || result.ProviderState["egress_proxied"] != test.wantProxied {
+				t.Fatalf("xurl %s result = %#v", test.name, result)
+			}
+			log := readFixtureFile(t, record)
+			for _, wanted := range test.wantLog {
+				if !strings.Contains(log, wanted) {
+					t.Fatalf("xurl %s log lacks %q: %s", test.name, wanted, log)
+				}
+			}
+			assertXURLHomesRemoved(t, log)
+			assertSerializedSecretAbsent(t, result, secret, test.proxyEndpoint)
+		})
+	}
+}
+
+func TestXURLAdapterMapsCommandFailuresAndAlwaysCleansHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake xurl executable is a POSIX shell fixture")
+	}
+	secret := "xurl-failure-secret-123456"
+	query := "agents"
+	tests := []struct {
+		name           string
+		behavior       fakeXURLBehavior
+		maxOutputBytes int64
+		deadlineMS     int
+		code           core.ErrorCode
+		retryable      bool
+		wantSearch     bool
+	}{
+		{name: "api_error_json", behavior: fakeXURLBehavior{SearchStdout: `{"status":429,"title":"Too Many Requests"}`, SearchExit: 1}, code: core.ErrorRateLimit, retryable: true, wantSearch: true},
+		{name: "stderr_network", behavior: fakeXURLBehavior{SearchStderr: "dial tcp: connection refused", SearchExit: 1}, code: core.ErrorNetwork, retryable: true, wantSearch: true},
+		{name: "malformed_stdout", behavior: fakeXURLBehavior{SearchStdout: "not-json"}, code: core.ErrorParse, wantSearch: true},
+		{name: "schema_invalid", behavior: fakeXURLBehavior{SearchStdout: `{"data":[],"meta":{"result_count":1}}`}, code: core.ErrorProtocol, wantSearch: true},
+		{name: "oversized_stdout", behavior: fakeXURLBehavior{SearchStdout: strings.Repeat("x", 256)}, maxOutputBytes: 64, code: core.ErrorProtocol, wantSearch: true},
+		{name: "timeout", behavior: fakeXURLBehavior{HangSearch: true}, deadlineMS: 500, code: core.ErrorTimeout, retryable: true, wantSearch: true},
+		{name: "auth_failure", behavior: fakeXURLBehavior{AuthStderr: "invalid token", AuthExit: 1}, code: core.ErrorAuth},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executable, record := writeFakeXURL(t, secret, test.behavior)
+			deadline := test.deadlineMS
+			if deadline == 0 {
+				deadline = 2_000
+			}
+			request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 10, DeadlineMS: deadline}, secret, core.EgressModeDirect, "")
+			result := (XURLAdapter{Executable: executable, MaxOutputBytes: test.maxOutputBytes}).Execute(context.Background(), request)
+			assertAdapterError(t, result, test.code, test.retryable)
+			log := readFixtureFile(t, record)
+			if strings.Count(log, "argv=[auth][app-only][-]") != 1 || strings.Count(log, "argv=[search]") > 1 || test.wantSearch != strings.Contains(log, "argv=[search]") {
+				t.Fatalf("xurl %s retried or skipped wrong command: %s", test.name, log)
+			}
+			assertXURLHomesRemoved(t, log)
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+}
+
+func TestXURLAdapterRejectsUnsupportedInputsBeforeExecution(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake xurl executable is a POSIX shell fixture")
+	}
+	secret := "xurl-zero-execution-secret-123456"
+	query := "agents"
+	executable, record := writeFakeXURL(t, secret, fakeXURLBehavior{SearchStdout: `{"data":[],"meta":{"result_count":0}}`})
+	tests := []struct {
+		name   string
+		code   core.ErrorCode
+		mutate func(*XURLRequest, *XURLAdapter)
+	}{
+		{name: "socks5", code: core.ErrorConfig, mutate: func(request *XURLRequest, _ *XURLAdapter) {
+			request.Egress = testEgressProfile("egress_xurl", core.EgressModeSOCKS5, "socks5://127.0.0.1:1080", "", core.Socks5DNSProxy)
+		}},
+		{name: "missing_credential", code: core.ErrorAuth, mutate: func(request *XURLRequest, _ *XURLAdapter) { request.Credential = nil }},
+		{name: "limit_too_large", code: core.ErrorParameter, mutate: func(request *XURLRequest, _ *XURLAdapter) { request.Operation.Limit = 101 }},
+		{name: "missing_executable", code: core.ErrorConfig, mutate: func(_ *XURLRequest, adapter *XURLAdapter) {
+			adapter.Executable = filepath.Join(t.TempDir(), "missing-xurl")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 10}, secret, core.EgressModeDirect, "")
+			adapter := XURLAdapter{Executable: executable}
+			test.mutate(&request, &adapter)
+			result := adapter.Execute(context.Background(), request)
+			assertAdapterError(t, result, test.code, false)
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+	if _, err := os.Stat(record); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected xurl input executed the command: %v\n%s", err, readFixtureFile(t, record))
+	}
+}
+
+func TestXURLAdapterRejectsCredentialReflectedOnAnyCommandOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake xurl executable is a POSIX shell fixture")
+	}
+	secret := "xurl-reflected-secret-123456"
+	query := "agents"
+	tests := []struct {
+		name     string
+		behavior fakeXURLBehavior
+	}{
+		{name: "auth_stdout", behavior: fakeXURLBehavior{AuthStdout: secret}},
+		{name: "auth_stderr", behavior: fakeXURLBehavior{AuthStderr: secret}},
+		{name: "search_stdout", behavior: fakeXURLBehavior{SearchStdout: secret}},
+		{name: "search_stderr", behavior: fakeXURLBehavior{SearchStderr: secret, SearchExit: 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executable, record := writeFakeXURL(t, secret, test.behavior)
+			request := xurlRequestFixture(core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 10}, secret, core.EgressModeDirect, "")
+			result := (XURLAdapter{Executable: executable}).Execute(context.Background(), request)
+			assertAdapterError(t, result, core.ErrorProtocol, false)
+			assertXURLHomesRemoved(t, readFixtureFile(t, record))
+			assertSerializedSecretAbsent(t, result, secret)
+		})
+	}
+}
+
+type fakeXURLBehavior struct {
+	AuthStdout   string
+	AuthStderr   string
+	AuthExit     int
+	SearchStdout string
+	SearchStderr string
+	SearchExit   int
+	HangSearch   bool
+}
+
+func writeFakeXURL(t *testing.T, expectedToken string, behavior fakeXURLBehavior) (string, string) {
+	t.Helper()
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "xurl")
+	record := filepath.Join(directory, "calls.log")
+	hang := ""
+	if behavior.HangSearch {
+		hang = "while :; do :; done"
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+record=%s
+printf 'argv=' >> "$record"
+for argument in "$@"; do printf '[%%s]' "$argument" >> "$record"; done
+printf '\nhome=[%%s]\ncwd=[%%s]\nhttp_proxy=[%%s]\nhttps_proxy=[%%s]\nno_proxy=[%%s]\nhttp_proxy_lower=[%%s]\nhttps_proxy_lower=[%%s]\nno_proxy_lower=[%%s]\n' \
+  "$HOME" "$(pwd)" "${HTTP_PROXY-}" "${HTTPS_PROXY-}" "${NO_PROXY-}" "${http_proxy-}" "${https_proxy-}" "${no_proxy-}" >> "$record"
+if [ "$(pwd -P)" = "$(cd "$HOME" && pwd -P)" ]; then printf 'cwd_matches_home=yes\n' >> "$record"; else printf 'cwd_matches_home=no\n' >> "$record"; fi
+if [ -e "$HOME/.twurlrc" ]; then printf 'twurlrc=visible\n' >> "$record"; else printf 'twurlrc=hidden\n' >> "$record"; fi
+case "${1-}" in
+  auth)
+    supplied=''
+    IFS= read -r supplied || true
+    if [ "$supplied" = %s ]; then printf 'stdin=ok\n' >> "$record"; else printf 'stdin=wrong\n' >> "$record"; exit 97; fi
+    printf '%%s' %s
+    printf '%%s' %s >&2
+    exit %d
+    ;;
+  search)
+    %s
+    printf '%%s' %s
+    printf '%%s' %s >&2
+    exit %d
+    ;;
+  *) exit 98 ;;
+esac
+`, shellLiteral(record), shellLiteral(expectedToken), shellLiteral(behavior.AuthStdout), shellLiteral(behavior.AuthStderr), behavior.AuthExit, hang, shellLiteral(behavior.SearchStdout), shellLiteral(behavior.SearchStderr), behavior.SearchExit)
+	if err := os.WriteFile(executable, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return executable, record
+}
+
+func xurlRequestFixture(operation core.Operation, token string, mode core.EgressMode, proxyEndpoint string) XURLRequest {
+	egressProfile := testEgressProfile("egress_xurl", mode, proxyEndpoint, "", "")
+	return XURLRequest{
+		Operation: operation,
+		Channel: core.Channel{
+			ID: "channel_xurl", Source: "x", RouteTemplateID: "xurl_recent_search",
+			EgressProfileID: egressProfile.ID, CredentialID: "credential_xurl", Enabled: true, Revision: 1,
+		},
+		RouteTemplate: core.RouteTemplate{RouteTemplateID: "xurl_recent_search", Provider: "xurl", Adapter: "xurl"},
+		Credential: &core.Credential{
+			ID: "credential_xurl", Provider: "xurl", AuthKind: "app_only", Value: &token, Enabled: true, Revision: 1,
+		},
+		Egress: egressProfile,
+	}
+}
+
+func shellLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func readFixtureFile(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func assertXURLHomesRemoved(t *testing.T, log string) {
+	t.Helper()
+	var homes []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, "home=[") && strings.HasSuffix(line, "]") {
+			homes = append(homes, strings.TrimSuffix(strings.TrimPrefix(line, "home=["), "]"))
+		}
+	}
+	if len(homes) == 0 || strings.Count(log, "cwd_matches_home=yes") != len(homes) || strings.Contains(log, "cwd_matches_home=no") {
+		t.Fatalf("xurl command HOME/CWD mismatch: homes=%#v log=%s", homes, log)
+	}
+	for _, home := range homes {
+		if home != homes[0] {
+			t.Fatalf("xurl commands used different HOME directories: %#v", homes)
+		}
+		if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("xurl temporary HOME still exists: %q (%v)", home, err)
+		}
+	}
+}
+
+func githubRequestFixture(operation core.Operation, token *string) GitHubRequest {
+	egressProfile := testEgressProfile("egress_github", core.EgressModeDirect, "", "", "")
+	request := GitHubRequest{
+		Operation: operation,
+		Channel: core.Channel{
+			ID: "channel_github", Source: "github", RouteTemplateID: "github_repository_search",
+			EndpointProfileID: "endpoint_github", Enabled: true, Revision: 1,
+		},
+		RouteTemplate: core.RouteTemplate{RouteTemplateID: "github_repository_search", Provider: "github-api", Adapter: "github"},
+		Endpoint: core.EndpointProfile{
+			ID: "endpoint_github", Provider: "github-api", BaseURL: "https://api.github.com",
+			EgressProfileID: egressProfile.ID, Enabled: true, Revision: 1,
+		},
+		Egress: egressProfile,
+	}
+	if token != nil {
+		request.Channel.CredentialID = "credential_github"
+		request.Credential = &core.Credential{
+			ID: "credential_github", Provider: "github-api", AuthKind: "token", Value: token, Enabled: true, Revision: 1,
+		}
+	}
+	return request
+}
+
+func githubRepositoryFixture() map[string]any {
+	return map[string]any{
+		"id": 42, "node_id": "R_fixture_repo_42", "full_name": "owner/repo", "html_url": "https://github.com/owner/repo",
+		"description": "Repository summary", "created_at": "2026-08-01T01:00:00Z", "updated_at": "2026-08-02T02:00:00Z",
+		"owner":  map[string]any{"login": "owner", "html_url": "https://github.com/owner", "avatar_url": "https://avatars.githubusercontent.com/u/42"},
+		"topics": []string{"agents"}, "language": "Go", "stargazers_count": 12, "forks_count": 3,
+		"open_issues_count": 2, "watchers_count": 4, "score": 1.0, "license": map[string]any{"spdx_id": "MIT"},
+	}
+}
+
+func tavilyRequestFixture(operation core.Operation, apiKey string) TavilyRequest {
+	egressProfile := testEgressProfile("egress_tavily", core.EgressModeDirect, "", "", "")
+	return TavilyRequest{
+		Operation: operation,
+		Channel: core.Channel{
+			ID: "channel_tavily", Source: "open-web", RouteTemplateID: "tavily_search",
+			EndpointProfileID: "endpoint_tavily", CredentialID: "credential_tavily", Enabled: true, Revision: 1,
+		},
+		RouteTemplate: core.RouteTemplate{RouteTemplateID: "tavily_search", Provider: "tavily", Adapter: "tavily"},
+		Endpoint: core.EndpointProfile{
+			ID: "endpoint_tavily", Provider: "tavily", BaseURL: "https://api.tavily.com",
+			EgressProfileID: egressProfile.ID, Enabled: true, Revision: 1,
+		},
+		Credential: &core.Credential{
+			ID: "credential_tavily", Provider: "tavily", AuthKind: "api_key", Value: &apiKey, Enabled: true, Revision: 1,
+		},
+		Egress: egressProfile,
+	}
+}
+
+func writeJSONFixture(t *testing.T, writer http.ResponseWriter, value any) {
+	t.Helper()
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(value); err != nil {
+		t.Error(err)
+	}
+}
+
+func assertAdapterError(t *testing.T, result core.AdapterResult, code core.ErrorCode, retryable bool) {
+	t.Helper()
+	if len(result.Errors) != 1 || result.Errors[0].Code != code || result.Errors[0].Retryable != retryable || len(result.Items) != 0 || len(result.Coverage) != 0 {
+		t.Fatalf("adapter result = %#v, want one %s retryable=%t", result, code, retryable)
+	}
+}
+
+func assertSerializedSecretAbsent(t *testing.T, value any, secrets ...string) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range secrets {
+		if secret != "" && bytes.Contains(raw, []byte(secret)) {
+			t.Fatalf("serialized result contains credential material: %s", raw)
+		}
+	}
+}
+
 func testEgressProfile(id string, mode core.EgressMode, endpoint, credentialID string, dnsMode core.Socks5DNSMode) core.EgressProfile {
 	return core.EgressProfile{ID: id, Mode: mode, ProxyEndpoint: endpoint, CredentialID: credentialID, Socks5DNS: dnsMode, Enabled: true, Revision: 1}
 }

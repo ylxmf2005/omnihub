@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +38,7 @@ const usage = `usage:
   omnihub egress-profiles disable ID --revision N
   omnihub endpoints
   omnihub endpoints apply < endpoint.json
+  omnihub endpoints apply-provider < provider-endpoint.json
   omnihub endpoints disable ID --revision N
   omnihub endpoints probe ID
   omnihub credentials
@@ -43,6 +46,7 @@ const usage = `usage:
   omnihub channels
   omnihub channels apply < direct-feed.json
   omnihub channels apply-rsshub < rsshub-channel.json
+  omnihub channels apply-provider < provider-channel.json
   omnihub channels disable ID --revision N
   omnihub channels probe ID
   omnihub opml import --egress-profile ID < subscriptions.opml
@@ -51,8 +55,12 @@ const usage = `usage:
   omnihub plan < operation.json
   omnihub latest < latest.json
   omnihub search < search.json
-  omnihub latest --feed-url URL --source ID --egress-mode direct|environment [--limit N] [--format json]
-  omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json]
+  omnihub fetch < fetch.json
+  omnihub latest|search|fetch --format jsonl < operation.json
+  omnihub latest --feed-url URL --source ID --egress-mode direct|environment [--limit N] [--format json|jsonl]
+  omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json|jsonl]
+  omnihub mcp
+  omnihub serve [--listen 127.0.0.1:8787]
 
 plan only selects declared channels; it never executes an upstream request.
 `
@@ -262,7 +270,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			value = catalogOutput{SchemaVersion: core.SchemaVersion, Endpoints: &endpoints}
 			break
 		}
-		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" && args[1] != "probe" {
+		if len(args) < 2 || args[1] != "apply" && args[1] != "apply-provider" && args[1] != "disable" && args[1] != "probe" {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
 		}
@@ -286,6 +294,28 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			endpoint, applyErr := service.ApplyEndpointProfile(context.Background(), input)
 			if applyErr != nil {
 				fmt.Fprintf(stderr, "omnihub: apply RSSHub endpoint: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = endpoint
+		case "apply-provider":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyProviderEndpointInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode provider endpoint: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			endpoint, applyErr := service.ApplyProviderEndpoint(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply provider endpoint: %v\n", applyErr)
 				return managementExitCode(applyErr)
 			}
 			value = endpoint
@@ -375,7 +405,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			value = catalogOutput{SchemaVersion: core.SchemaVersion, Channels: &channels}
 			break
 		}
-		if len(args) < 2 || args[1] != "apply" && args[1] != "apply-rsshub" && args[1] != "disable" && args[1] != "probe" {
+		if len(args) < 2 || args[1] != "apply" && args[1] != "apply-rsshub" && args[1] != "apply-provider" && args[1] != "disable" && args[1] != "probe" {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
 		}
@@ -421,6 +451,28 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			channel, applyErr := service.ApplyRSSHubChannel(context.Background(), input)
 			if applyErr != nil {
 				fmt.Fprintf(stderr, "omnihub: apply RSSHub channel: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = channel
+		case "apply-provider":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyProviderChannelInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode provider channel: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			channel, applyErr := service.ApplyProviderChannel(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply provider channel: %v\n", applyErr)
 				return managementExitCode(applyErr)
 			}
 			value = channel
@@ -561,14 +613,54 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			resultExitCode = exitConfig
 		}
 
-	case "latest", "search":
+	case "latest", "search", "fetch":
 		operationKind := core.OperationKind(args[0])
-		result, code := runQueryCommand(operationKind, args[1:], stdin, stderr)
-		if result == nil {
+		result, outputFormat, code := runQueryCommand(operationKind, args[1:], stdin, stderr)
+		if result.RequestID == "" {
+			return code
+		}
+		if outputFormat == "jsonl" {
+			if err := transport.WriteJSONL(stdout, result); err != nil {
+				fmt.Fprintf(stderr, "omnihub: encode JSONL result: %v\n", err)
+				return exitInternal
+			}
 			return code
 		}
 		value = result
 		resultExitCode = code
+
+	case "mcp":
+		if len(args) != 1 {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		if err := transport.RunMCPStdio(context.Background(), executeOperation); err != nil {
+			fmt.Fprintf(stderr, "omnihub: run MCP server: %v\n", err)
+			return exitInternal
+		}
+		return 0
+
+	case "serve":
+		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		listen := "127.0.0.1:8787"
+		flags.StringVar(&listen, "listen", listen, "literal loopback listen address")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || !loopbackListenAddress(listen) {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		handler, err := transport.NewHTTPHandler(executeOperation)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: construct HTTP server: %v\n", err)
+			return exitInternal
+		}
+		server := &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+		fmt.Fprintf(stderr, "omnihub: serving on http://%s\n", listen)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(stderr, "omnihub: serve: %v\n", err)
+			return exitInternal
+		}
+		return 0
 
 	default:
 		fmt.Fprint(stderr, usage)
@@ -597,55 +689,91 @@ type directFeedFlags struct {
 	deadlineMS int
 }
 
-func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (any, int) {
+func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (core.Envelope, string, int) {
+	outputFormat := "json"
+	if len(args) == 2 && args[0] == "--format" {
+		outputFormat, args = args[1], nil
+	}
+	if outputFormat != "json" && outputFormat != "jsonl" {
+		fmt.Fprintf(stderr, "omnihub: unsupported output format %q\n", outputFormat)
+		return core.Envelope{}, "", exitParameter
+	}
 	operation, transient, err := queryOperation(kind, args, stdin, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "omnihub: decode %s operation: %v\n", kind, err)
-		return nil, exitParameter
+		return core.Envelope{}, "", exitParameter
 	}
 
 	catalog, closeCatalog, err := loadCatalog(context.Background())
 	if err != nil {
 		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
-		return nil, exitConfig
+		return core.Envelope{}, "", exitConfig
 	}
 	defer closeCatalog()
 	if transient != nil {
 		catalog, err = catalog.WithEgressProfile(transient.egress)
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: configure direct feed egress: %v\n", err)
-			return nil, exitConfig
+			return core.Envelope{}, "", exitConfig
 		}
 		catalog, err = catalog.WithSourceAndChannel(transient.source, transient.channel)
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: configure direct feed: %v\n", err)
-			return nil, exitConfig
+			return core.Envelope{}, "", exitConfig
 		}
+		outputFormat = transient.format
 	}
 
-	paths, err := resolveCLIPaths()
-	if err != nil {
-		fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
-		return nil, exitConfig
-	}
-	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
-	service := query.Service{Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}}
-	envelope, err := service.Execute(context.Background(), catalog, operation)
+	envelope, err := executeCatalogOperation(context.Background(), catalog, operation)
 	if err != nil {
 		if errors.Is(err, router.ErrNoRoute) {
 			fmt.Fprintf(stderr, "omnihub: execute %s: %v\n", kind, err)
-			return nil, exitConfig
+			return core.Envelope{}, "", exitConfig
 		}
 		fmt.Fprintf(stderr, "omnihub: execute %s: %v\n", kind, err)
 		if errors.Is(err, core.ErrInvalidOperation) {
-			return nil, exitParameter
+			return core.Envelope{}, "", exitParameter
 		}
-		return nil, exitInternal
+		if errors.Is(err, transport.ErrExecutionConfiguration) {
+			return core.Envelope{}, "", exitConfig
+		}
+		return core.Envelope{}, "", exitInternal
 	}
 	if envelope.Status == core.StatusFailed {
-		return envelope, exitFailed
+		return envelope, outputFormat, exitFailed
 	}
-	return envelope, 0
+	return envelope, outputFormat, 0
+}
+
+func executeOperation(ctx context.Context, operation core.Operation) (core.Envelope, error) {
+	catalog, closeCatalog, err := loadCatalog(ctx)
+	if err != nil {
+		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
+	}
+	defer closeCatalog()
+	return executeCatalogOperation(ctx, catalog, operation)
+}
+
+func executeCatalogOperation(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+	paths, err := resolveCLIPaths()
+	if err != nil {
+		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
+	}
+	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
+	service := query.Service{
+		Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}, GitHub: adapter.GitHubAdapter{},
+		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{},
+	}
+	return service.Execute(ctx, catalog, operation)
+}
+
+func loopbackListenAddress(address string) bool {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || port == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func runRSSHubEndpointProbe(endpointID string, stderr io.Writer) (any, int) {
@@ -758,6 +886,7 @@ type transientDirectFeed struct {
 	source  core.Source
 	channel core.Channel
 	egress  core.EgressProfile
+	format  string
 }
 
 func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (core.Operation, *transientDirectFeed, error) {
@@ -769,11 +898,17 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 		case core.OperationSearch:
 			input, err := decodeStrictJSON[core.SearchInput](stdin)
 			return input.OperationRequest(), nil, err
+		case core.OperationFetch:
+			input, err := decodeStrictJSON[core.FetchInput](stdin)
+			return input.OperationRequest(), nil, err
 		default:
 			return core.Operation{}, nil, fmt.Errorf("unsupported operation %q", kind)
 		}
 	}
 
+	if kind == core.OperationFetch {
+		return core.Operation{}, nil, errors.New("fetch only accepts typed JSON input")
+	}
 	flags := flag.NewFlagSet(string(kind), flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	options := directFeedFlags{}
@@ -781,7 +916,7 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	flags.StringVar(&options.source, "source", "", "logical source ID")
 	flags.StringVar(&options.egressMode, "egress-mode", "", "explicit transient egress (direct or environment)")
 	flags.StringVar(&options.query, "query", "", "bounded-window search query")
-	flags.StringVar(&options.format, "format", "json", "output format (json)")
+	flags.StringVar(&options.format, "format", "json", "output format (json or jsonl)")
 	flags.StringVar(&options.identity, "identity-dedupe", string(core.IdentityExact), "identity dedupe mode (exact or none)")
 	flags.StringVar(&options.from, "from", "", "inclusive RFC3339 lower time bound")
 	flags.StringVar(&options.to, "to", "", "inclusive RFC3339 upper time bound")
@@ -800,7 +935,7 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	if egressMode != core.EgressModeDirect && egressMode != core.EgressModeEnvironment {
 		return core.Operation{}, nil, errors.New("--egress-mode must be direct or environment for flag-based queries")
 	}
-	if options.format != "json" {
+	if options.format != "json" && options.format != "jsonl" {
 		return core.Operation{}, nil, fmt.Errorf("unsupported format %q", options.format)
 	}
 	if kind == core.OperationSearch && strings.TrimSpace(options.query) == "" {
@@ -848,6 +983,7 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 			EgressProfileID: egressID, Priority: 100, Enabled: true, Revision: 1,
 		},
 		egress: core.EgressProfile{ID: egressID, Mode: egressMode, Enabled: true, Revision: 1},
+		format: options.format,
 	}, nil
 }
 
@@ -1004,7 +1140,7 @@ func openReadManagementService(ctx context.Context) (management.Service, func(),
 }
 
 func managementExitCode(err error) int {
-	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidEgress) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) {
+	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidEgress) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) || errors.Is(err, management.ErrInvalidProviderConfig) {
 		return exitParameter
 	}
 	return exitConfig

@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -42,9 +44,24 @@ type RSSHubExecutor interface {
 	Execute(context.Context, adapter.RSSHubRequest) core.AdapterResult
 }
 
+type GitHubExecutor interface {
+	Execute(context.Context, adapter.GitHubRequest) core.AdapterResult
+}
+
+type TavilyExecutor interface {
+	Execute(context.Context, adapter.TavilyRequest) core.AdapterResult
+}
+
+type XURLExecutor interface {
+	Execute(context.Context, adapter.XURLRequest) core.AdapterResult
+}
+
 type Service struct {
 	Feed   FeedExecutor
 	RSSHub RSSHubExecutor
+	GitHub GitHubExecutor
+	Tavily TavilyExecutor
+	XURL   XURLExecutor
 	Now    func() time.Time
 }
 
@@ -195,6 +212,22 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		Mode:      egress.Mode,
 		Proxied:   false,
 	}
+	var endpoint core.EndpointProfile
+	if decision.Channel.EndpointProfileID != "" {
+		var exists bool
+		endpoint, exists = run.catalog.Endpoint(decision.Channel.EndpointProfileID)
+		if !exists {
+			return false, fmt.Errorf("%w: selected channel %s has no resolved endpoint", ErrInvalidExecutor, decision.Channel.ID)
+		}
+	}
+	var credential *core.Credential
+	if decision.Channel.CredentialID != "" {
+		resolved, exists := run.catalog.Credential(decision.Channel.CredentialID)
+		if !exists {
+			return false, fmt.Errorf("%w: selected channel %s has no resolved credential", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		credential = &resolved
+	}
 	var result core.AdapterResult
 	switch decision.RouteTemplate.Adapter {
 	case "feed":
@@ -212,21 +245,39 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		if run.service.RSSHub == nil {
 			return false, fmt.Errorf("%w: RSSHub executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
 		}
-		endpoint, endpointExists := run.catalog.Endpoint(decision.Channel.EndpointProfileID)
-		if !endpointExists {
-			return false, fmt.Errorf("%w: selected RSSHub channel %s has no resolved endpoint", ErrInvalidExecutor, decision.Channel.ID)
-		}
-		var credential *core.Credential
-		if decision.Channel.CredentialID != "" {
-			resolved, credentialExists := run.catalog.Credential(decision.Channel.CredentialID)
-			if !credentialExists {
-				return false, fmt.Errorf("%w: selected RSSHub channel %s has no resolved credential", ErrInvalidExecutor, decision.Channel.ID)
-			}
-			credential = &resolved
-		}
 		result = run.service.RSSHub.Execute(childContext, adapter.RSSHubRequest{
 			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "github":
+		if run.service.GitHub == nil {
+			return false, fmt.Errorf("%w: GitHub executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.GitHub.Execute(childContext, adapter.GitHubRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "tavily":
+		if run.service.Tavily == nil {
+			return false, fmt.Errorf("%w: Tavily executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		if credential == nil {
+			return false, fmt.Errorf("%w: selected Tavily channel %s has no resolved credential", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.Tavily.Execute(childContext, adapter.TavilyRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "xurl":
+		if run.service.XURL == nil {
+			return false, fmt.Errorf("%w: xurl executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		if credential == nil {
+			return false, fmt.Errorf("%w: selected xurl channel %s has no resolved credential", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.XURL.Execute(childContext, adapter.XURLRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Credential: credential, Egress: egress,
 		})
 	default:
 		reason := "unsupported_adapter"
@@ -255,7 +306,8 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 	default:
 		return false, fmt.Errorf("%w: adapter channel %s returned invalid egress_proxied state", ErrInvalidExecutor, decision.Channel.ID)
 	}
-	result, normalizeErr := normalizeAdapterResult(result, decision, execution.StartedAt)
+	provider, _ := run.catalog.Provider(decision.RouteTemplate.Provider)
+	result, normalizeErr := normalizeAdapterResult(result, decision, execution.StartedAt, provider.AllowsGlobalDiscovery)
 	if normalizeErr != nil {
 		return false, normalizeErr
 	}
@@ -270,7 +322,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			result.Coverage[index].Exhaustive = &exhaustive
 		}
 	}
-	if run.operation.Operation == core.OperationSearch {
+	if run.operation.Operation == core.OperationSearch && (decision.RouteTemplate.Adapter == "feed" || decision.RouteTemplate.Adapter == "rsshub") {
 		result.Items = filterSearchWindow(result.Items, *run.operation.Query)
 		result.Limitations = appendUnique(result.Limitations, localFeedWindowLimitation)
 		for index := range result.Coverage {
@@ -307,7 +359,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 	return false, nil
 }
 
-func normalizeAdapterResult(result core.AdapterResult, decision router.Decision, retrievedAt time.Time) (core.AdapterResult, error) {
+func normalizeAdapterResult(result core.AdapterResult, decision router.Decision, retrievedAt time.Time, allowDynamicSource bool) (core.AdapterResult, error) {
 	for index := range result.Coverage {
 		result.Coverage[index].Source = decision.Channel.Source
 		result.Coverage[index].ChannelID = decision.Channel.ID
@@ -323,11 +375,19 @@ func normalizeAdapterResult(result core.AdapterResult, decision router.Decision,
 	for itemIndex := range result.Items {
 		observations := slices.Clone(result.Items[itemIndex].Observations)
 		if len(observations) == 0 {
-			return core.AdapterResult{}, fmt.Errorf("%w: feed channel %s item %d has no observation", ErrInvalidExecutor, decision.Channel.ID, itemIndex)
+			return core.AdapterResult{}, fmt.Errorf("%w: adapter channel %s item %d has no observation", ErrInvalidExecutor, decision.Channel.ID, itemIndex)
 		}
 		for observationIndex := range observations {
 			observation := &observations[observationIndex]
-			observation.Source = decision.Channel.Source
+			if allowDynamicSource {
+				normalized, ok := normalizeDynamicSource(observation.Source)
+				if !ok {
+					return core.AdapterResult{}, fmt.Errorf("%w: global discovery channel %s item %d has an invalid source", ErrInvalidExecutor, decision.Channel.ID, itemIndex)
+				}
+				observation.Source = normalized
+			} else {
+				observation.Source = decision.Channel.Source
+			}
 			observation.Provider = decision.RouteTemplate.Provider
 			observation.ChannelID = decision.Channel.ID
 			observation.RouteTemplateID = decision.RouteTemplate.RouteTemplateID
@@ -347,6 +407,18 @@ func normalizeAdapterResult(result core.AdapterResult, decision router.Decision,
 	}
 	result.Limitations = slices.Clone(result.Limitations)
 	return result, nil
+}
+
+func normalizeDynamicSource(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || strings.ContainsAny(value, "/:@?#") {
+		return "", false
+	}
+	parsed, err := url.Parse("https://" + value)
+	if err != nil || parsed.Host != value || parsed.Hostname() == "" || parsed.Port() != "" || net.ParseIP(parsed.Hostname()) != nil {
+		return "", false
+	}
+	return value, true
 }
 
 func baseExecution(decision router.Decision, operation core.Operation) core.Execution {

@@ -6,15 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/management"
@@ -591,6 +595,65 @@ func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 	t.Fatal("transient feed health is missing")
 }
 
+func TestStageBFeedSampleBundleStaysSourceOnly(t *testing.T) {
+	ctx := context.Background()
+	bundlePath := "../../sources/feed-samples.yaml"
+	builtin := registry.BuiltinCatalog()
+	catalog, err := registry.Load(ctx, nil, bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceIDs := []string{"arxiv", "hacker-news", "youtube", "newsletter", "podcast"}
+	for _, sourceID := range sourceIDs {
+		source, ok := catalog.Source(sourceID)
+		if !ok || source.Origin != "imported" || !source.Enabled || !slices.Contains(source.Tags, "feed") {
+			t.Fatalf("feed sample source %s = %#v, %v", sourceID, source, ok)
+		}
+	}
+	if len(catalog.Channels()) != 0 || len(catalog.Providers()) != len(builtin.Providers()) || len(catalog.RouteTemplates()) != len(builtin.RouteTemplates()) {
+		t.Fatalf("Source-only Bundle added runtime routes: providers=%d/%d templates=%d/%d channels=%d",
+			len(catalog.Providers()), len(builtin.Providers()), len(catalog.RouteTemplates()), len(builtin.RouteTemplates()), len(catalog.Channels()))
+	}
+
+	store, err := sqlitestore.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	service := management.Service{Store: store, Catalog: catalog}
+	if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for index, sourceID := range sourceIDs {
+		channel, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: sourceID, ChannelID: "sample-" + sourceID, EgressProfileID: "direct",
+			URL: "https://feeds.example.com/" + sourceID + ".xml", Priority: len(sourceIDs) - index,
+		})
+		if err != nil || channel.RouteTemplateID != management.DirectFeedRouteTemplateID || channel.EgressProfileID != "direct" || channel.Revision != 1 {
+			t.Fatalf("configure sample Source %s = %#v, %v", sourceID, channel, err)
+		}
+	}
+	runtimeCatalog, err := registry.Load(ctx, store, bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels := make(map[string]core.Channel, len(sourceIDs))
+	for _, channel := range runtimeCatalog.Channels() {
+		channels[channel.ID] = channel
+	}
+	health := readiness.Doctor(runtimeCatalog, time.Date(2026, 8, 14, 17, 0, 0, 0, time.UTC))
+	if len(health.Channels) != len(sourceIDs) {
+		t.Fatalf("feed sample health channels = %#v", health.Channels)
+	}
+	for _, channel := range health.Channels {
+		configured, configuredOK := channels[channel.ChannelID]
+		template, ok := runtimeCatalog.RouteTemplate(configured.RouteTemplateID)
+		if !configuredOK || !ok || template.Adapter != "feed" || channel.Readiness == readiness.StateReady || channel.Readiness == readiness.StateReadyDependent {
+			t.Fatalf("feed sample channel claimed a specialized or ready route: %#v / %#v", template, channel)
+		}
+	}
+}
+
 type fakeFeedExecutor struct {
 	results  map[string]core.AdapterResult
 	calls    []string
@@ -603,8 +666,38 @@ type fakeRSSHubExecutor struct {
 	requests []adapter.RSSHubRequest
 }
 
+type fakeGitHubExecutor struct {
+	results  map[string]core.AdapterResult
+	requests []adapter.GitHubRequest
+}
+
+type fakeTavilyExecutor struct {
+	results  map[string]core.AdapterResult
+	requests []adapter.TavilyRequest
+}
+
+type fakeXURLExecutor struct {
+	results  map[string]core.AdapterResult
+	requests []adapter.XURLRequest
+}
+
 func (executor *fakeRSSHubExecutor) Execute(_ context.Context, request adapter.RSSHubRequest) core.AdapterResult {
 	executor.calls = append(executor.calls, request.Channel.ID)
+	executor.requests = append(executor.requests, request)
+	return executor.results[request.Channel.ID]
+}
+
+func (executor *fakeGitHubExecutor) Execute(_ context.Context, request adapter.GitHubRequest) core.AdapterResult {
+	executor.requests = append(executor.requests, request)
+	return executor.results[request.Channel.ID]
+}
+
+func (executor *fakeTavilyExecutor) Execute(_ context.Context, request adapter.TavilyRequest) core.AdapterResult {
+	executor.requests = append(executor.requests, request)
+	return executor.results[request.Channel.ID]
+}
+
+func (executor *fakeXURLExecutor) Execute(_ context.Context, request adapter.XURLRequest) core.AdapterResult {
 	executor.requests = append(executor.requests, request)
 	return executor.results[request.Channel.ID]
 }
@@ -666,6 +759,573 @@ func successfulFeedResult(items ...core.Item) core.AdapterResult {
 			Scope: "fixture-window", Examined: &examined, Exhaustive: &exhaustive,
 		}},
 	}
+}
+
+func stageBQueryCatalog(t *testing.T) *registry.Catalog {
+	t.Helper()
+	githubToken, tavilyKey, xToken := "github-fixture-token", "tavily-fixture-key", "xurl-fixture-token"
+	catalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "github", Enabled: true}, {ID: "tavily-discovery", Enabled: true}, {ID: "x", Enabled: true}},
+		[]core.Provider{
+			{ID: "github-api", Capabilities: []string{"search", "fetch"}, Enabled: true},
+			{ID: "tavily", Capabilities: []string{"search"}, AllowsGlobalDiscovery: true, Enabled: true},
+			{ID: "xurl", Capabilities: []string{"search"}, Enabled: true},
+		},
+		[]core.RouteTemplate{
+			{RouteTemplateID: "github", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "github", Capabilities: []string{"search", "fetch"}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "token"}, Limitations: []string{"github_repository_metadata_only"}},
+			{RouteTemplateID: "tavily", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"tavily-discovery"}}, Provider: "tavily", Adapter: "tavily", Capabilities: []string{"search"}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "api_key", Required: true}},
+			{RouteTemplateID: "xurl", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "xurl", Capabilities: []string{"search"}, Auth: core.AuthDescriptor{Kind: "app_only", Required: true}},
+		},
+		[]core.Channel{
+			{ID: "github", Source: "github", RouteTemplateID: "github", EndpointProfileID: "github-endpoint", CredentialID: "github-credential", Priority: 100, Enabled: true},
+			{ID: "tavily", Source: "tavily-discovery", RouteTemplateID: "tavily", EndpointProfileID: "tavily-endpoint", CredentialID: "tavily-credential", Parameters: map[string]any{"search_depth": "basic"}, Priority: 100, Enabled: true},
+			{ID: "xurl", Source: "x", RouteTemplateID: "xurl", EgressProfileID: "direct", CredentialID: "xurl-credential", Priority: 100, Enabled: true},
+		},
+		[]core.EndpointProfile{
+			{ID: "github-endpoint", Provider: "github-api", BaseURL: "https://api.github.com", EgressProfileID: "direct", Enabled: true},
+			{ID: "tavily-endpoint", Provider: "tavily", BaseURL: "https://api.tavily.com", EgressProfileID: "direct", Enabled: true},
+		},
+		[]core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
+		[]core.Credential{
+			{ID: "github-credential", Provider: "github-api", AuthKind: "token", Value: &githubToken, Enabled: true},
+			{ID: "tavily-credential", Provider: "tavily", AuthKind: "api_key", Value: &tavilyKey, Enabled: true},
+			{ID: "xurl-credential", Provider: "xurl", AuthKind: "app_only", Value: &xToken, Enabled: true},
+		}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func successfulProviderResult(source, title, target string) core.AdapterResult {
+	text := "provider-ranked result"
+	return successfulFeedResult(core.Item{
+		URL: target, Title: title, Content: core.Content{Role: core.ContentSnippet, Text: &text, SourceSupplied: true},
+		Observations: []core.Observation{{Source: source, OriginalURL: target, CanonicalURL: target, Verification: core.VerificationCandidate}},
+	})
+}
+
+func TestStageBQueryServiceProviderDispatchContracts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC)
+	catalog := stageBQueryCatalog(t)
+	github := &fakeGitHubExecutor{results: map[string]core.AdapterResult{
+		"github": successfulProviderResult("spoof.example", "Repository result", "https://github.com/acme/repository"),
+	}}
+	tavily := &fakeTavilyExecutor{results: map[string]core.AdapterResult{
+		"tavily": successfulProviderResult("Docs.Example.COM", "Web result", "https://docs.example.com/result"),
+	}}
+	xurl := &fakeXURLExecutor{results: map[string]core.AdapterResult{
+		"xurl": successfulProviderResult("spoof.example", "X result", "https://x.com/acme/status/1"),
+	}}
+	service := queryservice.Service{GitHub: github, Tavily: tavily, XURL: xurl, Now: func() time.Time { return fixedNow }}
+	operation := stage2Operation(core.OperationSearch, []string{"github", "tavily", "xurl"}, 10)
+	operation.RoutePolicy.Aggregate = true
+
+	envelope, err := service.Execute(context.Background(), catalog, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Status != core.StatusComplete || len(envelope.Items) != 3 || len(envelope.Executions) != 3 || len(envelope.Coverage) != 3 {
+		t.Fatalf("provider aggregate envelope = %#v", envelope)
+	}
+	if len(github.requests) != 1 || len(tavily.requests) != 1 || len(xurl.requests) != 1 {
+		t.Fatalf("provider dispatch counts GitHub/Tavily/xurl = %d/%d/%d", len(github.requests), len(tavily.requests), len(xurl.requests))
+	}
+	if request := github.requests[0]; request.Endpoint.ID != "github-endpoint" || request.Credential == nil || request.Credential.ID != "github-credential" || request.Egress.ID != "direct" || request.Operation.Operation != core.OperationSearch {
+		t.Fatalf("GitHub resolved request = %#v", request)
+	}
+	if request := tavily.requests[0]; request.Endpoint.ID != "tavily-endpoint" || request.Credential == nil || request.Credential.ID != "tavily-credential" || request.Egress.ID != "direct" || request.Operation.Operation != core.OperationSearch {
+		t.Fatalf("Tavily resolved request = %#v", request)
+	}
+	if request := xurl.requests[0]; request.Credential == nil || request.Credential.ID != "xurl-credential" || request.Egress.ID != "direct" || request.Operation.Operation != core.OperationSearch {
+		t.Fatalf("xurl resolved request = %#v", request)
+	}
+
+	// 专用 search Adapter 已按上游 query 排名；即使 Item 文本不含 needle，
+	// Query 也不能再套用 Feed bounded-window 的本地二次过滤。
+	sources := make(map[string]string, len(envelope.Items))
+	for _, item := range envelope.Items {
+		sources[item.Title] = item.Observations[0].Source
+	}
+	if sources["Repository result"] != "github" || sources["Web result"] != "docs.example.com" || sources["X result"] != "x" {
+		t.Fatalf("normalized provider sources = %#v", sources)
+	}
+	for _, execution := range envelope.Executions {
+		if slices.Contains(execution.Limitations, "local_feed_window_only") {
+			t.Fatalf("non-Feed execution was locally filtered: %#v", execution)
+		}
+	}
+	for _, coverage := range envelope.Coverage {
+		if slices.Contains(coverage.Limitations, "local_feed_window_only") {
+			t.Fatalf("non-Feed coverage was locally filtered: %#v", coverage)
+		}
+	}
+
+	target := "octo/repository"
+	github.results["github"] = successfulProviderResult("spoof.example", "Fetched repository", "https://github.com/octo/repository")
+	fetch := stage2Operation(core.OperationFetch, []string{"github"}, 1)
+	fetch.Target = &target
+	fetched, err := service.Execute(context.Background(), catalog, fetch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := github.requests[len(github.requests)-1]
+	if fetched.Status != core.StatusComplete || len(fetched.Items) != 1 || fetched.Executions[0].Capability != "fetch" || last.Operation.Target == nil || *last.Operation.Target != target {
+		t.Fatalf("GitHub fetch envelope/request = %#v / %#v", fetched, last)
+	}
+	if !slices.Equal(fetched.Executions[0].Limitations, []string{"github_repository_metadata_only"}) {
+		t.Fatalf("GitHub fetch limitations = %#v", fetched.Executions[0].Limitations)
+	}
+}
+
+func TestStageBDoctorReportsBuiltinProviderDependencies(t *testing.T) {
+	githubToken, tavilyKey, xToken := "github-token", "tavily-key", "xurl-token"
+	builtin := registry.BuiltinCatalog()
+	catalog, err := registry.NewCatalog(
+		builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(),
+		[]core.Channel{
+			{ID: "github", Source: "github", RouteTemplateID: "github-native-search", EndpointProfileID: "github-endpoint", CredentialID: "github-token", Enabled: true},
+			{ID: "tavily", Source: "tavily-discovery", RouteTemplateID: "tavily-search", EndpointProfileID: "tavily-endpoint", CredentialID: "tavily-key", Enabled: true},
+			{ID: "xurl", Source: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "direct", CredentialID: "xurl-token", Enabled: true},
+		},
+		[]core.EndpointProfile{
+			{ID: "github-endpoint", Provider: "github-api", BaseURL: "https://api.github.com", EgressProfileID: "direct", Enabled: true},
+			{ID: "tavily-endpoint", Provider: "tavily", BaseURL: "https://api.tavily.com", EgressProfileID: "direct", Enabled: true},
+		},
+		[]core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
+		[]core.Credential{
+			{ID: "github-token", Provider: "github-api", AuthKind: "token", Value: &githubToken, Enabled: true},
+			{ID: "tavily-key", Provider: "tavily", AuthKind: "api_key", Value: &tavilyKey, Enabled: true},
+			{ID: "xurl-token", Provider: "xurl", AuthKind: "app_only", Value: &xToken, Enabled: true},
+		}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	emptyPath := t.TempDir()
+	t.Setenv("PATH", emptyPath)
+	report := readiness.Doctor(catalog, time.Date(2026, 8, 14, 18, 0, 0, 0, time.UTC))
+	statuses := make(map[string]readiness.Check)
+	states := make(map[string]readiness.State)
+	for _, health := range report.Channels {
+		states[health.ChannelID] = health.Readiness
+		for _, check := range health.Checks {
+			if check.Kind == "dependency_installed" {
+				statuses[health.ChannelID] = check
+			}
+		}
+	}
+	if statuses["github"].Status != readiness.CheckPassed || statuses["tavily"].Status != readiness.CheckPassed || statuses["xurl"].Status != readiness.CheckFailed || statuses["xurl"].Code == nil || *statuses["xurl"].Code != "dependency_unavailable" || states["xurl"] != readiness.StateBlocked {
+		t.Fatalf("builtin dependency health = %#v / %#v", statuses, states)
+	}
+
+	executable := filepath.Join(emptyPath, "xurl")
+	content := []byte("#!/bin/sh\nexit 0\n")
+	if runtime.GOOS == "windows" {
+		executable += ".bat"
+		content = []byte("@exit /B 0\r\n")
+		t.Setenv("PATHEXT", ".BAT")
+	}
+	if err := os.WriteFile(executable, content, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	report = readiness.Doctor(catalog, time.Date(2026, 8, 14, 18, 1, 0, 0, time.UTC))
+	for _, health := range report.Channels {
+		if health.ChannelID != "xurl" {
+			continue
+		}
+		for _, check := range health.Checks {
+			if check.Kind == "dependency_installed" && check.Status != readiness.CheckPassed {
+				t.Fatalf("installed xurl dependency health = %#v", health)
+			}
+		}
+	}
+}
+
+func TestStageBProviderAggregatePreservesPartialFacts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 14, 15, 30, 0, 0, time.UTC)
+	github := &fakeGitHubExecutor{results: map[string]core.AdapterResult{
+		"github": successfulProviderResult("github", "Repository result", "https://github.com/acme/repository"),
+	}}
+	tavily := &fakeTavilyExecutor{results: map[string]core.AdapterResult{
+		"tavily": {Errors: []core.Error{{Code: core.ErrorRateLimit, Message: "Tavily rate limited", Retryable: true}}},
+	}}
+	xurl := &fakeXURLExecutor{results: map[string]core.AdapterResult{
+		"xurl": {Errors: []core.Error{{Code: core.ErrorUpstream, Message: "xurl upstream failed", Retryable: true}}},
+	}}
+	operation := stage2Operation(core.OperationSearch, []string{"github", "tavily", "xurl"}, 10)
+	operation.RoutePolicy.Aggregate = true
+	envelope, err := (queryservice.Service{
+		GitHub: github, Tavily: tavily, XURL: xurl, Now: func() time.Time { return fixedNow },
+	}).Execute(context.Background(), stageBQueryCatalog(t), operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Status != core.StatusPartial || len(envelope.Items) != 1 || len(envelope.Coverage) != 1 || len(envelope.Errors) != 2 || len(envelope.Executions) != 3 {
+		t.Fatalf("partial provider aggregate = %#v", envelope)
+	}
+	statuses := make(map[string]core.ExecutionStatus, len(envelope.Executions))
+	for _, execution := range envelope.Executions {
+		statuses[execution.ChannelID] = execution.Status
+	}
+	if statuses["github"] != core.ExecutionCompleted || statuses["tavily"] != core.ExecutionFailed || statuses["xurl"] != core.ExecutionFailed {
+		t.Fatalf("provider execution statuses = %#v", statuses)
+	}
+	problems := make(map[string]core.ErrorCode, len(envelope.Errors))
+	for _, problem := range envelope.Errors {
+		problems[problem.ChannelID] = problem.Code
+	}
+	if problems["tavily"] != core.ErrorRateLimit || problems["xurl"] != core.ErrorUpstream || envelope.Coverage[0].ChannelID != "github" {
+		t.Fatalf("provider coverage/errors = %#v / %#v", envelope.Coverage, envelope.Errors)
+	}
+}
+
+func transportFixtureEnvelope(t *testing.T, input core.SearchInput, failed bool) core.Envelope {
+	t.Helper()
+	started := time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC)
+	execution := core.Execution{
+		ChannelID: "fixture", RouteTemplateID: "fixture-search", Source: "fixture", Provider: "fixture-provider",
+		Capability: "search", Selection: core.SelectionPrimary, StartedAt: started, DurationMS: 1,
+		Egress: &core.ExecutionEgress{ProfileID: "direct", Mode: core.EgressModeDirect},
+	}
+	inputEnvelope := core.EnvelopeInput{
+		RequestID: "req_00000000-0000-4000-8000-000000000001", Request: input.OperationRequest(),
+		RequiredChannelIDs: []string{"fixture"}, Continuation: core.Continuation{Mode: "none", Limitations: []string{}},
+		StartedAt: started, FinishedAt: started.Add(time.Millisecond),
+	}
+	if failed {
+		reason := string(core.ErrorUpstream)
+		execution.Status, execution.Reason = core.ExecutionFailed, &reason
+		inputEnvelope.Executions = []core.Execution{execution}
+		inputEnvelope.Errors = []core.Error{{
+			Code: core.ErrorUpstream, Message: "fixture upstream failed", Source: "fixture", Provider: "fixture-provider",
+			ChannelID: "fixture", RouteTemplateID: "fixture-search", Retryable: true,
+		}}
+	} else {
+		examined, returned, exhaustive, rank := 1, 1, true, 1
+		text := "fixture result"
+		execution.Status, execution.Examined, execution.Returned = core.ExecutionCompleted, 1, 1
+		inputEnvelope.Executions = []core.Execution{execution}
+		inputEnvelope.Items = []core.Item{{
+			ID: "item_fixture", URL: "https://example.com/result", Title: "Fixture result",
+			Content: core.Content{Role: core.ContentSnippet, Text: &text, SourceSupplied: true},
+			Observations: []core.Observation{{
+				Source: "fixture", Provider: "fixture-provider", ChannelID: "fixture", RouteTemplateID: "fixture-search",
+				OriginalURL: "https://example.com/result", CanonicalURL: "https://example.com/result", RetrievedAt: started,
+				Rank: &rank, Verification: core.VerificationCandidate,
+			}},
+			Identity:   core.Identity{ClusterID: "idn_fixture", Reason: "canonical_url"},
+			Similarity: core.Similarity{Strategy: string(core.SimilarityOff)},
+		}}
+		inputEnvelope.Coverage = []core.Coverage{{
+			Source: "fixture", ChannelID: "fixture", RouteTemplateID: "fixture-search", Scope: "fixture",
+			Examined: &examined, Returned: &returned, Exhaustive: &exhaustive,
+		}}
+		inputEnvelope.Errors = []core.Error{}
+	}
+	envelope, err := core.BuildEnvelope(inputEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func assertJSONEquivalent(t *testing.T, got, want any) {
+	t.Helper()
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotJSON, wantJSON) {
+		t.Fatalf("JSON differs\ngot:  %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+func callMCPQuery(t *testing.T, execute ExecuteFunc, input core.SearchInput) *mcp.CallToolResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	server, err := NewMCPServer(execute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "omnihub-test", Version: "0.1.0"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	result, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: "omnihub_search", Arguments: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func operationHTTPRequest(method, path string, body []byte) *http.Request {
+	request := httptest.NewRequest(method, path, bytes.NewReader(body))
+	request.Host = "127.0.0.1:8787"
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	return request
+}
+
+func decodeJSONLEnvelope(t *testing.T, raw []byte) (core.Envelope, []string) {
+	t.Helper()
+	var envelope core.Envelope
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	types := make([]string, 0, len(lines))
+	for _, line := range lines {
+		var event struct {
+			Type               string            `json:"type"`
+			SchemaVersion      string            `json:"schema_version"`
+			RequestID          string            `json:"request_id"`
+			Request            core.Operation    `json:"request"`
+			SelectedChannelIDs []string          `json:"selected_channel_ids"`
+			Execution          core.Execution    `json:"execution"`
+			Item               core.Item         `json:"item"`
+			Status             core.Status       `json:"status"`
+			Coverage           []core.Coverage   `json:"coverage"`
+			Errors             []core.Error      `json:"errors"`
+			Continuation       core.Continuation `json:"continuation"`
+			Meta               core.Meta         `json:"meta"`
+		}
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		types = append(types, event.Type)
+		switch event.Type {
+		case "start":
+			envelope.SchemaVersion, envelope.RequestID, envelope.Request, envelope.SelectedChannelIDs = event.SchemaVersion, event.RequestID, event.Request, event.SelectedChannelIDs
+		case "execution":
+			envelope.Executions = append(envelope.Executions, event.Execution)
+		case "item":
+			envelope.Items = append(envelope.Items, event.Item)
+		case "end":
+			envelope.Status, envelope.Coverage, envelope.Errors = event.Status, event.Coverage, event.Errors
+			envelope.Continuation, envelope.Meta = event.Continuation, event.Meta
+		default:
+			t.Fatalf("unknown JSONL event %q", event.Type)
+		}
+	}
+	if err := envelope.Validate(); err != nil {
+		t.Fatalf("reconstructed JSONL envelope: %v", err)
+	}
+	return envelope, types
+}
+
+func TestStageBOperationRuntimeSurfacesAreEquivalent(t *testing.T) {
+	input := core.SearchInput{
+		SchemaVersion: core.SchemaVersion, Query: "fixture query", Scope: core.Scope{Channels: []string{"fixture"}},
+		RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto}, Limit: 10, IdentityDedupe: core.IdentityExact,
+		SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30_000,
+	}
+	want := transportFixtureEnvelope(t, input, false)
+	wantOperationJSON, err := json.Marshal(input.OperationRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	execute := ExecuteFunc(func(_ context.Context, operation core.Operation) (core.Envelope, error) {
+		got, err := json.Marshal(operation)
+		if err != nil || !bytes.Equal(got, wantOperationJSON) {
+			return core.Envelope{}, errors.New("transport changed the fixture Operation")
+		}
+		return want, nil
+	})
+	direct, err := execute(context.Background(), input.OperationRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEquivalent(t, direct, want)
+
+	handler, err := NewHTTPHandler(execute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := operationHTTPRequest(http.MethodPost, "/v1/search", body)
+	request.Header.Set("Origin", "http://127.0.0.1:8787")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("HTTP response = %d %s: %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
+	}
+	var httpEnvelope core.Envelope
+	if err := json.Unmarshal(recorder.Body.Bytes(), &httpEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEquivalent(t, httpEnvelope, want)
+
+	mcpResult := callMCPQuery(t, execute, input)
+	if mcpResult.IsError || mcpResult.StructuredContent == nil {
+		t.Fatalf("MCP complete result = %#v", mcpResult)
+	}
+	structured, err := json.Marshal(mcpResult.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mcpEnvelope core.Envelope
+	if err := json.Unmarshal(structured, &mcpEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEquivalent(t, mcpEnvelope, want)
+
+	var jsonl bytes.Buffer
+	if err := WriteJSONL(&jsonl, want); err != nil {
+		t.Fatal(err)
+	}
+	jsonlEnvelope, eventTypes := decodeJSONLEnvelope(t, jsonl.Bytes())
+	if !slices.Equal(eventTypes, []string{"start", "execution", "item", "end"}) {
+		t.Fatalf("JSONL event types = %v", eventTypes)
+	}
+	assertJSONEquivalent(t, jsonlEnvelope, want)
+}
+
+func TestStageBOperationRuntimeFailureContracts(t *testing.T) {
+	input := core.SearchInput{
+		SchemaVersion: core.SchemaVersion, Query: "fixture query", Scope: core.Scope{Channels: []string{"fixture"}},
+		RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto}, Limit: 10, IdentityDedupe: core.IdentityExact,
+		SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30_000,
+	}
+	validBody, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unknown map[string]any
+	if err := json.Unmarshal(validBody, &unknown); err != nil {
+		t.Fatal(err)
+	}
+	unknown["unexpected"] = true
+	unknownBody, _ := json.Marshal(unknown)
+	invalidSemantic := input
+	invalidSemantic.Limit = 0
+	invalidSemanticBody, _ := json.Marshal(invalidSemantic)
+
+	executeCalls := 0
+	handler, err := NewHTTPHandler(func(context.Context, core.Operation) (core.Envelope, error) {
+		executeCalls++
+		return core.Envelope{}, errors.New("invalid input reached ExecuteFunc")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{
+		"unknown field": unknownBody,
+		"multiple JSON": append(append([]byte{}, validBody...), []byte(`{}`)...),
+		"invalid limit": invalidSemanticBody,
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, operationHTTPRequest(http.MethodPost, "/v1/search", body))
+			if recorder.Code != http.StatusBadRequest || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "application/problem+json") {
+				t.Fatalf("invalid HTTP response = %d %s: %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
+			}
+			var problem struct {
+				Type, Title, Detail string
+				Status              int
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &problem); err != nil || problem.Type == "" || problem.Title == "" || problem.Detail == "" || problem.Status != http.StatusBadRequest {
+				t.Fatalf("RFC 9457 problem = %#v, %v", problem, err)
+			}
+		})
+	}
+	methodRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(methodRecorder, operationHTTPRequest(http.MethodGet, "/v1/search", nil))
+	if methodRecorder.Code != http.StatusMethodNotAllowed || methodRecorder.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("method response = %d %s", methodRecorder.Code, methodRecorder.Header().Get("Allow"))
+	}
+	for _, test := range []struct {
+		name   string
+		status int
+		mutate func(*http.Request)
+	}{
+		{name: "host", status: http.StatusForbidden, mutate: func(request *http.Request) { request.Host = "attacker.example" }},
+		{name: "origin", status: http.StatusForbidden, mutate: func(request *http.Request) { request.Header.Set("Origin", "https://attacker.example") }},
+		{name: "media type", status: http.StatusUnsupportedMediaType, mutate: func(request *http.Request) { request.Header.Set("Content-Type", "text/plain") }},
+	} {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			request := operationHTTPRequest(http.MethodPost, "/v1/search", validBody)
+			test.mutate(request)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != test.status || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "application/problem+json") {
+				t.Fatalf("protected HTTP response = %d %s: %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
+			}
+		})
+	}
+	if executeCalls != 0 {
+		t.Fatalf("rejected requests called ExecuteFunc %d times", executeCalls)
+	}
+	noRouteHandler, err := NewHTTPHandler(func(context.Context, core.Operation) (core.Envelope, error) {
+		return core.Envelope{}, router.ErrNoRoute
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noRouteRecorder := httptest.NewRecorder()
+	noRouteHandler.ServeHTTP(noRouteRecorder, operationHTTPRequest(http.MethodPost, "/v1/search", validBody))
+	if noRouteRecorder.Code != http.StatusConflict || !strings.HasPrefix(noRouteRecorder.Header().Get("Content-Type"), "application/problem+json") {
+		t.Fatalf("no-route HTTP response = %d %s: %s", noRouteRecorder.Code, noRouteRecorder.Header().Get("Content-Type"), noRouteRecorder.Body.String())
+	}
+	configHandler, err := NewHTTPHandler(func(context.Context, core.Operation) (core.Envelope, error) {
+		return core.Envelope{}, ErrExecutionConfiguration
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configRecorder := httptest.NewRecorder()
+	configHandler.ServeHTTP(configRecorder, operationHTTPRequest(http.MethodPost, "/v1/search", validBody))
+	if configRecorder.Code != http.StatusConflict || !strings.HasPrefix(configRecorder.Header().Get("Content-Type"), "application/problem+json") {
+		t.Fatalf("configuration HTTP response = %d %s: %s", configRecorder.Code, configRecorder.Header().Get("Content-Type"), configRecorder.Body.String())
+	}
+
+	failed := transportFixtureEnvelope(t, input, true)
+	failedExecute := ExecuteFunc(func(context.Context, core.Operation) (core.Envelope, error) { return failed, nil })
+	failedHandler, err := NewHTTPHandler(failedExecute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := operationHTTPRequest(http.MethodPost, "/v1/search", validBody)
+	failedHandler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway || recorder.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("failed HTTP response = %d %s: %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
+	}
+	var httpEnvelope core.Envelope
+	if err := json.Unmarshal(recorder.Body.Bytes(), &httpEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEquivalent(t, httpEnvelope, failed)
+
+	mcpResult := callMCPQuery(t, failedExecute, input)
+	if !mcpResult.IsError || mcpResult.StructuredContent == nil {
+		t.Fatalf("MCP failed result = %#v", mcpResult)
+	}
+	structured, err := json.Marshal(mcpResult.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mcpEnvelope core.Envelope
+	if err := json.Unmarshal(structured, &mcpEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	assertJSONEquivalent(t, mcpEnvelope, failed)
 }
 
 func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
@@ -992,7 +1652,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "similarity", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{}}
 		operation := stage2Operation(core.OperationLatest, []string{"similarity"}, 10)
-		operation.SimilarityGrouping = core.SimilarityTitle
+		operation.SimilarityGrouping = core.SimilarityGrouping("title")
 
 		_, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
 		if !errors.Is(err, core.ErrInvalidOperation) || len(feed.calls) != 0 {
@@ -1260,6 +1920,166 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		stored, err := store.LoadRoutingCatalog(ctx)
 		if err != nil || !slices.Equal(stored.Collections[0].ChannelIDs, []string{channel.ID}) || stored.Channels[1].RouteTemplateID == management.DirectFeedRouteTemplateID {
 			t.Fatalf("stored RSSHub configuration = %#v, %v", stored, err)
+		}
+	})
+
+	t.Run("provider endpoints credentials and channels preserve managed boundaries", func(t *testing.T) {
+		service, store := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+
+		githubEndpoint, err := service.ApplyProviderEndpoint(ctx, management.ApplyProviderEndpointInput{
+			ID: "github-official", Provider: "github-api", BaseURL: "HTTPS://API.GITHUB.COM:443/", EgressProfileID: "egress-direct",
+		})
+		if err != nil || githubEndpoint.Revision != 1 || githubEndpoint.Provider != "github-api" || githubEndpoint.BaseURL != "https://api.github.com" || githubEndpoint.Trust != "official" {
+			t.Fatalf("ApplyProviderEndpoint(GitHub) = %#v, %v", githubEndpoint, err)
+		}
+		if _, err := service.ApplyProviderEndpoint(ctx, management.ApplyProviderEndpointInput{
+			ID: githubEndpoint.ID, Provider: "github-api", BaseURL: githubEndpoint.BaseURL, EgressProfileID: "egress-direct",
+		}); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("ApplyProviderEndpoint(stale) error = %v, want ErrConflict", err)
+		}
+		githubEndpoint, err = service.ApplyProviderEndpoint(ctx, management.ApplyProviderEndpointInput{
+			ID: githubEndpoint.ID, Provider: "github-api", BaseURL: githubEndpoint.BaseURL, EgressProfileID: "egress-direct", ExpectedRevision: githubEndpoint.Revision,
+		})
+		if err != nil || githubEndpoint.Revision != 2 {
+			t.Fatalf("ApplyProviderEndpoint(update) = %#v, %v", githubEndpoint, err)
+		}
+		tavilyEndpoint, err := service.ApplyProviderEndpoint(ctx, management.ApplyProviderEndpointInput{
+			ID: "tavily-official", Provider: "tavily", BaseURL: "https://api.tavily.com", EgressProfileID: "egress-direct",
+		})
+		if err != nil || tavilyEndpoint.Provider != "tavily" || tavilyEndpoint.BaseURL != "https://api.tavily.com" || tavilyEndpoint.Revision != 1 {
+			t.Fatalf("ApplyProviderEndpoint(Tavily) = %#v, %v", tavilyEndpoint, err)
+		}
+		if _, err := service.ApplyProviderEndpoint(ctx, management.ApplyProviderEndpointInput{
+			ID: "tavily-mirror", Provider: "tavily", BaseURL: "https://search.example.com", EgressProfileID: "egress-direct",
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyProviderEndpoint(mirror) error = %v", err)
+		}
+
+		credentialInputs := []management.ApplyCredentialInput{
+			{ID: "cred-github", Provider: "github-api", AuthKind: "token", Label: "GitHub", Value: "github-secret-1234", Enabled: true},
+			{ID: "cred-tavily", Provider: "tavily", AuthKind: "api_key", Label: "Tavily", Value: "tavily-secret-5678", Enabled: true},
+			{ID: "cred-xurl", Provider: "xurl", AuthKind: "app_only", Label: "xurl", Value: "xurl-secret-9012", Enabled: true},
+			{ID: "cred-proxy", Provider: "egress", AuthKind: "basic", Label: "Proxy", Value: "user:proxy-secret", Enabled: true},
+		}
+		credentialRevisions := make(map[string]int64, len(credentialInputs))
+		for _, input := range credentialInputs {
+			summary, err := service.ApplyCredential(ctx, input)
+			if err != nil || summary.Revision != 1 || summary.Provider != input.Provider || summary.AuthKind != input.AuthKind || !summary.HasValue || summary.ValueMasked == input.Value {
+				t.Fatalf("ApplyCredential(%s) = %#v, %v", input.ID, summary, err)
+			}
+			credentialRevisions[input.ID] = summary.Revision
+		}
+		if _, err := service.ApplyCredential(ctx, management.ApplyCredentialInput{
+			ID: "unsupported", Provider: "tavily", AuthKind: "token", Value: "unsupported-secret", Enabled: true,
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyCredential(unsupported pair) error = %v", err)
+		}
+		if _, err := service.ApplyCredential(ctx, management.ApplyCredentialInput{
+			ID: "cred-github", Provider: "tavily", AuthKind: "api_key", Value: "replacement-secret", Enabled: true, ExpectedRevision: credentialRevisions["cred-github"],
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyCredential(cross-provider update) error = %v", err)
+		}
+		ignored := "must-not-be-listed"
+		if _, err := store.CreateCredential(ctx, core.Credential{ID: "ignored", Provider: "unknown", AuthKind: "token", Value: &ignored, Enabled: true, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		summaries, err := service.ListCredentialSummaries(ctx)
+		if err != nil || len(summaries) != len(credentialInputs) {
+			t.Fatalf("ListCredentialSummaries() = %#v, %v", summaries, err)
+		}
+		encodedSummaries, err := json.Marshal(summaries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, input := range credentialInputs {
+			if !bytes.Contains(encodedSummaries, []byte(input.ID)) || bytes.Contains(encodedSummaries, []byte(input.Value)) {
+				t.Fatalf("credential summary allowlist/redaction failed for %s: %s", input.ID, encodedSummaries)
+			}
+		}
+		if bytes.Contains(encodedSummaries, []byte("ignored")) || bytes.Contains(encodedSummaries, []byte(ignored)) {
+			t.Fatalf("credential summary exposed unsupported credential: %s", encodedSummaries)
+		}
+
+		githubChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-github", DisplayName: "GitHub anonymous", SourceID: "github", RouteTemplateID: "github-native-search",
+			EndpointProfileID: githubEndpoint.ID, Priority: 100, Enabled: true,
+		})
+		if err != nil || githubChannel.Revision != 1 || githubChannel.CredentialID != "" || githubChannel.EndpointProfileID != githubEndpoint.ID || githubChannel.EgressProfileID != "" || githubChannel.Parameters != nil {
+			t.Fatalf("ApplyProviderChannel(GitHub anonymous) = %#v, %v", githubChannel, err)
+		}
+		if _, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: githubChannel.ID, SourceID: "github", RouteTemplateID: "github-native-search", EndpointProfileID: githubEndpoint.ID, Enabled: true,
+		}); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("ApplyProviderChannel(stale GitHub) error = %v", err)
+		}
+		githubChannel, err = service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: githubChannel.ID, DisplayName: "GitHub anonymous updated", SourceID: "github", RouteTemplateID: "github-native-search",
+			EndpointProfileID: githubEndpoint.ID, Priority: 101, Enabled: true, ExpectedRevision: githubChannel.Revision,
+		})
+		if err != nil || githubChannel.Revision != 2 || githubChannel.Priority != 101 {
+			t.Fatalf("ApplyProviderChannel(update GitHub) = %#v, %v", githubChannel, err)
+		}
+
+		tavilyChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-tavily", SourceID: "tavily-discovery", RouteTemplateID: "tavily-search", EndpointProfileID: tavilyEndpoint.ID,
+			CredentialID: "cred-tavily", Parameters: map[string]any{
+				"search_depth": "advanced", "exclude_domains": []any{"Docs.Example.COM.", "docs.example.com", "api.example.com"},
+			}, Priority: 90, Enabled: true,
+		})
+		if err != nil || tavilyChannel.Revision != 1 || tavilyChannel.CredentialID != "cred-tavily" || tavilyChannel.Parameters["search_depth"] != "advanced" {
+			t.Fatalf("ApplyProviderChannel(Tavily) = %#v, %v", tavilyChannel, err)
+		}
+		assertJSONEquivalent(t, tavilyChannel.Parameters["exclude_domains"], []string{"docs.example.com", "api.example.com"})
+
+		xurlChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-xurl", SourceID: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-direct",
+			CredentialID: "cred-xurl", Priority: 80, Enabled: true,
+		})
+		if err != nil || xurlChannel.Revision != 1 || xurlChannel.EndpointProfileID != "" || xurlChannel.EgressProfileID != "egress-direct" || xurlChannel.CredentialID != "cred-xurl" {
+			t.Fatalf("ApplyProviderChannel(xurl) = %#v, %v", xurlChannel, err)
+		}
+		if _, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: githubChannel.ID, SourceID: "tavily-discovery", RouteTemplateID: "tavily-search", EndpointProfileID: tavilyEndpoint.ID,
+			CredentialID: "cred-tavily", Enabled: true, ExpectedRevision: githubChannel.Revision,
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyProviderChannel(cross-provider update) error = %v", err)
+		}
+
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{
+			ID: "egress-socks", Mode: core.EgressModeSOCKS5, ProxyEndpoint: "socks5://127.0.0.1:1080", Socks5DNS: core.Socks5DNSProxy, Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-xurl-socks", SourceID: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-socks", CredentialID: "cred-xurl", Enabled: true,
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyProviderChannel(xurl SOCKS5) error = %v", err)
+		}
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{
+			ID: "egress-http-auth", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:8080", CredentialID: "cred-proxy", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-xurl-auth-proxy", SourceID: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-http-auth", CredentialID: "cred-xurl", Enabled: true,
+		}); !errors.Is(err, management.ErrInvalidProviderConfig) {
+			t.Fatalf("ApplyProviderChannel(xurl authenticated proxy) error = %v", err)
+		}
+
+		stored, err := store.LoadRoutingCatalog(ctx)
+		if err != nil || len(stored.Endpoints) != 2 || len(stored.Channels) != 3 {
+			t.Fatalf("stored provider resources = %#v, %v", stored, err)
+		}
+		githubTemplate, _ := service.Catalog.RouteTemplate(githubChannel.RouteTemplateID)
+		tavilyTemplate, _ := service.Catalog.RouteTemplate(tavilyChannel.RouteTemplateID)
+		xurlTemplate, _ := service.Catalog.RouteTemplate(xurlChannel.RouteTemplateID)
+		if githubTemplate.Provider != "github-api" || githubTemplate.Auth.Kind != "token" || githubTemplate.Auth.Required ||
+			tavilyTemplate.Provider != "tavily" || tavilyTemplate.Auth.Kind != "api_key" || !tavilyTemplate.Auth.Required ||
+			xurlTemplate.Provider != "xurl" || xurlTemplate.Auth.Kind != "app_only" || !xurlTemplate.Auth.Required {
+			t.Fatalf("managed provider template contracts = %#v / %#v / %#v", githubTemplate, tavilyTemplate, xurlTemplate)
 		}
 	})
 
