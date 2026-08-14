@@ -18,12 +18,15 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/config"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/health"
 	"github.com/ylxmf2005/omnihub/internal/management"
 	"github.com/ylxmf2005/omnihub/internal/query"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
 	"github.com/ylxmf2005/omnihub/internal/registry"
+	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/router"
 	"github.com/ylxmf2005/omnihub/internal/store/sqlite"
+	"github.com/ylxmf2005/omnihub/internal/subscription"
 	"github.com/ylxmf2005/omnihub/internal/transport"
 )
 
@@ -48,7 +51,7 @@ const usage = `usage:
   omnihub channels apply-rsshub < rsshub-channel.json
   omnihub channels apply-provider < provider-channel.json
   omnihub channels disable ID --revision N
-  omnihub channels probe ID
+  omnihub channels probe ID [--idempotency-key KEY]
   omnihub opml import --egress-profile ID < subscriptions.opml
   omnihub opml export > subscriptions.opml
   omnihub doctor --json
@@ -59,8 +62,10 @@ const usage = `usage:
   omnihub latest|search|fetch --format jsonl < operation.json
   omnihub latest --feed-url URL --source ID --egress-mode direct|environment [--limit N] [--format json|jsonl]
   omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json|jsonl]
+  omnihub refresh VIEW_ID --idempotency-key KEY
+  omnihub maintenance prune [--apply]
   omnihub mcp
-  omnihub serve [--listen 127.0.0.1:8787]
+  omnihub serve [--listen 127.0.0.1:8787] [--dev-origin ORIGIN]
 
 plan only selects declared channels; it never executes an upstream request.
 `
@@ -95,19 +100,6 @@ type rssHubEndpointProbeOutput struct {
 	SchemaVersion     string                      `json:"schema_version"`
 	EndpointProfileID string                      `json:"endpoint_profile_id"`
 	Probe             adapter.RSSHubEndpointProbe `json:"probe"`
-}
-
-type rssHubChannelProbeOutput struct {
-	SchemaVersion     string                    `json:"schema_version"`
-	ChannelID         string                    `json:"channel_id"`
-	EndpointProfileID string                    `json:"endpoint_profile_id"`
-	Probe             adapter.RSSHubProbeReport `json:"probe"`
-}
-
-type directFeedChannelProbeOutput struct {
-	SchemaVersion string                  `json:"schema_version"`
-	ChannelID     string                  `json:"channel_id"`
-	Probe         adapter.FeedProbeReport `json:"probe"`
 }
 
 func main() {
@@ -498,11 +490,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			}
 			value = channel
 		case "probe":
-			if len(args) != 3 {
+			if len(args) < 3 {
 				fmt.Fprint(stderr, usage)
 				return exitParameter
 			}
-			probe, code := runChannelProbe(args[2], stderr)
+			flags := flag.NewFlagSet("channels probe", flag.ContinueOnError)
+			flags.SetOutput(stderr)
+			var idempotencyKey string
+			flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable key for this Probe request")
+			if err := flags.Parse(args[3:]); err != nil || flags.NArg() != 0 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			keyProvided := false
+			flags.Visit(func(option *flag.Flag) { keyProvided = keyProvided || option.Name == "idempotency-key" })
+			if keyProvided && (idempotencyKey == "" || idempotencyKey != strings.TrimSpace(idempotencyKey) || len(idempotencyKey) > 256) {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			probe, code := runChannelProbe(args[2], idempotencyKey, stderr)
 			if probe == nil {
 				return code
 			}
@@ -629,6 +635,105 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		value = result
 		resultExitCode = code
 
+	case "refresh":
+		if len(args) < 2 || strings.TrimSpace(args[1]) == "" || args[1] != strings.TrimSpace(args[1]) {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		flags := flag.NewFlagSet("refresh", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		var idempotencyKey string
+		flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable key for this refresh request")
+		if err := flags.Parse(args[2:]); err != nil || flags.NArg() != 0 || strings.TrimSpace(idempotencyKey) == "" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+
+		paths, err := resolveCLIPaths()
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
+			return exitConfig
+		}
+		store, err := sqlite.Open(context.Background(), paths.Database)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: open subscription store: %v\n", err)
+			return exitConfig
+		}
+		defer store.Close()
+		bundlePath := filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename)
+		load := func(ctx context.Context) (*registry.Catalog, error) {
+			return registry.Load(ctx, store, bundlePath)
+		}
+		instanceID, err := core.NewRequestID()
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: create refresh worker identity: %v\n", err)
+			return exitInternal
+		}
+		service := subscription.Service{
+			Store: store, LoadCatalog: load, Execute: executeCatalogOperation, InstanceID: instanceID,
+		}
+		run, _, err := service.CreateViewRefreshRun(context.Background(), args[1], idempotencyKey)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: create refresh run: %v\n", err)
+			switch {
+			case errors.Is(err, subscription.ErrInvalidRequest):
+				return exitParameter
+			case errors.Is(err, repository.ErrNotFound), errors.Is(err, repository.ErrIdempotency), errors.Is(err, subscription.ErrViewDisabled):
+				return exitConfig
+			default:
+				return exitInternal
+			}
+		}
+		now := time.Now().UTC()
+		if run.Status == core.RunQueued || run.Status == core.RunRunning && (run.LeaseExpiresAt == nil || !run.LeaseExpiresAt.After(now)) {
+			run, err = service.ProcessRun(context.Background(), run.ID)
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: process refresh run: %v\n", err)
+				return exitInternal
+			}
+		}
+		value = run
+		if run.Status == core.RunFailed {
+			resultExitCode = exitFailed
+		}
+
+	case "maintenance":
+		if len(args) < 2 || args[1] != "prune" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		flags := flag.NewFlagSet("maintenance prune", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		var apply bool
+		flags.BoolVar(&apply, "apply", false, "delete expired records instead of only counting them")
+		if err := flags.Parse(args[2:]); err != nil || flags.NArg() != 0 {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		paths, err := resolveCLIPaths()
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
+			return exitConfig
+		}
+		store, err := sqlite.Open(context.Background(), paths.Database)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: open maintenance store: %v\n", err)
+			return exitConfig
+		}
+		defer store.Close()
+		now := time.Now().UTC()
+		result, err := store.Prune(context.Background(), repository.Prune{
+			DryRun: !apply, RunFinishedBefore: now.Add(-30 * 24 * time.Hour),
+			ProbeCheckedBefore: now.Add(-30 * 24 * time.Hour),
+			// Tombstone 在创建时已经固化 180 天 expires_at，清理当前已到期记录即可。
+			TombstoneExpiresBefore: now,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: prune retention records: %v\n", err)
+			return exitInternal
+		}
+		value = result
+
 	case "mcp":
 		if len(args) != 1 {
 			fmt.Fprint(stderr, usage)
@@ -644,15 +749,93 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		flags.SetOutput(stderr)
 		listen := "127.0.0.1:8787"
+		devOrigin := ""
 		flags.StringVar(&listen, "listen", listen, "literal loopback listen address")
+		flags.StringVar(&devOrigin, "dev-origin", devOrigin, "one explicit loopback Dashboard development origin")
 		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || !loopbackListenAddress(listen) {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
 		}
-		handler, err := transport.NewHTTPHandler(executeOperation)
+
+		paths, err := resolveCLIPaths()
 		if err != nil {
-			fmt.Fprintf(stderr, "omnihub: construct HTTP server: %v\n", err)
+			fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
+			return exitConfig
+		}
+		store, err := sqlite.Open(context.Background(), paths.Database)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: open serve store: %v\n", err)
+			return exitConfig
+		}
+		defer store.Close()
+		bundlePath := filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename)
+		load := func(ctx context.Context) (*registry.Catalog, error) {
+			return registry.Load(ctx, store, bundlePath)
+		}
+		catalog, err := load(context.Background())
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: load serve catalog: %v\n", err)
+			return exitConfig
+		}
+		instanceID, err := core.NewRequestID()
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: create serve instance identity: %v\n", err)
 			return exitInternal
+		}
+		execute := func(ctx context.Context, operation core.Operation) (core.Envelope, error) {
+			current, loadErr := load(ctx)
+			if loadErr != nil {
+				return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, loadErr)
+			}
+			return executeCatalogOperation(ctx, current, operation)
+		}
+		managementService := &management.Service{Store: store, Catalog: catalog}
+		subscriptionService := &subscription.Service{
+			Store: store, LoadCatalog: load, Execute: executeCatalogOperation, InstanceID: instanceID,
+		}
+		readinessReport := func(ctx context.Context) (readiness.Report, error) {
+			current, loadErr := load(ctx)
+			if loadErr != nil {
+				return readiness.Report{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, loadErr)
+			}
+			now := time.Now().UTC()
+			// Store 的 limit 约束历史行，不按 Channel 分组；逐 Channel 读取可避免
+			// 一个频繁 Probe 的来源把其他来源的有效健康事实挤出窗口。
+			records := make([]core.ChannelProbeRecord, 0, len(current.Channels()))
+			for _, channel := range current.SortedChannels() {
+				values, listErr := store.ListProbeHealth(ctx, repository.ProbeHealthFilter{
+					ChannelID: channel.ID, ActiveAt: now, Limit: 1,
+				})
+				if listErr != nil {
+					return readiness.Report{}, listErr
+				}
+				records = append(records, values...)
+			}
+			return readiness.FromProbeHealth(current, records, now), nil
+		}
+		probe := func(ctx context.Context, channelID, idempotencyKey string) (core.Run, error) {
+			current, loadErr := load(ctx)
+			if loadErr != nil {
+				return core.Run{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, loadErr)
+			}
+			service := health.Service{Store: store, Catalog: current, InstanceID: instanceID}
+			run, created, createErr := service.CreateProbeRun(ctx, channelID, idempotencyKey)
+			if createErr != nil {
+				return core.Run{}, createErr
+			}
+			now := time.Now().UTC()
+			if created || run.Status == core.RunQueued || run.Status == core.RunRunning && (run.LeaseExpiresAt == nil || !run.LeaseExpiresAt.After(now)) {
+				go func() { _, _ = service.ProcessRun(context.Background(), run.ID) }()
+			}
+			return run, nil
+		}
+		handler, err := transport.NewDashboardHTTPHandler(transport.DashboardHTTPDependencies{
+			Execute: execute, LoadCatalog: load, Management: managementService, Subscription: subscriptionService,
+			Readiness: readinessReport, Probe: probe, Version: "0.1.0", InstanceID: instanceID, DevOrigin: devOrigin,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: construct Dashboard HTTP server: %v\n", err)
+			return exitParameter
 		}
 		server := &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 		fmt.Fprintf(stderr, "omnihub: serving on http://%s\n", listen)
@@ -806,80 +989,56 @@ func runRSSHubEndpointProbe(endpointID string, stderr io.Writer) (any, int) {
 	return rssHubEndpointProbeOutput{SchemaVersion: core.SchemaVersion, EndpointProfileID: endpoint.ID, Probe: probe}, code
 }
 
-func runChannelProbe(channelID string, stderr io.Writer) (any, int) {
-	catalog, closeCatalog, err := loadCatalog(context.Background())
+func runChannelProbe(channelID, idempotencyKey string, stderr io.Writer) (any, int) {
+	paths, err := resolveCLIPaths()
 	if err != nil {
-		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+		fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
 		return nil, exitConfig
 	}
-	defer closeCatalog()
-	channel, ok := catalog.Channel(strings.TrimSpace(channelID))
-	if !ok {
-		fmt.Fprintf(stderr, "omnihub: probe channel: channel %q is not configured\n", channelID)
-		return nil, exitConfig
-	}
-	template, ok := catalog.RouteTemplate(channel.RouteTemplateID)
-	if !ok || template.Adapter != "feed" && template.Adapter != "rsshub" {
-		fmt.Fprintf(stderr, "omnihub: probe channel: channel %q has no supported probe adapter\n", channelID)
-		return nil, exitConfig
-	}
-	egressProfile, egressCredential, reason := router.ResolveEgress(catalog, channel)
-	if reason != "" {
-		fmt.Fprintf(stderr, "omnihub: probe channel: egress is unavailable (%s)\n", reason)
-		return nil, exitConfig
-	}
-	operation := core.Operation{
-		SchemaVersion: core.SchemaVersion, Operation: core.OperationLatest,
-		Scope: core.Scope{Channels: []string{channel.ID}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
-		Limit: 100, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
-	}
-	ctx, cancel, err := operation.Context(context.Background())
+	store, err := sqlite.Open(context.Background(), paths.Database)
 	if err != nil {
-		fmt.Fprintf(stderr, "omnihub: probe channel: %v\n", err)
+		fmt.Fprintf(stderr, "omnihub: open channel Probe store: %v\n", err)
+		return nil, exitConfig
+	}
+	defer store.Close()
+	catalog, err := registry.Load(context.Background(), store, filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename))
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: load channel Probe catalog: %v\n", err)
+		return nil, exitConfig
+	}
+	instanceID, err := core.NewRequestID()
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: create channel Probe identity: %v\n", err)
 		return nil, exitInternal
 	}
-	defer cancel()
-
-	if template.Adapter == "feed" {
-		probe := (adapter.FeedAdapter{}).Probe(ctx, adapter.FeedRequest{
-			Operation: operation, Channel: channel, RouteTemplate: template,
-			Egress: egressProfile, EgressCredential: egressCredential,
-		})
-		code := 0
-		if len(probe.Result.Errors) > 0 {
-			code = exitFailed
-			if probe.Result.Errors[0].Code == core.ErrorConfig {
-				code = exitConfig
-			}
-		}
-		return directFeedChannelProbeOutput{SchemaVersion: core.SchemaVersion, ChannelID: channel.ID, Probe: probe}, code
+	if idempotencyKey == "" {
+		idempotencyKey = instanceID
 	}
-
-	endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
-	if !ok {
-		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: endpoint %q is not configured\n", channel.EndpointProfileID)
-		return nil, exitConfig
-	}
-	var credential *core.Credential
-	if channel.CredentialID != "" {
-		resolved, exists := catalog.Credential(channel.CredentialID)
-		if !exists || !resolved.Enabled || resolved.Value == nil {
-			fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: credential %q is unresolved\n", channel.CredentialID)
+	service := health.Service{Store: store, Catalog: catalog, InstanceID: instanceID}
+	run, _, err := service.CreateProbeRun(context.Background(), strings.TrimSpace(channelID), idempotencyKey)
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: create channel Probe run: %v\n", err)
+		if errors.Is(err, repository.ErrNotFound) || errors.Is(err, repository.ErrIdempotency) || errors.Is(err, health.ErrInvalidProbeRun) {
 			return nil, exitConfig
 		}
-		credential = &resolved
+		return nil, exitInternal
 	}
-	probe := (adapter.RSSHubAdapter{}).Probe(ctx, adapter.RSSHubRequest{
-		Operation: operation, Channel: channel, RouteTemplate: template, Endpoint: endpoint, Credential: credential,
-		Egress: egressProfile, EgressCredential: egressCredential,
-	})
+	now := time.Now().UTC()
+	if run.Status == core.RunQueued || run.Status == core.RunRunning && (run.LeaseExpiresAt == nil || !run.LeaseExpiresAt.After(now)) {
+		run, err = service.ProcessRun(context.Background(), run.ID)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: process channel Probe run: %v\n", err)
+			return nil, exitInternal
+		}
+	}
 	code := 0
-	if probe.Readiness == "failed" {
+	if run.Status == core.RunFailed {
 		code = exitFailed
+		if run.LastError != nil && run.LastError.Code == core.ErrorConfig {
+			code = exitConfig
+		}
 	}
-	return rssHubChannelProbeOutput{
-		SchemaVersion: core.SchemaVersion, ChannelID: channel.ID, EndpointProfileID: endpoint.ID, Probe: probe,
-	}, code
+	return run, code
 }
 
 type transientDirectFeed struct {
@@ -1077,13 +1236,13 @@ func loadCatalog(ctx context.Context) (*registry.Catalog, func(), error) {
 
 func openCatalogStore(ctx context.Context, databasePath string) (*sqlite.Store, error) {
 	// Registry/Doctor/Plan 是读取入口。只接受已经完成当前 migration 的
-	// SQLite v2，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
+	// SQLite v3，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
 	version, err := sqlite.SchemaVersion(ctx, databasePath)
 	if err != nil {
 		return nil, err
 	}
-	if version != 2 {
-		return nil, fmt.Errorf("SQLite schema version %d requires initialization or migration to version 2", version)
+	if version != 3 {
+		return nil, fmt.Errorf("SQLite schema version %d requires initialization or migration to version 3", version)
 	}
 	return sqlite.OpenReadOnly(ctx, databasePath)
 }

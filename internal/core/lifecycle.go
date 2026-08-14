@@ -144,12 +144,18 @@ func (envelope Envelope) Validate() error {
 			if execution.Egress == nil || !validExecutionEgress(*execution.Egress) {
 				return fmt.Errorf("%w: execution %d has invalid egress facts", ErrInvalidEnvelope, index)
 			}
+			if (execution.Status == ExecutionFailed && execution.FreshUntil != nil) || !validFreshUntil(execution.FreshUntil) {
+				return fmt.Errorf("%w: execution %d has invalid freshness facts", ErrInvalidEnvelope, index)
+			}
 		case ExecutionSkipped:
 			if !execution.StartedAt.IsZero() || execution.DurationMS != 0 {
 				return fmt.Errorf("%w: skipped execution %d contains runtime timing", ErrInvalidEnvelope, index)
 			}
 			if execution.Egress != nil && !validExecutionEgress(*execution.Egress) {
 				return fmt.Errorf("%w: skipped execution %d has invalid egress facts", ErrInvalidEnvelope, index)
+			}
+			if execution.FreshUntil != nil {
+				return fmt.Errorf("%w: skipped execution %d contains freshness facts", ErrInvalidEnvelope, index)
 			}
 		default:
 			return fmt.Errorf("%w: execution %d has unsupported status %q", ErrInvalidEnvelope, index, execution.Status)
@@ -218,12 +224,18 @@ func (input EnvelopeInput) validate() error {
 			if execution.Egress == nil || !validExecutionEgress(*execution.Egress) {
 				return fmt.Errorf("%w: execution %d requires valid egress facts", ErrInvalidEnvelope, index)
 			}
+			if (execution.Status == ExecutionFailed && execution.FreshUntil != nil) || !validFreshUntil(execution.FreshUntil) {
+				return fmt.Errorf("%w: execution %d has invalid freshness facts", ErrInvalidEnvelope, index)
+			}
 		case ExecutionSkipped:
 			if !execution.StartedAt.IsZero() || execution.DurationMS != 0 {
 				return fmt.Errorf("%w: skipped execution %d must not contain runtime timing", ErrInvalidEnvelope, index)
 			}
 			if execution.Egress != nil && !validExecutionEgress(*execution.Egress) {
 				return fmt.Errorf("%w: skipped execution %d has invalid egress facts", ErrInvalidEnvelope, index)
+			}
+			if execution.FreshUntil != nil {
+				return fmt.Errorf("%w: skipped execution %d contains freshness facts", ErrInvalidEnvelope, index)
 			}
 		default:
 			return fmt.Errorf("%w: execution %d has unsupported status %q", ErrInvalidEnvelope, index, execution.Status)
@@ -301,6 +313,14 @@ func validExecutionEgress(egress ExecutionEgress) bool {
 	default:
 		return false
 	}
+}
+
+func validFreshUntil(value *time.Time) bool {
+	if value == nil {
+		return true
+	}
+	_, offset := value.Zone()
+	return !value.IsZero() && offset == 0
 }
 
 func validErrorCode(code ErrorCode) bool {

@@ -1,11 +1,14 @@
 package readiness
 
 import (
+	"encoding/json"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/health"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/router"
 )
@@ -63,9 +66,20 @@ type ActionRequired struct {
 }
 
 type Report struct {
-	SchemaVersion string          `json:"schema_version"`
-	GeneratedAt   time.Time       `json:"generated_at"`
-	Channels      []ChannelHealth `json:"channels"`
+	SchemaVersion string             `json:"schema_version"`
+	GeneratedAt   time.Time          `json:"generated_at"`
+	Channels      []ChannelHealth    `json:"channels"`
+	RouteGroups   []RouteGroupHealth `json:"route_groups"`
+}
+
+// RouteGroupHealth 只在同一执行语义经过不同 Egress 得到相反结果时出现。
+// 单个 Channel 的 Readiness 始终保留它自己的 Probe 事实。
+type RouteGroupHealth struct {
+	RouteGroup             string   `json:"route_group"`
+	Readiness              State    `json:"readiness"`
+	ChannelIDs             []string `json:"channel_ids"`
+	ReadyEgressProfileIDs  []string `json:"ready_egress_profile_ids"`
+	FailedEgressProfileIDs []string `json:"failed_egress_profile_ids"`
 }
 
 func Doctor(catalog *registry.Catalog, now time.Time) Report {
@@ -73,7 +87,43 @@ func Doctor(catalog *registry.Catalog, now time.Time) Report {
 	for _, channel := range catalog.SortedChannels() {
 		health = append(health, inspect(catalog, channel, now))
 	}
-	return Report{SchemaVersion: core.SchemaVersion, GeneratedAt: now.UTC(), Channels: health}
+	return Report{SchemaVersion: core.SchemaVersion, GeneratedAt: now.UTC(), Channels: health, RouteGroups: []RouteGroupHealth{}}
+}
+
+// FromProbeHealth 在 Doctor 的静态配置事实上应用仍有效的最新 Probe 记录。
+// 它是纯读取投影：不会因记录缺失或过期而发起 Probe。
+func FromProbeHealth(catalog *registry.Catalog, records []core.ChannelProbeRecord, now time.Time) Report {
+	report := Doctor(catalog, now)
+	latest := make(map[string]core.ChannelProbeRecord)
+	lastSuccess := make(map[string]time.Time)
+	for _, record := range records {
+		channel, ok := catalog.Channel(record.ChannelID)
+		if !ok || !currentProbeRecord(catalog, channel, record, now) {
+			continue
+		}
+		if previous, exists := latest[channel.ID]; !exists || newerProbeRecord(record, previous) {
+			latest[channel.ID] = record
+		}
+		if record.Passed && record.CheckedAt.After(lastSuccess[channel.ID]) {
+			lastSuccess[channel.ID] = record.CheckedAt.UTC()
+		}
+	}
+
+	active := make(map[string]core.ChannelProbeRecord, len(latest))
+	for index := range report.Channels {
+		channelHealth := &report.Channels[index]
+		record, ok := latest[channelHealth.ChannelID]
+		if !ok || channelHealth.Readiness != StateDegraded || !applyProbeRecord(channelHealth, record) {
+			continue
+		}
+		active[channelHealth.ChannelID] = record
+		if checkedAt, ok := lastSuccess[channelHealth.ChannelID]; ok {
+			value := checkedAt
+			channelHealth.LastSuccessfulProbeAt = &value
+		}
+	}
+	report.RouteGroups = aggregateRouteGroups(active)
+	return report
 }
 
 func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) ChannelHealth {
@@ -205,9 +255,13 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 	// 内建 Go Adapter 随二进制发布，因此安装状态可以确定；但普通 doctor
 	// 仍不发起网络请求，不能把“依赖存在”提升成“这个 Channel 已可达”。
 	switch {
-	case template.Origin == "builtin" && (template.Adapter == "feed" || template.Adapter == "rsshub" || template.Adapter == "github" || template.Adapter == "tavily"):
+	case template.Origin == "builtin" && (template.Adapter == "feed" || template.Adapter == "rsshub"):
 		addCheck("dependency_installed", CheckPassed, nil)
 		code := "upstream_not_probed"
+		addCheck("channel_probe", CheckUnknown, &code)
+	case template.Origin == "builtin" && (template.Adapter == "github" || template.Adapter == "tavily"):
+		addCheck("dependency_installed", CheckPassed, nil)
+		code := "probe_unsupported"
 		addCheck("channel_probe", CheckUnknown, &code)
 	case template.Origin == "builtin" && template.Adapter == "xurl":
 		if _, err := exec.LookPath("xurl"); err != nil {
@@ -219,7 +273,7 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 			return result
 		}
 		addCheck("dependency_installed", CheckPassed, nil)
-		code := "upstream_not_probed"
+		code := "probe_unsupported"
 		addCheck("channel_probe", CheckUnknown, &code)
 	default:
 		code := "dependency_not_probed"
@@ -228,5 +282,140 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 	if result.Readiness == StateUnknown {
 		result.Readiness = StateDegraded
 	}
+	return result
+}
+
+func currentProbeRecord(catalog *registry.Catalog, channel core.Channel, record core.ChannelProbeRecord, now time.Time) bool {
+	if record.Validate() != nil || record.ChannelRevision != channel.Revision || record.CheckedAt.After(now) || !record.ExpiresAt.After(now) {
+		return false
+	}
+	egress, _, reason := router.ResolveEgress(catalog, channel)
+	if reason != "" || record.Egress.ProfileID != egress.ID || record.Egress.Mode != egress.Mode || record.EgressRevision != egress.Revision {
+		return false
+	}
+	endpointRevision := int64(0)
+	if channel.EndpointProfileID != "" {
+		endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
+		if !ok {
+			return false
+		}
+		endpointRevision = endpoint.Revision
+	}
+	if record.EndpointRevision != endpointRevision {
+		return false
+	}
+	routeGroup, err := health.RouteGroupKey(catalog, channel)
+	return err == nil && routeGroup == record.RouteGroup
+}
+
+func newerProbeRecord(candidate, current core.ChannelProbeRecord) bool {
+	return candidate.CheckedAt.After(current.CheckedAt) || candidate.CheckedAt.Equal(current.CheckedAt) && candidate.ID > current.ID
+}
+
+func applyProbeRecord(channel *ChannelHealth, record core.ChannelProbeRecord) bool {
+	checkIndex := -1
+	for index := range channel.Checks {
+		if channel.Checks[index].Kind == "channel_probe" {
+			checkIndex = index
+			break
+		}
+	}
+	if checkIndex < 0 {
+		return false
+	}
+	expiresAt := record.ExpiresAt.UTC()
+	check := &channel.Checks[checkIndex]
+	check.CheckedAt, check.ExpiresAt = record.CheckedAt.UTC(), &expiresAt
+	if record.Passed {
+		check.Status, check.Code, check.Error = CheckPassed, nil, nil
+		channel.Readiness = StateReady
+		return true
+	}
+	degraded, problem := probeReportFacts(record.Report)
+	code := "probe_failed"
+	channel.Readiness = StateBlocked
+	if degraded || record.Transient {
+		code, channel.Readiness = "probe_degraded", StateDegraded
+	}
+	check.Status, check.Code, check.Error = CheckFailed, &code, problem
+	return true
+}
+
+func probeReportFacts(raw json.RawMessage) (bool, *core.Error) {
+	var report struct {
+		Readiness string `json:"readiness"`
+		Result    struct {
+			Errors []core.Error `json:"errors"`
+		} `json:"result"`
+		Feed struct {
+			Error *core.Error `json:"error"`
+		} `json:"feed"`
+		Metadata struct {
+			Error *core.Error `json:"error"`
+		} `json:"metadata"`
+		Endpoint struct {
+			Error *core.Error `json:"error"`
+		} `json:"endpoint"`
+	}
+	if json.Unmarshal(raw, &report) != nil {
+		return false, nil
+	}
+	if len(report.Result.Errors) > 0 {
+		problem := report.Result.Errors[0]
+		return report.Readiness == "degraded", &problem
+	}
+	for _, problem := range []*core.Error{report.Feed.Error, report.Metadata.Error, report.Endpoint.Error} {
+		if problem != nil {
+			copy := *problem
+			return report.Readiness == "degraded", &copy
+		}
+	}
+	return report.Readiness == "degraded", nil
+}
+
+func aggregateRouteGroups(records map[string]core.ChannelProbeRecord) []RouteGroupHealth {
+	type groupState struct {
+		channels map[string]bool
+		profiles map[string]core.ChannelProbeRecord
+	}
+	groups := make(map[string]*groupState)
+	for channelID, record := range records {
+		group := groups[record.RouteGroup]
+		if group == nil {
+			group = &groupState{channels: make(map[string]bool), profiles: make(map[string]core.ChannelProbeRecord)}
+			groups[record.RouteGroup] = group
+		}
+		group.channels[channelID] = true
+		profileID := record.Egress.ProfileID
+		if previous, ok := group.profiles[profileID]; !ok || newerProbeRecord(record, previous) {
+			group.profiles[profileID] = record
+		}
+	}
+
+	result := make([]RouteGroupHealth, 0, len(groups))
+	for routeGroup, group := range groups {
+		if len(group.profiles) < 2 {
+			continue
+		}
+		aggregate := RouteGroupHealth{RouteGroup: routeGroup, Readiness: StateReadyDependent}
+		for channelID := range group.channels {
+			aggregate.ChannelIDs = append(aggregate.ChannelIDs, channelID)
+		}
+		for profileID, record := range group.profiles {
+			if record.Passed {
+				aggregate.ReadyEgressProfileIDs = append(aggregate.ReadyEgressProfileIDs, profileID)
+			} else {
+				aggregate.FailedEgressProfileIDs = append(aggregate.FailedEgressProfileIDs, profileID)
+			}
+		}
+		if len(aggregate.ReadyEgressProfileIDs) == 0 || len(aggregate.FailedEgressProfileIDs) == 0 {
+			continue
+		}
+		sort.Strings(aggregate.ChannelIDs)
+		sort.Strings(aggregate.ReadyEgressProfileIDs)
+		sort.Strings(aggregate.FailedEgressProfileIDs)
+		result = append(result, aggregate)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].RouteGroup < result[right].RouteGroup })
 	return result
 }

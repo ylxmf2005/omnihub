@@ -401,6 +401,8 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) (fi
 			result.ProviderState["cache_status"] = "hit"
 			result.ProviderState["effective_url"] = cached.EffectiveURL
 			result.ProviderState["feed_type"] = feed.FeedType
+			freshUntil := cached.FreshUntil.UTC()
+			result.FreshUntil = &freshUntil
 			return normalizeFeedResult(request, result, feed, cached.EffectiveURL, now)
 		}
 		adapter.discardCache(ctx, cacheKey)
@@ -474,9 +476,13 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) (fi
 		return feedFailureResult(request, result, core.ErrorParse, "parse upstream feed", false, nil, nil)
 	}
 	result.ProviderState["feed_type"] = feed.FeedType
+	policy := deriveCachePolicy(responseHeader, body, now, cached, revalidated)
+	if !policy.noStore && !policy.freshUntil.IsZero() {
+		freshUntil := policy.freshUntil.UTC()
+		result.FreshUntil = &freshUntil
+	}
 
 	if adapter.Cache != nil {
-		policy := deriveCachePolicy(responseHeader, body, now, cached, revalidated)
 		if policy.noStore {
 			adapter.discardCache(ctx, cacheKey)
 			result.ProviderState["cache_status"] = "bypass"
@@ -921,6 +927,7 @@ func emptyFeedResult() core.AdapterResult {
 func feedFailureResult(request FeedRequest, result core.AdapterResult, code core.ErrorCode, message string, retryable bool, retryAfter *int, details map[string]any) core.AdapterResult {
 	result.Items = []core.Item{}
 	result.Coverage = []core.Coverage{}
+	result.FreshUntil = nil
 	result.Errors = []core.Error{{
 		Code:            code,
 		Message:         message,

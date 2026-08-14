@@ -1,4 +1,4 @@
-# Review：Stage B 代表 Provider 与 Agent Query 发布面
+# Review：Stage C Subscription、Dashboard Backend 与 Feed 分发
 
 ## Findings
 
@@ -7,22 +7,24 @@
 ## 裁决
 
 - 结论：`approve`
-- 对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-b-agent-query` 最终未提交工作树；GitHub/Tavily/xurl、Provider management、Query Service、CLI fetch/JSONL、REST/OpenAPI、MCP、Skill、Feed Source Bundle、Schema、README 与阶段产物的完整 Stage B diff。
-- Baseline：`origin/main@2f62019c775693dbc5bbd8889806139353a15dc7`。
-- 核心理由：三个代表 Provider 都从现有 Endpoint/Channel/Egress/Credential 合同 fail-closed；外部 HTTP 与 command trust boundary 有零请求/零进程负例、redirect/credential reflection/timeout 证据；统一 Operation Service 的 CLI/REST/MCP、aggregate partial、错误状态与来源链一致。首轮冷审的安全与契约缺陷已逐项重放关闭；最终独立 reviewer 未发现仍成立 P0–P2，全量 test/race/vet/diff 和 xurl timeout 连续 10 次通过。
+- 对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-c-subscriptions` 最终未提交工作树；View/Snapshot/Run/Probe/tombstone SQLite v3、Subscription/SWR、三种 Feed、Dashboard 管理 API、Query Workbench、CLI 装配、Schema、README 与阶段产物的完整 Stage C diff。
+- Baseline：Stage B `ec834a98da9b0b6bc2ed011a68c4742a2aba3d4a`。
+- 核心理由：承重状态转换由 Store 原子事务和 revision/lease CAS 约束；View 与 Routing Catalog 的双向竞态不会留下悬挂引用；Dashboard 只在 loopback/显式 dev Origin 暴露管理面，Credential 与 Probe 持久化边界经全文负例验证；真实 CLI/HTTP E2E闭合了 refresh 幂等、Feed 200→304、Probe→readiness 与显式 prune。独立冷审没有发现 P0–P2，补证后的全量 test/race/vet/diff 均通过。
 
 ## 影响面与证据边界
 
 - 已检查：
-  - Core Operation 校验、hostname/target 规范化、敏感 URL 边界、Similarity 当前只允许 off；
-  - builtin Source/Provider/RouteTemplate 与 user Endpoint/Channel/Credential/Egress 的管理、revision/CAS、Router、Doctor dependency；
-  - GitHub Repository search/fetch、匿名限制、rate-limit headers、canonical target、redirect、错误与 Token 脱敏；
-  - Tavily basic/advanced、limit/domain/TimeRange、动态 hostname Source、计费请求次数、redirect、错误与 Key 脱敏；
-  - xurl 固定 argv、`--` query delimiter、stdin Token、0700 isolated HOME、proxy env、SOCKS5 fail-closed、有界输出/timeout/cleanup 与 credential reflection；
-  - Query aggregate 的 complete/partial/failed、identity exact、Coverage/Execution/Error/Observation provenance 与 limitation 投影；
-  - CLI JSON/JSONL/exit、REST status/Host/Origin/Content-Type/OpenAPI、MCP stdio/Streamable HTTP tool schema 与 configuration 409；
-  - Skill prompt-injection 边界、Feed Bundle 只声明 Source、README 的安装/Quickstart/能力与未实现范围、Stage B Test Report。
-- 独立复核：首轮 reviewer 实际走通了四条候选缺陷：敏感 fetch query 进入失败 Envelope、GitHub fetch limitation 漂移、Schema/runtime domain/target 漂移、HTTP catalog load failure 误映射 500；修复后同一输入分别在 Core、transport、Schema 与端到端回归中关闭。最终复核又攻击了匿名 GitHub coverage、Tavily TimeRange 零网络、xurl `--help` query/`auth_used`、Doctor executable、Skill 外部文本与 rate-limit header 反射，均由代码门和运行证据推翻。
-- 已判定无关：Stage C 的 View/Snapshot/Run/Dashboard/Feed renderer、Stage D Chrome Bridge、Stage E semantic grouping/embedding、MySQL、多实例、系统 service manager、PAC/VPN/TUN 和自动出口 fallback 没有借 Stage B 进入；它们仍由后续阶段承担。
-- 证据缺口：没有真实 Tavily API Key 或 X app-only Token，因此只批准其真实 Adapter + 确定性 fixture 合同，不批准上游账号/quota/SLA 声明；Linux/Windows 仅交叉构建。JSON Schema 的 hostname regex 不表达单 label 63 字符上限、fetch Schema 不识别 credential-like query key，但服务端 `Operation.Validate` 在执行和 Envelope 前返回 400，不产生 secret 泄漏或错误 I/O，当前影响不足以形成 P2。
-- 剩余风险与下一位：Stage B 可以提交。Stage C 必须从当前同一 Operation Service 构建持久 View/Snapshot/Run 和 Dashboard Backend，不能在前端重造查询、错误或终态语义；真实 Tavily/X live E2E 等用户凭据可用时补做，但不阻断当前 preview。
+  - SQLite v2→v3 migration、future schema gate、View/Run/Probe/tombstone 完整往返与 current Snapshot pointer；
+  - Snapshot/checkpoint/tombstone/Run terminal 原子提交、故障回滚、旧 refresh 冲突、append-only 成本；
+  - View Operation 不可变、disabled/fresh/stale/empty、首次有界刷新、SWR singleflight 与失败保留旧 Snapshot；
+  - Observation/StateKey tombstone 的 A+B→B→A+B 路径，以及 current Snapshot 之外不暴露历史；
+  - Run idempotency、queued 重放恢复、claim/renew/lease expiry、terminal 不可重写与 Query/refresh/Probe 分工；
+  - Feed/RSSHub Probe 的成功/瞬时失败/确定失败 TTL、resource revision/expiry、严格 route-group、unsupported Provider 与脱敏 health 投影；
+  - Egress/Endpoint/Channel/Collection/View/Credential 的 Dashboard HTTP CRUD、强 If-Match、PATCH拒绝、in-use、revoke、mask/include-value/no-store；
+  - Host/Origin/CORS、body/media/method/413、RFC 9457、同步 Query/MCP/Feed 不开放 dev CORS；
+  - RSS/Atom/JSON Feed parser、ETag/Last-Modified/304、stale metadata 与零上游投影；
+  - CLI `serve`、`refresh`、持久 `channels probe`、`maintenance prune`、OpenAPI、README、三平台构建与清理回读。
+- 独立复核：冷审重新走通了 Snapshot/tombstone、Run lease、Store TOCTOU、Probe脱敏、Dashboard secret/CORS 与 Direct Feed `(canonical URL, Egress)` identity。候选问题“显式 Channel ID 不应迁移 Egress”被当前合同推翻；明确更新携带正确 revision 时允许用户主动换出口。补证阶段发现测试计划未直接证明失败 Probe TTL、全资源 HTTP CRUD 与 413，新增到既有测试文件后用相同真实服务路径通过，没有修改生产语义。
+- 已判定无关：Dashboard 前端、Chrome Extension/Native Host、semantic grouping、MySQL、多实例、scheduler、系统 service manager、PAC/VPN/TUN 与自动出口 fallback 没有借 Stage C 进入。
+- 证据缺口：Linux/Windows 仅交叉构建，未实机运行；真实 CLI E2E 使用本机 Feed fixture，RSS/Atom 由真实 transport parser fixture证明；Tavily/X live credential 与上游 SLA不属于本阶段。
+- 剩余风险与下一位：Stage C 可以提交。非当前 Snapshot 会继续占用磁盘，v0.1 没有历史 API 或 compaction；该成本已在 README/Task 公开。下一位从 `plan.md` Stage D 实现 Chrome Cookie Backend，不得把 mock Bridge 写成已有真实 Cookie Provider。

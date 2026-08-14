@@ -149,7 +149,7 @@ Dashboard v1 已确认包含临时 Query Workbench，只管理当前 loopback �
 
 ### REQ-022：配置写入一致性
 
-Dashboard 可写资源携带全局唯一 ID、`revision`、创建/更新时间和来源层级 `builtin | imported | user`。修改必须使用乐观并发，冲突时返回 409；创建 Run/refresh 支持 idempotency key。内建 RouteTemplate 默认只读，用户通过创建/启停 Channel 或 user overlay 个性化，避免升级覆盖本地修改。
+Dashboard 可写资源携带全局唯一 ID、`revision`、创建/更新时间和来源层级 `builtin | imported | user`。资源使用 `POST` 创建、`PUT + If-Match` 完整替换；v0.1 不实现 partial PATCH，也不兼容预发布的非标准 PATCH-as-replace。冲突返回 409；只有 Query Run、View refresh 与 Channel Probe 这类可触发外部执行的命令使用持久 idempotency key。内建 RouteTemplate 默认只读，用户通过创建/启停 Channel 或 user overlay 个性化，避免升级覆盖本地修改。View 的 Operation 创建后不可变；改变查询需创建新 View，已有 View 只更新名称和启用状态。
 
 ### REQ-023：Dashboard Credential 管理
 
@@ -195,7 +195,7 @@ Companion Extension 用 `chrome.runtime.connectNative()` 与 `omnihub chrome-hos
 
 Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoint 的 Channel 以目标连接×Egress 形成等价绑定。对外只披露 profile ID、mode 与本次是否经过代理，不返回代理密码或完整代理 URL。真正的 macOS System Proxy/PAC、VPN/TUN 和“自动选择最快线路”不属于该阶段。
 
-绑定规则只有一层：有 Endpoint 的 Channel 使用 `EndpointProfile.egress_profile_id`，自身不得再填 Egress；无 Endpoint 的 Channel 使用 `Channel.egress_profile_id`。同一 BaseURL 需要多个出口时创建多个 EndpointProfile，不增加 override/allowlist precedence。migration 允许旧字段为空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。无数据库的一次性 Direct Feed 由调用方显式构造 ephemeral Channel，并明确选择 `direct|environment`；代理仍只能引用已保存的 profile，不能在请求中传 proxy URL。
+绑定规则只有一层：有 Endpoint 的 Channel 使用 `EndpointProfile.egress_profile_id`，自身不得再填 Egress；无 Endpoint 的 Channel 使用 `Channel.egress_profile_id`。同一 BaseURL 需要多个出口时创建多个 EndpointProfile；同一 Direct Feed URL 需要多个出口时创建不同 ID、分别绑定 Egress 的 Channel，同 URL + 同 Egress 仍唯一；不增加 override/allowlist precedence。migration 允许旧字段为空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。无数据库的一次性 Direct Feed 由调用方显式构造 ephemeral Channel，并明确选择 `direct|environment`；代理仍只能引用已保存的 profile，不能在请求中传 proxy URL。
 
 ### REQ-030：主动分层网络 Probe（Stage A）
 
@@ -219,11 +219,11 @@ GitHub v1 只提供 Repository Search 与 Repository metadata fetch；Credential
 
 ### REQ-033：Dashboard 同源、删除与健康默认值
 
-生产 Dashboard 构建产物由同一 loopback `serve` Origin 提供；开发态只允许一个用户显式配置的 loopback Origin，拒绝 wildcard 与 `null`。资源删除不级联、不静默解绑；有引用的普通资源返回 `409 resource_in_use`，Credential 撤销必须清除值并让依赖 Channel 进入 blocked。`ready_dependent` 只聚合 Source、RouteTemplate、规范化目标、参数与 Credential revision 相同且仅 Egress 不同的路线。真实 Probe 成功证据默认 15 分钟、瞬时失败 5 分钟，本地确定事实随资源 revision 失效，过期不触发自动 Probe。
+生产 Dashboard 构建产物由同一 loopback `serve` Origin 提供；开发态只允许一个用户显式配置的 loopback Origin，拒绝 wildcard 与 `null`，且 CORS 只开放 Dashboard 管理与 Workbench 所需路由，不开放同步 Query、MCP 或 Feed。资源删除不级联、不静默解绑；有引用的普通资源返回 `409 resource_in_use`，Credential revoke 必须清除值并让依赖 Channel 进入 blocked。`ready_dependent` 只聚合 Source、RouteTemplate、规范化目标、参数与 Credential revision 相同且仅 Egress 不同的路线。真实 Probe 成功证据默认 15 分钟、瞬时失败 5 分钟、确定失败 15 分钟，本地确定事实随资源 revision 失效，过期不触发自动 Probe。Probe 历史只保存脱敏 network/HTTP/feed health 投影，不保存 Item、正文或响应 body；v0.1 的分层 Probe 只支持 Feed/RSSHub，其他 Provider 明确返回 unsupported。
 
 ### REQ-034：有界保留与发布边界
 
-每个 View 只保留最新成功 Snapshot；Run 与 Probe 历史保留 30 天，identity tombstone 180 天，无引用 embedding cache 30 天。清理由显式 maintenance、进程启动或外部 cron 触发，不增加内置 scheduler。Chrome v1 交付 Bridge、Native Host、安全校验与 mock consumer，Host manifest 只接受安装时给出的一个精确 Extension ID；没有真实 Cookie Channel 时不得宣称某来源已可用。OmniHub 只保证自身 Item/Observation URL 可追溯，并由 Skill 要求 Agent 披露 coverage，不审计任意最终自然语言。首个公开版本按 `0.1.x` preview 准备；首发交付三平台 archive、checksum 与 `go install`，包管理器和平台签名后置。普通卸载只移除二进制/Native Host 注册并保留用户数据。
+每个 View 在 SQLite 中只暴露 `current_view_snapshots` 指向的一份成功 Snapshot；Snapshot 内容 immutable append-only，新 Snapshot、当前指针、checkpoint、tombstone 与 Run 终态同事务提交，失败时旧指针与 Snapshot 完整保留。Snapshot 保存本次执行 StateKey，tombstone 只移除命中的 Observation，Item 仍有其他来源时必须保留。v3 migration 不读取旧 Snapshot，也不维护 preview 双合同；旧字节原样保留，升级不隐式删除用户数据。Disabled View 可读取既有 Snapshot，但手动、后台和读取触发都不得刷新；没有 Snapshot 时返回明确冲突。Run 与 Probe 历史保留 30 天，identity tombstone 180 天，无引用 embedding cache 30 天；非当前 Snapshot 在 v0.1 保留为不可见内部记录，不提供历史 API，也不由 maintenance 删除。只有真实磁盘增长证明需要 compaction 且用户明确授权不可逆清理后才扩展该边界。v1 只提供默认 dry-run 的显式 `omnihub maintenance prune`；用户或外部 cron 必须加 `--apply` 才实际删除 Run/Probe/tombstone，且 active Run 与未到期记录不能删除。`serve` 启动、普通 Query 与读取接口都不隐式清理，也不增加内置 scheduler。Chrome v1 交付 Bridge、Native Host、安全校验与 mock consumer，Host manifest 只接受安装时给出的一个精确 Extension ID；没有真实 Cookie Channel 时不得宣称某来源已可用。OmniHub 只保证自身 Item/Observation URL 可追溯，并由 Skill 要求 Agent 披露 coverage，不审计任意最终自然语言。首个公开版本按 `0.1.x` preview 准备；首发交付三平台 archive、checksum 与 `go install`，包管理器和平台签名后置。普通卸载只移除二进制/Native Host 注册并保留用户数据。
 
 ## 4. 非功能要求
 
@@ -277,7 +277,7 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 19. **semantic MVP**：近期本地向量方案调研后仍复用 SQLite BLOB + 精确 cosine，支持用户显式配置的本地 Ollama/OpenAI-compatible embedding；默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务；达到具名规模/延迟/ANN 阈值再重评 `sqlite-vec`。
 20. **代表 Provider**：GitHub repository metadata 且 Token 可选；Tavily basic 默认、最多 20 条、动态 hostname Source；xurl 只支持可诚实控制的 direct/environment/http_proxy。
 21. **Dashboard 默认值**：生产同源、开发单一显式 loopback Origin；普通资源不级联删除；严格 route group 才聚合 `ready_dependent`；成功/瞬时失败 Probe TTL 为 15/5 分钟。
-22. **保留与发布**：最新 Snapshot、30 天 Run/Probe、180 天 tombstone、30 天孤立 embedding；Chrome Host 精确 Extension ID、mock consumer；引用保证止于 OmniHub 输出；首发 `0.1.x` preview、archive/checksum/`go install`，普通卸载保留用户数据。
+22. **保留与发布**：每个 View 只暴露当前 Snapshot；30 天 Run/Probe、180 天 tombstone、30 天孤立 embedding；非当前 immutable Snapshot 暂不暴露或清理；Chrome Host 精确 Extension ID、mock consumer；引用保证止于 OmniHub 输出；首发 `0.1.x` preview、archive/checksum/`go install`，普通卸载保留用户数据。
 23. **升级与外部运行时**：SQLite 自动执行事务化、仅向前 migration，不支持 downgrade；OmniHub 只连接和诊断用户已有的 Ollama/OpenAI-compatible Endpoint，不负责安装、下载模型或启动 daemon。
 
 ## 7. 决策收口

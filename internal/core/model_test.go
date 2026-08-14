@@ -86,12 +86,14 @@ func TestOperationValidation(t *testing.T) {
 
 func TestEnvelopeValidateRejectsBypassedBuilder(t *testing.T) {
 	started := time.Date(2026, time.August, 13, 10, 0, 0, 0, time.UTC)
+	// 过期的上游 Expires 仍是有效事实，表示结果应立即进入 stale，而不是协议错误。
+	freshUntil := started.Add(-24 * time.Hour)
 	envelope, err := BuildEnvelope(EnvelopeInput{
 		RequestID: "req_123e4567-e89b-42d3-a456-426614174000", Request: validSearchOperation(),
 		RequiredChannelIDs: []string{"channel_primary"},
 		Executions: []Execution{{
 			ChannelID: "channel_primary", Selection: SelectionPrimary, Status: ExecutionCompleted, StartedAt: started,
-			Egress: &ExecutionEgress{ProfileID: "egress_direct", Mode: EgressModeDirect},
+			Egress: &ExecutionEgress{ProfileID: "egress_direct", Mode: EgressModeDirect}, FreshUntil: &freshUntil,
 		}},
 		StartedAt: started, FinishedAt: started.Add(time.Second),
 	})
@@ -100,6 +102,17 @@ func TestEnvelopeValidateRejectsBypassedBuilder(t *testing.T) {
 	}
 	if err := envelope.Validate(); err != nil {
 		t.Fatalf("valid Envelope.Validate() error = %v", err)
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip Envelope
+	if err := json.Unmarshal(raw, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if err := roundTrip.Validate(); err != nil || roundTrip.Executions[0].FreshUntil == nil || !roundTrip.Executions[0].FreshUntil.Equal(freshUntil) {
+		t.Fatalf("fresh_until round trip = %v, %v", roundTrip.Executions[0].FreshUntil, err)
 	}
 
 	cases := []struct {
@@ -119,10 +132,21 @@ func TestEnvelopeValidateRejectsBypassedBuilder(t *testing.T) {
 		{name: "unsupported egress mode", mutate: func(value *Envelope) {
 			value.Executions[0].Egress = &ExecutionEgress{ProfileID: "egress_direct", Mode: "automatic"}
 		}},
+		{name: "zero completed freshness", mutate: func(value *Envelope) {
+			zero := time.Time{}
+			value.Executions[0].FreshUntil = &zero
+		}},
+		{name: "non UTC completed freshness", mutate: func(value *Envelope) {
+			nonUTC := freshUntil.In(time.FixedZone("UTC+8", 8*60*60))
+			value.Executions[0].FreshUntil = &nonUTC
+		}},
+		{name: "failed freshness", mutate: func(value *Envelope) { value.Executions[0].Status = ExecutionFailed }},
+		{name: "skipped freshness", mutate: func(value *Envelope) { value.Executions[0].Status = ExecutionSkipped }},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			value := envelope
+			value.Executions = append([]Execution(nil), envelope.Executions...)
 			test.mutate(&value)
 			if err := value.Validate(); !errors.Is(err, ErrInvalidEnvelope) {
 				t.Fatalf("Envelope.Validate() error = %v, want ErrInvalidEnvelope", err)
@@ -313,6 +337,11 @@ func TestBuildEnvelopeRejectsInvalidInput(t *testing.T) {
 		{name: "completed without start", mutate: func(input *EnvelopeInput) { input.Executions[0].StartedAt = time.Time{} }},
 		{name: "negative execution duration", mutate: func(input *EnvelopeInput) { input.Executions[0].DurationMS = -1 }},
 		{name: "missing execution egress", mutate: func(input *EnvelopeInput) { input.Executions[0].Egress = nil }},
+		{name: "failed execution freshness", mutate: func(input *EnvelopeInput) {
+			freshUntil := started.Add(time.Hour)
+			input.Executions[0].Status = ExecutionFailed
+			input.Executions[0].FreshUntil = &freshUntil
+		}},
 		{name: "timed skipped execution", mutate: func(input *EnvelopeInput) {
 			input.Executions[0].Status = ExecutionSkipped
 			input.Executions[0].StartedAt = started

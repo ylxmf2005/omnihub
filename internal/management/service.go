@@ -77,6 +77,9 @@ type ApplyDirectFeedInput struct {
 	EgressProfileID    string             `json:"egress_profile_id"`
 	URL                string             `json:"url"`
 	Priority           int                `json:"priority"`
+	FallbackChannelIDs []string           `json:"fallback_channel_ids,omitempty"`
+	CollectionIDs      []string           `json:"collection_ids,omitempty"`
+	Enabled            *bool              `json:"enabled,omitempty"`
 	ExpectedRevision   int64              `json:"expected_revision"`
 	FeedMetadata       *core.FeedMetadata `json:"feed_metadata,omitempty"`
 }
@@ -206,8 +209,8 @@ func validateManagedCredential(provider, authKind, value string) error {
 	return fmt.Errorf("%w: unsupported or incomplete credential", managedCredentialError(provider, authKind))
 }
 
-// ListCredentialSummaries 返回受支持 Credential 的掩码摘要。它不提供任何
-// include-value 分支，避免 Stage 3 管理面意外扩大为 secret read API。
+// ListCredentialSummaries 返回受支持 Credential 的稳定掩码摘要。完整值
+// 只能通过 Dashboard detail 的显式 include-value 分支读取。
 func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.CredentialSummary, error) {
 	store, err := service.credentialStore()
 	if err != nil {
@@ -215,7 +218,7 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 	}
 	credentials, err := store.ListCredentials(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list RSSHub credentials: %w", err)
+		return nil, fmt.Errorf("list credentials: %w", err)
 	}
 	result := make([]core.CredentialSummary, 0, len(credentials))
 	for _, credential := range credentials {
@@ -227,6 +230,7 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 			result = append(result, summarizeCredential(credential))
 		}
 	}
+	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
 	return result, nil
 }
 
@@ -627,9 +631,18 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	}
 	channelIndex := indexChannels(working.Channels)
 
-	channelID := strings.TrimSpace(input.ChannelID)
+	explicitChannelID := strings.TrimSpace(input.ChannelID)
+	channelID := explicitChannelID
 	if channelID == "" {
-		channelID = stableChannelID(canonicalURL)
+		for _, candidate := range working.Channels {
+			candidateURL, ok := service.canonicalChannelFeedURL(candidate)
+			if ok && candidateURL == canonicalURL && candidate.EgressProfileID == egressID && (channelID == "" || candidate.ID < channelID) {
+				channelID = candidate.ID
+			}
+		}
+		if channelID == "" {
+			channelID = stableChannelID(directFeedRouteKey(canonicalURL, egressID))
+		}
 	}
 	if err := validateResourceID(channelID); err != nil {
 		return core.Channel{}, fmt.Errorf("%w: channel id: %v", ErrInvalidDirectFeed, err)
@@ -671,15 +684,18 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 		return core.Channel{}, fmt.Errorf("%w: template %s does not accept source %s", ErrInvalidDirectFeed, template.RouteTemplateID, sourceID)
 	}
 
-	// 同一规范化 Feed URL 只能指向一个 Direct Feed Channel，避免后续 OPML
-	// membership 与 Query 路由把同一订阅误当成两个独立执行单元。
+	// 同一规范化 Feed URL 在同一显式出口内只能指向一个 Direct Feed
+	// Channel；不同出口是可独立 Probe 与聚合的真实执行路线。
 	for index, candidate := range working.Channels {
 		if index == existingIndex && channelExists {
 			continue
 		}
 		candidateURL, ok := service.canonicalChannelFeedURL(candidate)
-		if ok && candidateURL == canonicalURL {
-			return core.Channel{}, fmt.Errorf("%w: feed URL is already owned by channel %s", repository.ErrConflict, candidate.ID)
+		if !ok || candidateURL != canonicalURL {
+			continue
+		}
+		if candidate.EgressProfileID == egressID {
+			return core.Channel{}, fmt.Errorf("%w: feed route is already owned by channel %s", repository.ErrConflict, candidate.ID)
 		}
 	}
 
@@ -709,6 +725,12 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	channel.Parameters = map[string]any{"url": canonicalURL}
 	channel.Priority = input.Priority
 	channel.Enabled = true
+	if input.Enabled != nil {
+		channel.Enabled = *input.Enabled
+	}
+	if input.FallbackChannelIDs != nil {
+		channel.FallbackChannelIDs = slices.Clone(input.FallbackChannelIDs)
+	}
 	if displayName := strings.TrimSpace(input.ChannelDisplayName); displayName != "" {
 		channel.DisplayName = displayName
 	} else if !channelExists {
@@ -723,6 +745,11 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	} else {
 		channel.Revision = 1
 		working.Channels = append(working.Channels, channel)
+	}
+	if input.CollectionIDs != nil {
+		if err := setChannelCollections(&working, channelID, input.CollectionIDs); err != nil {
+			return core.Channel{}, fmt.Errorf("%w: collection membership is invalid", ErrInvalidDirectFeed)
+		}
 	}
 
 	sortRoutingResources(&working)
@@ -991,7 +1018,7 @@ func (service Service) credentialStore() (credentialStore, error) {
 
 func summarizeCredential(credential core.Credential) core.CredentialSummary {
 	result := core.CredentialSummary{ID: credential.ID, Provider: credential.Provider, AuthKind: credential.AuthKind, Label: credential.Label, Enabled: credential.Enabled, Revision: credential.Revision}
-	if credential.Value == nil {
+	if credential.Value == nil || credential.AuthKind == "chrome_cookie" {
 		return result
 	}
 	result.HasValue = true
@@ -1282,9 +1309,13 @@ func stableSourceID(host string) string {
 	return fmt.Sprintf("source_%s_%x", part, digest[:4])
 }
 
-func stableChannelID(canonicalURL string) string {
-	digest := sha256.Sum256([]byte(canonicalURL))
+func stableChannelID(identity string) string {
+	digest := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("channel_%x", digest[:12])
+}
+
+func directFeedRouteKey(canonicalURL, egressProfileID string) string {
+	return canonicalURL + "\x00" + egressProfileID
 }
 
 func stableCollectionID(path []string) string {
@@ -1609,7 +1640,7 @@ type importState struct {
 	sourceIndex        map[string]int
 	channelIndex       map[string]int
 	collectionIndex    map[string]int
-	urlChannels        map[string]string
+	routeChannels      map[string]string
 	touchedSources     map[string]bool
 	touchedChannels    map[string]string
 	touchedCollections map[string]bool
@@ -1620,7 +1651,8 @@ func newImportState(service Service, catalog *core.RoutingCatalog, report *Impor
 	state := &importState{
 		service: service, catalog: catalog, report: report, egressProfileID: egressProfileID,
 		sourceIndex: make(map[string]int), channelIndex: make(map[string]int), collectionIndex: make(map[string]int),
-		urlChannels: make(map[string]string), touchedSources: make(map[string]bool), touchedChannels: make(map[string]string), touchedCollections: make(map[string]bool),
+		routeChannels: make(map[string]string), touchedSources: make(map[string]bool),
+		touchedChannels: make(map[string]string), touchedCollections: make(map[string]bool),
 	}
 	for index, source := range catalog.Sources {
 		state.sourceIndex[source.ID] = index
@@ -1635,8 +1667,9 @@ func newImportState(service Service, catalog *core.RoutingCatalog, report *Impor
 	sort.Slice(channelOrder, func(left, right int) bool { return channelOrder[left].ID < channelOrder[right].ID })
 	for _, channel := range channelOrder {
 		if canonicalURL, ok := service.canonicalChannelFeedURL(channel); ok {
-			if _, exists := state.urlChannels[canonicalURL]; !exists {
-				state.urlChannels[canonicalURL] = channel.ID
+			routeKey := directFeedRouteKey(canonicalURL, channel.EgressProfileID)
+			if _, exists := state.routeChannels[routeKey]; !exists {
+				state.routeChannels[routeKey] = channel.ID
 			}
 		}
 	}
@@ -1756,16 +1789,17 @@ func (state *importState) importFeed(outline *parsedOPMLOutline, path string) (s
 		}
 	}
 
+	routeKey := directFeedRouteKey(canonicalURL, state.egressProfileID)
 	channelID := explicitChannelID
-	existingURLChannelID := state.urlChannels[canonicalURL]
+	existingRouteChannelID := state.routeChannels[routeKey]
 	if channelID == "" {
-		if existingURLChannelID != "" {
-			channelID = existingURLChannelID
+		if existingRouteChannelID != "" {
+			channelID = existingRouteChannelID
 		} else {
-			channelID = stableChannelID(canonicalURL)
+			channelID = stableChannelID(routeKey)
 		}
-	} else if existingURLChannelID != "" && existingURLChannelID != channelID {
-		state.report.Skipped = append(state.report.Skipped, ImportReportEntry{Kind: "channel", ID: channelID, Path: path, Reason: "explicit channel id conflicts with the channel already owning this URL"})
+	} else if existingRouteChannelID != "" && existingRouteChannelID != channelID {
+		state.report.Skipped = append(state.report.Skipped, ImportReportEntry{Kind: "channel", ID: channelID, Path: path, Reason: "explicit channel id conflicts with the channel already owning this feed route"})
 		return "", false
 	}
 	if importedURL, touched := state.touchedChannels[channelID]; touched {
@@ -1791,6 +1825,10 @@ func (state *importState) importFeed(outline *parsedOPMLOutline, path string) (s
 			state.report.Skipped = append(state.report.Skipped, ImportReportEntry{Kind: "channel", ID: channelID, Path: path, Reason: "generated channel id collision"})
 			return "", false
 		}
+		if existing.EgressProfileID != "" && existing.EgressProfileID != state.egressProfileID {
+			state.report.Skipped = append(state.report.Skipped, ImportReportEntry{Kind: "channel", ID: channelID, Path: path, Reason: "channel id already identifies this feed through another egress"})
+			return "", false
+		}
 		_ = template
 	}
 
@@ -1799,8 +1837,8 @@ func (state *importState) importFeed(outline *parsedOPMLOutline, path string) (s
 		state.report.Warnings = append(state.report.Warnings, ImportReportEntry{Kind: "feed", ID: channelID, Path: path, Reason: metadataWarning})
 	}
 	desiredSourceID := strings.TrimSpace(outline.SourceID)
-	if channelExists && existingURLChannelID == channelID && explicitChannelID == "" {
-		// URL 复用时保留原 Channel 的 Source identity；第三方 OPML 的主机
+	if channelExists && existingRouteChannelID == channelID && explicitChannelID == "" {
+		// Feed route 复用时保留原 Channel 的 Source identity；第三方 OPML 的主机
 		// 推导不能把已有用户路由偷偷迁移到另一个 Source。
 		desiredSourceID = existing.Source
 		if outline.SourceID != "" && outline.SourceID != existing.Source {
@@ -1863,12 +1901,15 @@ func (state *importState) importFeed(outline *parsedOPMLOutline, path string) (s
 		state.report.Created = append(state.report.Created, ImportReportEntry{Kind: "channel", ID: channelID, Path: path})
 	}
 	if channelExists {
-		if oldURL, ok := state.service.canonicalChannelFeedURL(existing); ok && oldURL != canonicalURL && state.urlChannels[oldURL] == channelID {
-			delete(state.urlChannels, oldURL)
+		if oldURL, ok := state.service.canonicalChannelFeedURL(existing); ok {
+			oldRouteKey := directFeedRouteKey(oldURL, existing.EgressProfileID)
+			if oldRouteKey != routeKey && state.routeChannels[oldRouteKey] == channelID {
+				delete(state.routeChannels, oldRouteKey)
+			}
 		}
 	}
 	state.touchedChannels[channelID] = canonicalURL
-	state.urlChannels[canonicalURL] = channelID
+	state.routeChannels[routeKey] = channelID
 	return channelID, true
 }
 

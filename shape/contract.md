@@ -465,6 +465,8 @@ RSSHub 认证链必须使用 Endpoint 固定绑定的 EgressProfile；缺失、�
 
 `desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | ready_dependent | degraded`。`ready_dependent` 只用于 Stage C 的跨多个显式绑定聚合：至少一个绑定真实 Probe 成功且存在其他失败，并必须列出成功/失败 profile ID；单 Channel 不使用该值。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
 
+持久 Probe report 只包含 checked time、Egress ID/mode/proxied、分层 checks、HTTP/Feed parse 事实、readiness、limitations 与脱敏错误；不得保存 Item、正文、响应 body、Credential、派生认证值或完整代理地址。v0.1 只为 Feed 与 RSSHub Channel 提供主动分层 Probe；GitHub、Tavily 与 xurl 返回 `probe_unsupported`，普通查询或历史成功不能冒充当前健康证据。成功证据 TTL 15 分钟，retryable 瞬时失败 5 分钟，确定配置/认证/协议失败 15 分钟；资源 revision 改变会立即使旧证据失效。
+
 ### 7.6 EgressProfile 与主动 Probe（Stage A 合同）
 
 Stage A 新增独立资源；下列合同不表示 Stage 3 已经支持代理：
@@ -485,7 +487,7 @@ spec:
 
 - `environment` 显式采用当前进程受支持的 proxy environment/NO_PROXY 决策；`direct` 显式禁止代理；`http_proxy` 与 `socks5` 只使用资源中声明的地址。任何模式都不得隐式 fallback 到另一模式、公共 DoH、公共代理或关闭 TLS。
 - 代理 Credential 由 EgressProfile 引用，不出现在 `proxyEndpoint`。资源列表、日志、Error、Probe、readiness 与 Execution 不返回密码或完整 proxy URL。
-- 有 Endpoint 的 Channel 只从 `EndpointProfile.egress_profile_id` 取得出口，Channel 自身不得再填 Egress；无 Endpoint 的持久 Channel 必须填写 `Channel.egress_profile_id`。Operation 与 Probe 不接受 Egress override、内嵌 proxy 配置或任意 proxy URL。同一 BaseURL 需要多个出口时创建多个 EndpointProfile。无数据库的一次性 Direct Feed 由入口显式构造 ephemeral Channel，只允许选择 `direct|environment`；它不是对已选 Channel 的 override。
+- 有 Endpoint 的 Channel 只从 `EndpointProfile.egress_profile_id` 取得出口，Channel 自身不得再填 Egress；无 Endpoint 的持久 Channel 必须填写 `Channel.egress_profile_id`。Operation 与 Probe 不接受 Egress override、内嵌 proxy 配置或任意 proxy URL。同一 BaseURL 需要多个出口时创建多个 EndpointProfile；同一 Direct Feed URL 需要多个出口时创建不同 ID、分别绑定 Egress 的 Channel，同 URL + 同 Egress 仍保持唯一。无数据库的一次性 Direct Feed 由入口显式构造 ephemeral Channel，只允许选择 `direct|environment`；它不是对已选 Channel 的 override。
 - Probe、readiness 与 Execution 以 Endpoint×Egress 为事实键。普通输出只可携带 `egress.profile_id`、`egress.mode` 与 `egress.proxied`；无 Endpoint 时使用目标连接 ID 与 Egress 形成等价键。
 - 新建 Endpoint 或无 Endpoint Channel 必须显式引用 profile ID。migration 允许旧字段为空，但该资源为 `not_configured` 且执行前返回 `config_error`；不得暗中生成或选择 direct/environment。
 
@@ -605,12 +607,15 @@ channel + route_template + endpoint + normalized_parameters + credential_id + cr
 
 API Key/Token 值不进入 key；Credential revision 变化会隔离旧 cache/checkpoint/tombstone。Chrome Cookie 账号不会被复制或指纹化；用户切换账号时新建 Credential/Channel，使新的 ID/revision 隔离状态。checkpoint 与新 snapshot 必须在同一事务提交，失败刷新不推进 checkpoint。
 
+View Operation 在创建时固定；`PUT` 更新只允许 `display_name` 与 `enabled` 改变，改变查询需创建新 View。Snapshot 保存本次执行的 StateKey 集合，后续 tombstone 不从已经变化的当前 Channel 配置猜测旧执行分区。
+
 已确认的 `serve` 行为：
 
 - freshness 优先使用上游有效 TTL/Cache-Control/Expires；没有 hint 时为 15 分钟，v1 不接受 per-View 覆盖项。
 - 有未过期快照：直接返回。
 - 有过期快照：返回 stale snapshot，并对同一 View singleflight 后台 refresh。
-- 无快照：执行一次受 deadline 限制的阻塞 refresh；失败则返回明确错误，不生成空 Feed 冒充成功。
+- 无快照：执行一次受 deadline 限制的阻塞 refresh；失败返回 `503 Service Unavailable`、`Retry-After: 60` 与 RFC 9457 Problem，不生成空 Feed 冒充成功。
+- disabled View 有快照时仍可读取与分发，但不会触发后台或显式 refresh；无快照时返回 `409 view_disabled`。
 - 显式 `omnihub refresh <view>` 与外部 cron 始终可用；v1 不内置 scheduler 或三平台 service manager，`serve` 只以前台 loopback 进程运行。
 
 Feed 路径：
@@ -650,9 +655,11 @@ Feed 支持 ETag/Last-Modified，并暴露 snapshot 时间与 stale 状态。
 
 Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 仍走同一状态转换；未来 MySQL 多实例不得重新定义 Run 语义。进程内 singleflight 只减少本机重复执行，不能代替持久 Run 幂等和 lease。
 
+Query Workbench Run 的 `request` 直接保存现有规范化 Operation；View refresh Run 从当前 View 读取同一 Operation。v1 不增加 Query Session、可恢复 merge buffer 或新的 cursor 合同。Channel Probe Run 的终态事实保存在持久 Probe health，因而允许 `result=null`；查询与刷新 Run 仍以内嵌同一 Envelope 为终态结果。Probe 目标不健康时 Run 为 `failed`，并同时保存可用的脱敏 health 事实；这让 CLI 失败码与 Run 状态一致，不增加第二套 partial 规则。只有 Probe 引擎、lease 或持久化失败且没有可信报告时才不写 health。
+
 ## 11. OPML 与 Source Bundle
 
-- OPML 2.0 import/export 保存 Direct Feed subscription URL、稳定 Source/Channel extension ID、标准 Feed metadata、Collection 层级与 membership。普通 import 是非破坏性 merge，不把缺失项解释为退订；同一 URL 复用一个 Channel，并可属于多个 Collection。
+- OPML 2.0 import/export 保存 Direct Feed subscription URL、稳定 Source/Channel extension ID、标准 Feed metadata、Collection 层级与 membership。普通 import 是非破坏性 merge，不把缺失项解释为退订；同一 URL 在导入时选定的 Egress 内复用一个 Channel，并可属于多个 Collection。用户显式配置的同 URL 多出口路线仍是不同 Channel，不能被 OPML 静默合并。
 - OPML 不携带 enabled、priority、RouteTemplate、fallback、EndpointProfile 或 Credential 等本地执行策略；export 会先输出子 Collection，再按 membership 输出 Feed，因此不承诺混合 folder/feed sibling 的原始交错顺序。
 - 未知 attribute 进入脱敏 warning 后忽略；`include`/`link` 与外部实体不会执行。ImportReport 的 path 不回显原始 title/text，避免错误报告携带误填的 credential。
 - RSSHub、GitHub、Tavily、X 等非 Feed RouteTemplate/Channel 使用 OmniHub Source Bundle YAML 或后续专用管理资源，不冒充 OPML subscription。
@@ -674,8 +681,8 @@ Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 �
 ```
 
 - `origin` 为 `builtin | imported | user`。
-- `PATCH/DELETE` 必须携带 `If-Match` 或等价 expected revision；冲突返回 RFC 9457 `409 Conflict`。
-- `POST` 支持 `Idempotency-Key`；同 key、同 payload 返回原结果，不同 payload 返回冲突。
+- `PUT/DELETE` 必须携带标准 strong `If-Match`，值为带引号的当前 revision，例如 `"3"`；冲突返回 RFC 9457 `409 Conflict`。v0.1 不接受 bare revision、body `expected_revision` 或 partial PATCH。
+- 只有 Query Run、View refresh 与 Channel Probe 这类外部执行命令支持 `Idempotency-Key`；同 key、同 payload 返回原 Run，不同 payload 返回冲突。普通配置创建依靠调用方提供的全局唯一 ID 与资源 CAS，不另建幂等状态。
 - `builtin` 资源不能直接修改/删除；disable/overlay 产生 user-owned 配置。
 - Credential create/update 可以接收完整 API Key/Token；列表只给 `has_value/value_masked`，detail 在 `include_value=true` 时可返回完整值并使用 `Cache-Control: no-store`。Cookie 永不通过 HTTP API 返回。日志、Run、Error、readiness 和默认 export 始终脱敏。
 
@@ -685,12 +692,12 @@ Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 �
 |---|---|---|
 | 查看实例概览 | `GET /v1/dashboard/summary` | version/instance、readiness 摘要、View freshness、活跃 Run、近期失败计数 |
 | 查看 Source/RouteTemplate | `GET /v1/sources`、`GET /v1/route-templates` | 静态 Descriptor、Capability、auth/cost/limitations、origin/trust |
-| 管理 Channel | `GET/POST /v1/channels`、`GET/PATCH/DELETE /v1/channels/{id}` | Template/Endpoint/Credential/parameters/priority/fallback、revision、Channel Health |
-| 管理 Endpoint | `GET/POST /v1/endpoint-profiles`、`GET/PATCH/DELETE /v1/endpoint-profiles/{id}` | base URL 的安全显示、trust、Endpoint probe 摘要 |
-| 管理 Credential | `GET/POST /v1/credentials`、`GET/PATCH/DELETE /v1/credentials/{id}` | provider/auth kind/label/value、掩码、revision；detail 可显式 include value |
+| 管理 Channel | `GET/POST /v1/channels`、`GET/PUT/DELETE /v1/channels/{id}` | Template/Endpoint/Credential/parameters/priority/fallback、revision、Channel Health |
+| 管理 Endpoint | `GET/POST /v1/endpoint-profiles`、`GET/PUT/DELETE /v1/endpoint-profiles/{id}` | base URL 的安全显示、trust、Endpoint probe 摘要 |
+| 管理 Credential | `GET/POST /v1/credentials`、`GET/PUT/DELETE /v1/credentials/{id}`、`POST /v1/credentials/{id}/revoke` | provider/auth kind/label/value、掩码、revision；detail 可显式 include value |
 | 管理 Chrome 连接 | `GET /v1/browser-bridges`、`GET /v1/channels/{id}/chrome/authorization-descriptor`、`POST /v1/browser-bridges/{id}/permissions/revoke` | connected/profile、登录/授权描述、granted origins、last seen/error；Extension 自行重连，无 Cookie |
-| 管理 Collection | `GET/POST /v1/collections`、`GET/PATCH/DELETE /v1/collections/{id}` | Channel membership、revision |
-| 管理 View | `GET/POST /v1/views`、`GET/PATCH/DELETE /v1/views/{id}` | 规范化 Operation、`fresh|stale|refreshing|empty|failed`、Feed URLs、最近成功与最近失败并存 |
+| 管理 Collection | `GET/POST /v1/collections`、`GET/PUT/DELETE /v1/collections/{id}` | Channel membership、revision |
+| 管理 View | `GET/POST /v1/views`、`GET/PUT/DELETE /v1/views/{id}` | 创建时固定的规范化 Operation、`fresh|stale|refreshing|empty|failed`、Feed URLs、最近成功与最近失败并存 |
 | 读取 Snapshot/Item | `GET /v1/views/{id}/snapshot`、`GET /v1/views/{id}/items` | Snapshot metadata、Item/Observation、opaque pagination |
 | 启动刷新 | `POST /v1/views/{id}/refresh` | `202 Accepted` + Run |
 | 临时查询 | `POST /v1/runs`，kind=`query` | `202 Accepted` + Run；显式 scope/provider/trust/cost |
@@ -700,6 +707,10 @@ Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 �
 
 `dashboard/summary` 是这些资源的只读聚合，不成为新的状态来源。v1 前端轮询 Run；不提供 SSE/WebSocket。Query Workbench 已进入 v1，但不能默认广播所有 Provider。
 
+`ready_dependent` 只出现在 `GET /v1/readiness` 的 route-group 聚合结果；单个 Channel detail 始终保留自己的固定 Egress 与 Probe 事实，不把聚合状态写回 Channel 或独立状态表。Credential revoke action 把 `value` 清空并设为 disabled；仍被引用的 Credential 以及其他普通资源 DELETE 均返回 `409 resource_in_use`，不级联解绑。View Operation 创建后不可变；`PUT` 只允许名称与 enabled 改变。Disabled View 仍可读取既有 Snapshot，但显式、后台与读取触发的 refresh 都会被拒绝；没有 Snapshot 时返回 `409 view_disabled`。
+
+保留清理由 `omnihub maintenance prune` 暴露，默认只返回将删除的数量；只有显式 `--apply` 才删除 30 天前终态 Run/Probe、180 天前 tombstone 与 30 天前孤立 embedding。`serve` 启动和普通读取不执行清理。
+
 ### 12.3 View 可呈现状态
 
 - `fresh`：最近成功 Snapshot 在 freshness window 内。
@@ -708,7 +719,7 @@ Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 �
 - `empty`：尚无成功 Snapshot，且没有最近确定失败。
 - `failed`：没有可读 Snapshot，最近 Run 失败。
 
-“最近成功 Snapshot”与“最近 refresh 失败”是两个正交字段；有旧数据且新刷新失败时不能只显示绿色或只显示失败。
+“最近成功 Snapshot”与“最近 refresh 失败”是两个正交字段；有旧数据且新刷新失败时不能只显示绿色或只显示失败。每个 v3 Snapshot 还保存本次执行的 StateKey 集合；tombstone 只过滤 StateKey 命中的 Observation，Item 仍有其他 Observation 时继续分发。Snapshot 内容 immutable append-only，`current_view_snapshots` 每个 View 只保存一个当前指针；指针推进与新 Snapshot、checkpoint、tombstone、Run 终态同事务。旧 schema 与非当前 Snapshot 不参与读取；v0.1 不提供历史 API，也不隐式覆盖或删除这些字节。
 
 ### 12.4 Loopback 本机信任模型
 

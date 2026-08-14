@@ -258,6 +258,9 @@ func TestFeedAdapterRevalidatesFileCacheAcrossInstances(t *testing.T) {
 	if second.ProviderState["cache_status"] != "revalidated" || requests.Load() != 2 {
 		t.Fatalf("cache status/requests = %q/%d", second.ProviderState["cache_status"], requests.Load())
 	}
+	if first.FreshUntil == nil || !first.FreshUntil.Equal(now) || second.FreshUntil == nil || !second.FreshUntil.Equal(now.Add(time.Minute)) {
+		t.Fatalf("conditional fresh_until = %v/%v", first.FreshUntil, second.FreshUntil)
+	}
 }
 
 func TestFeedAdapterRespectsFreshnessHeadersAndRSSTTL(t *testing.T) {
@@ -268,11 +271,18 @@ func TestFeedAdapterRespectsFreshnessHeadersAndRSSTTL(t *testing.T) {
 		body             func(string) string
 		wantRequests     int32
 		wantCacheStatus  string
+		withoutCache     bool
+		wantFirst        time.Time
+		wantSecond       time.Time
 	}{
-		{name: "max-age", configureHeaders: func(header http.Header) { header.Set("Cache-Control", "max-age=3600") }, body: rssFeedFixture, wantRequests: 1, wantCacheStatus: "hit"},
-		{name: "expires", configureHeaders: func(header http.Header) { header.Set("Expires", now.Add(time.Hour).Format(http.TimeFormat)) }, body: rssFeedFixture, wantRequests: 1, wantCacheStatus: "hit"},
-		{name: "rss ttl", configureHeaders: func(http.Header) {}, body: rssTTLFeedFixture, wantRequests: 1, wantCacheStatus: "hit"},
+		{name: "max-age", configureHeaders: func(header http.Header) { header.Set("Cache-Control", "max-age=3600") }, body: rssFeedFixture, wantRequests: 1, wantCacheStatus: "hit", wantFirst: now.Add(time.Hour), wantSecond: now.Add(time.Hour)},
+		{name: "expires", configureHeaders: func(header http.Header) { header.Set("Expires", now.Add(time.Hour).Format(http.TimeFormat)) }, body: rssFeedFixture, wantRequests: 1, wantCacheStatus: "hit", wantFirst: now.Add(time.Hour), wantSecond: now.Add(time.Hour)},
+		{name: "expired expires", configureHeaders: func(header http.Header) { header.Set("Expires", now.Add(-time.Hour).Format(http.TimeFormat)) }, body: rssFeedFixture, wantRequests: 2, wantCacheStatus: "refreshed", wantFirst: now.Add(-time.Hour), wantSecond: now.Add(-time.Hour)},
+		{name: "rss ttl", configureHeaders: func(http.Header) {}, body: rssTTLFeedFixture, wantRequests: 1, wantCacheStatus: "hit", wantFirst: now.Add(time.Hour), wantSecond: now.Add(time.Hour)},
+		{name: "no-cache", configureHeaders: func(header http.Header) { header.Set("Cache-Control", "no-cache") }, body: rssFeedFixture, wantRequests: 2, wantCacheStatus: "refreshed", wantFirst: now, wantSecond: now.Add(time.Minute)},
 		{name: "no-store", configureHeaders: func(header http.Header) { header.Set("Cache-Control", "no-store, max-age=3600") }, body: rssFeedFixture, wantRequests: 2, wantCacheStatus: "bypass"},
+		{name: "no hint", configureHeaders: func(http.Header) {}, body: rssFeedFixture, wantRequests: 2, wantCacheStatus: "refreshed"},
+		{name: "max-age without cache", configureHeaders: func(header http.Header) { header.Set("Cache-Control", "max-age=3600") }, body: rssFeedFixture, wantRequests: 2, wantCacheStatus: "disabled", withoutCache: true, wantFirst: now.Add(time.Hour), wantSecond: now.Add(61 * time.Minute)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -285,15 +295,30 @@ func TestFeedAdapterRespectsFreshnessHeadersAndRSSTTL(t *testing.T) {
 			}))
 			defer server.Close()
 
-			adapter := FeedAdapter{Cache: NewMemoryFeedCache(), Now: func() time.Time { return now }}
+			var cache FeedCache
+			if !test.withoutCache {
+				cache = NewMemoryFeedCache()
+			}
+			executionNow := now
+			adapter := FeedAdapter{Cache: cache, Now: func() time.Time { return executionNow }}
 			request := feedRequestFixture(server.URL)
 			first := adapter.Execute(context.Background(), request)
+			executionNow = now.Add(time.Minute)
 			second := adapter.Execute(context.Background(), request)
 			if len(first.Errors) != 0 || len(second.Errors) != 0 {
 				t.Fatalf("Execute() errors = %#v/%#v", first.Errors, second.Errors)
 			}
 			if requests.Load() != test.wantRequests || second.ProviderState["cache_status"] != test.wantCacheStatus {
 				t.Fatalf("requests/cache_status = %d/%q, want %d/%q", requests.Load(), second.ProviderState["cache_status"], test.wantRequests, test.wantCacheStatus)
+			}
+			for _, check := range []struct {
+				name   string
+				result core.AdapterResult
+				want   time.Time
+			}{{"first", first, test.wantFirst}, {"second", second, test.wantSecond}} {
+				if (check.want.IsZero() && check.result.FreshUntil != nil) || (!check.want.IsZero() && (check.result.FreshUntil == nil || !check.result.FreshUntil.Equal(check.want))) {
+					t.Fatalf("%s fresh_until = %v, want %v", check.name, check.result.FreshUntil, check.want)
+				}
 			}
 		})
 	}
@@ -687,6 +712,11 @@ func TestRSSHubCredentialRotationPartitionsCacheAndAuthUsage(t *testing.T) {
 	rotated := adapter.Execute(context.Background(), rotatedRequest)
 	if len(first.Errors) != 0 || len(cacheHit.Errors) != 0 || len(rotated.Errors) != 0 || first.ProviderState["auth_used"] != "true" || cacheHit.ProviderState["auth_used"] != "" || cacheHit.ProviderState["cache_status"] != "hit" || rotated.ProviderState["auth_used"] != "true" {
 		t.Fatalf("rotation results = %#v/%#v/%#v", first, cacheHit, rotated)
+	}
+	for _, result := range []core.AdapterResult{first, cacheHit, rotated} {
+		if result.FreshUntil == nil || !result.FreshUntil.Equal(now.Add(time.Hour)) {
+			t.Fatalf("RSSHub fresh_until = %v, want %v", result.FreshUntil, now.Add(time.Hour))
+		}
 	}
 	mu.Lock()
 	gotCodes := append([]string(nil), receivedCodes...)

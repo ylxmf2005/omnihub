@@ -1,155 +1,185 @@
-# TestPlan：Stage B 代表 Provider 与 Agent Query 发布面
+# TestPlan：Stage C Subscription、Dashboard Backend 与 Feed 分发
 
 ## 计划状态
 
-- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-b-agent-query` 工作树，相对远端 `main@2f62019` 的完整 Stage B diff 与本轮构建的 native CLI。
+- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-c-subscriptions` 工作树，相对 Stage B `ec834a9` 的完整 Stage C diff 与最终 native CLI/loopback service。
 - 计划状态：`completed`
-- 任务承诺：`context.md`、`shape/requirements.md`、`shape/contract.md`、`plan.md` Stage B。
-- 结论边界：证明 GitHub、Tavily、xurl 三条代表路线，以及 CLI、REST、MCP、JSONL、Skill、Feed Source Bundle 的共同执行语义；不把 fixture 冒充 Tavily/X 真实凭据验证，不证明 Stage C 的持久 View/Dashboard 管理面、Stage D Chrome Bridge 或 Stage E semantic grouping。
+- 任务承诺：`context.md`、`shape/requirements.md` REQ-015—025/033、`shape/contract.md` View/Run/Dashboard、`plan.md` Stage C。
+- 结论边界：证明持久 View/Snapshot/Run/Probe health、stale-while-revalidate、三种 Feed、Dashboard 管理 API、Query Workbench、显式 retention 与同一 Operation Service；不证明 Dashboard 前端、Chrome Bridge、semantic grouping、MySQL、多实例或内置 scheduler。
 
 ## 测试事实账本
 
-- 环境与路由：macOS arm64、Go 1.26.4；Provider 自动回归使用 loopback HTTP fixture 与本地受控假 `xurl` executable；公网 smoke 只使用匿名 GitHub API。
-- 身份与权限：当前本机用户；没有 Tavily API Key 或 X Developer App Token，GitHub smoke 不使用 Token。
-- 数据与清理责任：配置、SQLite、缓存、socket/port、CLI 二进制和 fixture 全部隔离在 `/private/tmp`；不修改用户浏览器、系统代理或真实账号数据。
-- 观察面：CLI exit/stdout/stderr、统一 Envelope/JSONL、REST/RFC9457/OpenAPI、MCP tool result、Adapter request/response fixture、Execution/Coverage/Observation、Doctor 与文件权限。
-- 已知限制：匿名 GitHub 受共享出口 rate limit 影响；Tavily/X 只能以真实 Adapter + fixture/假 executable 证明协议和边界；Linux/Windows 只做交叉构建，不做运行验证。
+- 环境与路由：macOS arm64、Go 1.26.4；SQLite 从 v2 真实迁移到 v3；HTTP 只监听 literal loopback；Provider 执行使用真实 loopback Feed/RSSHub fixture，必要的公网 smoke 只读取 V2EX/GitHub。
+- 身份与权限：当前本机用户；Dashboard 无登录/session，信任边界为 loopback Host/Origin 与 SQLite 0700/0600；Credential 使用不可用假值。
+- 数据与清理责任：所有 View/Run/Snapshot/Probe/Feed/管理资源位于隔离 `/private/tmp` SQLite；测试完成后停止进程并删除临时 DB/产物。maintenance 删除只作用于专门构造的过期 fixture。
+- 观察面：HTTP status/header/body、CLI exit/JSON、SQLite Repository 回读、Run revision/lease、Snapshot/Checkpoint/Tombstone、Provider request count、Feed parser、OpenAPI、readiness 与全量质量闸。
+- 已知限制：Linux/Windows 仅交叉构建；真实 Tavily/X credential 不属于 Stage C；单机 singleflight 不证明多实例互斥。
 
 ## 风险与覆盖
 
 | 风险或承诺 | 来源 | 失败后果 | 覆盖用例 |
 | --- | --- | --- | --- |
-| Provider 配置、固定出口、凭据和 dependency readiness 必须 fail-closed | Stage B plan；Egress 合同 | 隐式出网、错误路由或虚报 ready | TC-B01 |
-| GitHub 只能搜索/读取 Repository metadata，匿名与鉴权语义、限流和来源链必须准确 | Stage B Provider 冻结范围 | 能力夸大、泄漏 Token 或生成不可追溯结果 | TC-B02 |
-| Tavily 参数、domain、basic/advanced 与结果 hostname 必须按合同投影 | Stage B Provider 冻结范围 | 产生意外计费、跨域结果或伪 Source | TC-B03 |
-| xurl 必须固定 argv、隔离 HOME、受控 Egress、stdin Token 且有界执行 | command binding 安全合同 | shell 注入、读取用户配置、泄漏 Token 或挂死 | TC-B04 |
-| 多 Provider aggregate 必须保留成功、失败、partial、coverage 与 provenance | 统一 Envelope 合同 | Agent 把部分结果误判完整或引用不可追溯 | TC-B05 |
-| CLI fetch 与 JSONL 不能丢失终态事实，错误需稳定映射 exit | Agent CLI 公共出口 | Agent 无法可靠调用或捕获失败 | TC-B06 |
-| REST、MCP 与 CLI 必须复用同一 Operation Service 和错误语义 | 公共传输合同 | 不同 Agent 接口结果漂移、配置错误误报 500 | TC-B07 |
-| Skill/Bundle/Schema/README 与运行时必须一致，全量质量闸不能回归旧来源 | 发布面合同 | Agent 按错误指令调用或 Source Manifest 冒充可执行路线 | TC-B08 |
+| v3 migration 与 Repository 必须完整持久化 View/Run/Probe 且只向前 | Repository/SQLite 决策 | 升级丢数据、Dashboard 读到零值或 future schema 被误写 | TC-C01 |
+| View refresh 的 Snapshot/checkpoint/tombstone/Run terminal 必须原子 | REQ-016；刷新事务 | checkpoint 先走、数据丢失或 Run 与快照矛盾 | TC-C02 |
+| freshness 与 stale-while-revalidate 必须遵守上游 hint/15m fallback | REQ-017；View contract | 永久 fresh、请求阻塞或重复刷新风暴 | TC-C03 |
+| RSS/Atom/JSON Feed 只能投影 Snapshot并支持 200→304 | 公共出口合同 | Feed 另抓上游、格式错误或空 Feed冒充成功 | TC-C04 |
+| Dashboard 资源 CRUD 必须 CAS、无级联、Credential 默认脱敏 | REQ-021—023/033 | 并发覆盖、配置被静默解绑或 secret 泄漏 | TC-C05 |
+| Refresh/Workbench/Probe 必须 202+持久 Run、幂等、lease 可恢复 | Run contract | 前端猜终态、重复计费或进程恢复后悬挂 | TC-C06 |
+| Probe health TTL 与 ready_dependent route-group 必须基于真实记录 | REQ-025/029/033 | 静态配置冒充 ready 或错误出口依赖被隐藏 | TC-C07 |
+| loopback Host/Origin/CORS 与 Problem Details 必须保持本机边界 | 本地信任模型 | 任意网页驱动本机 secret/config API | TC-C08 |
+| retention/tombstone 必须显式、可预览且不误删活跃状态 | REQ-016/033 | 隐式数据丢失或旧 Item 复活 | TC-C09 |
+| CLI/REST/MCP/旧 Feed Provider 回归、Schema/文档/构建必须一致 | 五阶段共同合同 | Stage C 横切破坏已交付查询面 | TC-C10 |
 
 ## 用例
 
-### TC-B01 — Provider 管理、路由、出口与 readiness
+### TC-C01 — SQLite v3 migration、View/Run/Probe 完整往返
 
-- 背景与风险：三个新 Provider 不能绕过现有 Channel/Endpoint/Egress/Credential 资源合同。
+- 背景与风险：Stage 0 的 Store 骨架缺少 Run resource/request/progress/error 与 View 定义。
 - 优先级：P1
-- 环境与身份：隔离 SQLite；真实 CLI/management/Router/Doctor；PATH 可控。
-- 前置数据：GitHub/Tavily Endpoint、direct Egress、可选/必需 Credential、xurl Channel；另准备悬挂、禁用、错误 Provider/AuthKind 和缺 executable 负例。
-- 实际动作：通过 CLI apply/list/update Provider Channel/Endpoint；重放 stale revision；构建 search/fetch plan；运行 `doctor --json`。
-- 预期：revision/CAS 和引用校验成立；GitHub Token 可选，Tavily/xurl Credential 必需；Endpoint 与 Egress 固定绑定；GitHub/Tavily 内建依赖通过，xurl 由 `LookPath` 如实报告 blocked/installed；拒绝配置时零上游请求。
-- 观察面与窗口：CLI JSON/exit、Catalog 回读、Router selected/skipped、Doctor checks、fixture 请求计数。
-- 证据：`internal/transport/examples_test.go`、`internal/management/provider.go` 与 CLI transcript。
-- 失败处理：阻断 Stage B。
-- 清理：删除隔离 SQLite 与 PATH fixture。
-- 证据边界：readiness 不替代真实 Provider 请求。
+- 环境与身份：真实 v2 DB fixture、空 DB、future-version DB；SQLite Repository。
+- 前置数据：v2 routing/credential/run/snapshot/checkpoint；完整 View、Run request/progress/error、Probe record。
+- 实际动作：打开迁移、重复打开、只读打开；Apply/Get/List/Delete View；Create/Get/List/Update Run；Put/List Probe。
+- 预期：v2 非 Snapshot 数据保留，旧 Snapshot 字节仍在但不参与当前读取；schema=3、重复打开幂等、future version fail-closed；所有领域字段 UTC/JSON 往返；View/resource revision 冲突和 in-use 删除返回稳定错误；只读入口同步接受 v3。
+- 观察面与窗口：PRAGMA user_version、Repository 值、旧表数据、文件权限。
+- 证据：扩展既有 `internal/store/sqlite/store_test.go` 与真实 CLI DB。
+- 失败处理：阻断 Stage C。
+- 清理：删除隔离 DB。
+- 证据边界：不实现或测试 MySQL dialect。
 
-### TC-B02 — GitHub Repository search/fetch 与失败边界
+### TC-C02 — View refresh 与 Run terminal 原子提交
 
-- 背景与风险：GitHub 路线必须保持 Repository metadata 的窄能力，并对匿名限流和恶意 target fail-closed。
+- 背景与风险：旧 `CommitViewRefresh` 与 `FinishRun` 分离会产生新快照配 running Run。
 - 优先级：P1
-- 环境与身份：loopback GitHub API fixture；匿名公网 smoke；可选假 Token。
-- 前置数据：Repository search/fetch 成功响应、401/403 rate-limit/404/5xx/坏 JSON/credential reflection/redirect fixture；canonical repository target 与带敏感 query target。
-- 实际动作：执行 Adapter、Query Service、CLI `search`/`fetch`；检查请求方法、headers、query、分页和失败映射。
-- 预期：只访问 GitHub API；search/fetch 分别返回 Repository metadata 与准确 limitation；匿名 coverage 明示 public-only/rate-limit，Token 不出现在 Envelope/Error；rate-limit 可重试；恶意 URL和敏感 query 在执行前拒绝且不回显。
-- 观察面与窗口：fixture request、Item/Observation/Coverage/Execution/Error、CLI JSON/exit、匿名公网结果。
-- 证据：`TestGitHubAdapter*`、`TestStageBQueryServiceProviderDispatchContracts` 与真实 CLI smoke。
-- 失败处理：secret 泄漏、错误能力或未受控重定向立即阻断。
-- 清理：停止 fixture，删除临时配置。
-- 证据边界：匿名公网 smoke 受 GitHub 共享出口限额影响，不证明长期 SLA。
+- 环境与身份：SQLite fault injector；真实 Subscription Service + deterministic Query executor。
+- 前置数据：queued→claimed view_refresh Run、旧 Snapshot/checkpoint、complete/partial/failed Envelope。
+- 实际动作：分别在 snapshot、checkpoint、tombstone、Run finish、commit 前注入故障；重放成功/partial/failed refresh及旧 created_at。
+- 预期：成功/partial时新 immutable Snapshot、唯一 current pointer、成功 Channel checkpoint、tombstone与 Run terminal同事务出现；任一故障全部回滚；failed/pre-execution只完成 Run并保留旧指针/Snapshot/checkpoint；旧 refresh不能推进 current pointer；每 View只暴露一个当前成功 Snapshot。
+- 观察面与窗口：Snapshot、current pointer、Checkpoint、Tombstone、Run revision/result及表计数回读。
+- 证据：Store fault tests + transport integration。
+- 失败处理：任一部分提交阻断。
+- 清理：fixture transaction回滚/DB删除。
+- 证据边界：单机执行；未来多实例仍依赖同一 lease/transaction合同。
 
-### TC-B03 — Tavily 查询参数、计费边界与动态 Source
+### TC-C03 — 上游 freshness、15 分钟 fallback 与 singleflight
 
-- 背景与风险：Tavily 是可选检索服务；默认参数不能暗中扩大计费或返回范围。
+- 背景与风险：Feed cache hint此前止于 Adapter，View不能猜 freshness。
 - 优先级：P1
-- 环境与身份：loopback Tavily fixture；只使用假 API Key。
-- 前置数据：basic/advanced、include/exclude domain、最多 20、时间范围、401/429/432/433/5xx/坏响应/redirect/credential reflection fixture。
-- 实际动作：执行 search；捕获请求 JSON；校验结果 URL hostname、Coverage、ProviderState 和错误分类。
-- 预期：默认 basic，不请求 answer/raw content/images；advanced 仅显式启用；limit 最大 20；不支持的 TimeRange 发网前 parameter error；domain 规范小写 hostname；结果 Source 来自 canonical target hostname，Provider 固定 Tavily；API Key 不泄漏且不跟随 credentialed redirect。
-- 观察面与窗口：单次 fixture request 或零请求、Adapter Result、聚合 Envelope。
-- 证据：`TestTavilyAdapter*` 与 transport 参数/Schema 回归。
-- 失败处理：意外请求、越域结果或 secret 泄漏阻断。
-- 清理：fixture 随测试退出。
-- 证据边界：没有真实 Tavily Key，因此不声称 live credential E2E。
+- 环境与身份：可控 clock、Feed max-age/Expires/RSS ttl/no-cache/no-store fixture、计数 executor。
+- 前置数据：fresh、stale、无 Snapshot三类 View；成功与失败 refresh。
+- 实际动作：贯通 AdapterResult→Execution→Snapshot；并发读取 stale View；读取空 View；显式 refresh。
+- 预期：每个 completed Execution保留真实 hint；无 hint按完成时间+15m；多 Channel取最早到期；fresh零执行；stale立即返回旧 Snapshot且并发只启动一个背景 refresh；空 View阻塞一次；失败保留旧 Snapshot与最近失败正交状态。
+- 观察面与窗口：clock、request/call count、ViewDetail状态、Run/Snapshot回读。
+- 证据：既有 Adapter/Core tests与 transport subscription fixture。
+- 失败处理：错误 TTL、重复执行或旧数据丢失阻断。
+- 清理：停止背景任务并等待终态。
+- 证据边界：不提供 per-View TTL或 scheduler。
 
-### TC-B04 — xurl 固定命令、安全隔离与错误映射
+### TC-C04 — 三种 Feed renderer 与 conditional GET
 
-- 背景与风险：外部 CLI 路线必须可被 Agent 复用，但不能变成 shell、环境或用户 HOME 的旁路。
+- 背景与风险：Feed必须是 Snapshot投影，不是第四套检索。
 - 优先级：P1
-- 环境与身份：临时 POSIX 假 `xurl`；隔离 HOME；direct/environment/http_proxy 与 SOCKS5 负例；假 app-only Token。
-- 前置数据：成功 JSON、API error、stderr network、malformed/oversize、timeout、auth failure、credential reflection 行为。
-- 实际动作：执行 xurl Adapter；记录 argv/stdin/env/HOME；使用以 `--help` 开头的 query；检查临时目录清理。
-- 预期：仅执行固定 `auth app-only -` 和 `search ... -- QUERY`，不用 shell；Token 只走 stdin；HOME 为 0700 临时目录且最终删除；direct 清空 proxy env，environment/http_proxy 只投影已授权出口；SOCKS5 发进程前 config_error；timeout/output 有界且不重试；结果归一化为 X Item/Observation/Coverage。
-- 观察面与窗口：fake executable log、Adapter Result、临时目录存在性、执行次数。
-- 证据：`TestXURLAdapter*`。
-- 失败处理：任一 Token/真实 HOME 泄漏、shell/重复执行或 SOCKS5 旁路阻断。
-- 清理：test cleanup 删除 executable、record 与 HOME。
-- 证据边界：不证明真实 X API 凭据或 xurl 上游 SLA。
+- 环境与身份：最终 loopback serve；含 text/html、作者、tag、时间、Observation 的固定 Snapshot。
+- 前置数据：fresh/stale/empty/failed View，已保存 Snapshot。
+- 实际动作：GET `.json/.rss/.atom`；用对应 parser读取；重放 If-None-Match/If-Modified-Since；记录 executor请求数。
+- 预期：三格式 Item URL/title/content/time/provenance一致，带 snapshot/fresh/stale扩展；ETag/Last-Modified稳定，第二次304无body；已有 Snapshot请求数0；空 View刷新失败为503 + Retry-After 60 + RFC9457，不返回空XML/JSON Feed。
+- 观察面与窗口：HTTP headers/body、parser结果、upstream counter。
+- 证据：`internal/transport/examples_test.go` 集成与真实 curl。
+- 失败处理：格式、conditional或上游旁路失败阻断。
+- 清理：停止 serve并确认端口关闭。
+- 证据边界：Feed不提供历史分页或WebSub。
 
-### TC-B05 — 多 Provider aggregate、partial 与来源链
+### TC-C05 — Dashboard 配置、View 与 Credential 管理
 
-- 背景与风险：并行来源中的单路失败不能抹掉成功事实，也不能被报告为 complete。
+- 背景与风险：前端必须调用领域管理服务，不能直接拼SQLite。
 - 优先级：P1
-- 环境与身份：固定 Catalog + fake Feed/RSSHub/GitHub/Tavily/xurl executors。
-- 前置数据：三路成功、一路 rate-limit、重复 URL、动态 hostname Source 与 spoofed Source 输入。
-- 实际动作：以 aggregate Operation 执行 search；再执行失败组合和 fetch。
-- 预期：每路恰执行一次；成功组合 complete，混合结果 partial，全失败 failed；Execution/Coverage/Error 保留实际 Provider/Channel/Route/Egress；GitHub/X Source 固定，Tavily Source 取 hostname；identity exact 只删除相同 identity，不做 semantic rerank；结果按确定规则排序。
-- 观察面与窗口：统一 Envelope 全字段与 executor request log。
-- 证据：`TestStageBProviderAggregatePreservesPartialFacts`、Provider dispatch tests。
-- 失败处理：状态、来源或失败事实丢失阻断。
-- 清理：纯内存 fixture，无外部状态。
-- 证据边界：Stage E 才实现 semantic grouping。
+- 环境与身份：loopback Dashboard API；隔离 user routing catalog/credentials。
+- 前置数据：user Channel/Endpoint/Egress/Credential/Collection/View与引用关系；builtin描述符。
+- 实际动作：list/detail/create/put/delete；遗漏/裸值/过期 If-Match；尝试 partial PATCH；改变 View Operation；删除被引用资源；revoke Credential；detail含/不含value。
+- 预期：成功资源 revision单调；完整 PUT 成功、partial PATCH/裸 revision 拒绝、stale→409；View Operation不可变；builtin只读；引用中DELETE→409 resource_in_use且无解绑；Credential列表/默认detail只mask，`include_value=true`才原值且`Cache-Control:no-store`，chrome_cookie永不值；revoke清值并使依赖Channel blocked。
+- 观察面与窗口：HTTP + Repository/Catalog回读、全文secret扫描。
+- 证据：transport integration + management真实服务。
+- 失败处理：secret泄漏/级联/并发覆盖阻断。
+- 清理：删除隔离DB。
+- 证据边界：Stage D browser endpoints不应出现。
 
-### TC-B06 — CLI fetch 与 JSONL Agent 出口
+### TC-C06 — 202 Run、幂等、轮询与 lease恢复
 
-- 背景与风险：Agent 需要稳定 argv 和机器可读终态，而不是解析人类日志。
+- 背景与风险：Dashboard不能用请求连接或进度百分比猜长任务终态。
 - 优先级：P1
-- 环境与身份：本轮 native CLI、隔离配置/SQLite；GitHub fixture及匿名公网可用时的 smoke。
-- 前置数据：可执行 GitHub Channel；成功、无路由、无效 Operation 与 Provider failure 输入。
-- 实际动作：运行 `search`、`fetch` 和 `--output jsonl`；分开捕获 stdout/stderr/exit。
-- 预期：stdout 只有 JSON/JSONL；JSONL 按 item 后 terminal record 输出且不丢 coverage/error/execution；fetch target 只接受 canonical repository 形式；parameter/config/upstream 分别映射稳定 exit；stderr 不含 Credential。
-- 观察面与窗口：进程 exit、stdout 每行 JSON、terminal Envelope、stderr。
-- 证据：CLI E2E 与 `cmd/omnihub`/transport runtime 回归。
-- 失败处理：格式漂移、终态丢失或 secret 泄漏阻断。
-- 清理：删除临时二进制、DB 和输出。
-- 证据边界：JSONL 不是持久 Run event stream。
+- 环境与身份：loopback API、可控 worker/clock、真实 Store lease。
+- 前置数据：View refresh、Query Workbench Operation、Feed Probe Channel；相同/不同payload Idempotency-Key。
+- 实际动作：POST refresh/runs/probe；立即与终态轮询；重复key；claim/renew/lease过期reclaim；重启式扫描queued/expired。
+- 预期：创建返回202+queued Run；同key同payload返回同ID，不同payload409；只有claim者发上游；Run完整保存resource/request/request_id/progress/result/error/revision；过期可重领，未过期不可抢；终态不可重写；Query result为同一Envelope，Probe result落health而不伪Envelope。
+- 观察面与窗口：HTTP、Run CAS/attempt/lease、executor count、terminal回读。
+- 证据：Store run contract + service/transport fixture。
+- 失败处理：重复计费、丢终态或错误reclaim阻断。
+- 清理：等待所有run terminal。
+- 证据边界：不实现SSE/WebSocket/QuerySession。
 
-### TC-B07 — REST、OpenAPI 与 MCP 等价执行
+### TC-C07 — 持久 Probe health、TTL 与 route-group aggregate
 
-- 背景与风险：不同 Agent 入口不得产生不同路由、状态或错误。
+- 背景与风险：static Doctor/Endpoint 200不能冒充真实 Channel ready。
 - 优先级：P1
-- 环境与身份：loopback HTTP server、MCP stdio/Streamable HTTP fixture、同一 Catalog/Operation Service。
-- 前置数据：相同成功 Operation、invalid operation、no route、catalog load failure 和 Adapter failure。
-- 实际动作：经 REST `/v1/search|latest|fetch` 与 MCP `omnihub_search|latest|fetch` 调用；比对 Envelope；读取 OpenAPI/JSON Schema；检查 Host/Content-Type/Method。
-- 预期：成功 Envelope 语义等价；invalid=400、no route/configuration=409、failed Envelope=502；MCP tool result 保留同一 JSON；Schema 只公开当前可执行字段，domain/target 前置校验与 runtime 一致；HTTP 安全边界拒绝非 loopback Host 与错误方法/媒体类型。
-- 观察面与窗口：HTTP status/headers/body、MCP result、Operation Service call count、Schema validation。
-- 证据：`TestStageBOperationRuntimeSurfacesAreEquivalent`、failure contract 与 schema tests。
-- 失败处理：跨入口语义或错误分类漂移阻断。
-- 清理：停止 server/stdio session，确认无监听进程。
-- 证据边界：Stage C 才提供持久 Run 轮询与完整 Dashboard API。
+- 环境与身份：真实Feed/RSSHub layered probe fixture；可控 clock；两条除Egress外完全相同路线及反例。
+- 前置数据：passed、retryable failed、expired、resource revision changed，以及 source/target/parameters/credential 不同的反例记录。
+- 实际动作：运行Probe Run并持久化；扫描持久 report 是否含 Item/正文/body/secret/代理地址；GET readiness；推进时间/修改资源；构造一成一败组合。
+- 预期：passed TTL15m、瞬时失败5m、确定失败15m；持久 report 只有脱敏 health 投影；未过期且revision匹配才改变Channel readiness；过期只标unknown/degraded且不自动Probe；单Channel永不ready_dependent；严格同组的一成一败只在aggregate输出ready_dependent并列ready/failed profile ID；反例不聚合。
+- 观察面与窗口：Probe请求/分层report、DB record、readiness channel+aggregate。
+- 证据：既有Adapter layered probe + transport integration。
+- 失败处理：虚报ready、错组或隐式Probe阻断。
+- 清理：fixture listener关闭。
+- 证据边界：GitHub/Tavily/xurl没有分层Probe，必须明确unsupported。
 
-### TC-B08 — Skill、Feed Source Bundle、文档与质量闸
+### TC-C08 — Host、Origin、CORS 与RFC9457
 
-- 背景与风险：配置样例和 Agent 指令不能把 Source 记录冒充已安装/可用 Channel。
+- 背景与风险：无登录的本地Dashboard仍可能被恶意网页驱动。
 - 优先级：P1
-- 环境与身份：最终工作树；无用户第三方凭据。
-- 前置数据：`skills/omnihub/`、`sources/feed-samples.yaml`、README、Schema 与全部既有测试。
-- 实际动作：加载 Bundle；配置样例 Feed Channel；检查 Skill 固定命令/JSON 使用、外部内容不可信边界；执行全量 test/race/vet/diff；构建 native/darwin-arm64/linux-amd64/windows-amd64。
-- 预期：Bundle 只增加 arXiv/Hacker News/YouTube/Newsletter/Podcast Source，不自动创建 Channel/Provider/Route；配置后仍需真实 Probe 才能 ready；Skill 使用固定 OmniHub CLI 形状并把 Item 内容视为不可信；README 不宣称 Tavily/X live 或 NodeSeek ready；全部质量闸 exit 0、四平台可构建且无新增测试文件。
-- 观察面与窗口：Catalog/Doctor、Skill/README 静态合同、命令终态、构建物格式。
-- 证据：`TestStageBFeedSampleBundleStaysSourceOnly`、Schema/README/Skill 检查与最终 gate。
-- 失败处理：能力夸大、契约漂移或任一质量闸失败阻断提交。
-- 清理：删除 `/private/tmp` 构建物和测试配置。
-- 证据边界：交叉构建不等于非 macOS 实机运行；Feed Source 样例不等于渠道已就绪。
+- 环境与身份：same-origin、一个显式loopback dev Origin、evil/null/wildcard Origin、非loopback Host。
+- 前置数据：read/write/credential/feed/run端点。
+- 实际动作：GET/POST/PUT/PATCH/DELETE/OPTIONS组合；错误media type、未知字段、超大body、缺If-Match。
+- 预期：生产same-origin通过；仅配置的dev Origin得到精确ACAO+Vary；其他拒绝且无side effect；Problem有稳定type/title/status/detail；method/content-type/body/If-Match错误准确400/405/413/415/428/409。
+- 观察面与窗口：HTTP、Catalog/DB未变回读。
+- 证据：transport安全回归与真实serve curl。
+- 失败处理：跨Origin写入阻断。
+- 清理：停止serve。
+- 证据边界：开放非loopback需重新Shape，不在本阶段。
+
+### TC-C09 — tombstone 与显式 maintenance retention
+
+- 背景与风险：读取/启动不能偷偷删数据，已清理Item不能在保护窗内复活。
+- 优先级：P1
+- 环境与身份：隔离DB、可控clock；旧/新terminal与active Run、Probe、180天tombstone。
+- 前置数据：Snapshot轮换产生tombstone；同一 Item 带命中与未命中的多条 Observation；过期和未过期各类记录。
+- 实际动作：普通GET和serve启动；`maintenance prune`；`maintenance prune --apply`；后续refresh尝试带回tombstoned identity。
+- 预期：读取/启动零删除；dry-run只计数；apply只删30天终态Run/Probe和180天tombstone，不删active/未到期或任何Snapshot；保护期内只过滤命中的 Observation，仍有来源时保留 Item，全部命中才删除 Item；过期后可重新出现；无隐式scheduler。
+- 观察面与窗口：前后DB计数、Snapshot Item、CLI JSON/exit。
+- 证据：Store retention tests +真实CLI。
+- 失败处理：误删或复活阻断。
+- 清理：删除fixture DB。
+- 证据边界：embedding表到Stage E才出现，当前计数应为0/不适用。
+
+### TC-C10 — 统一合同、旧路径回归与发布构建
+
+- 背景与风险：Stage C横跨Core/Store/Adapter/HTTP/CLI，容易破坏Stage A/B。
+- 优先级：P1
+- 环境与身份：最终工作树与native binary。
+- 前置数据：全量既有测试、Schema/OpenAPI/Skill/README。
+- 实际动作：全量test/race/vet/diff；定向重复异步/singleflight；CLI/REST/MCP同Operation；Schema/OpenAPI冷读；native/darwin-arm64/linux-amd64/windows-amd64 build。
+- 预期：全部exit0；同步Query语义不变；Dashboard/Feed共用Envelope；Schema只声明真实端点；README不把Dashboard前端/Chrome/semantic写成完成；三平台格式正确；无新增test文件。
+- 观察面与窗口：命令终态、Envelope比对、Schema路径、file/digest。
+- 证据：最终Test Report。
+- 失败处理：阻断Stage C提交。
+- 清理：删除构建物/DB并回读无进程。
+- 证据边界：交叉构建不等于非macOS实机运行。
 
 ## 执行顺序与依赖
 
-- 先验证 TC-B01 的配置/出口边界，再执行三个 Provider 的成功与失败路径；任何 secret 泄漏或未授权出网会停止相关执行。
-- TC-B02—B05 的 fixture 可并行；TC-B06/B07 使用同一最终构建物；TC-B08 在文档与代码冻结后执行。
-- 匿名 GitHub rate-limit 只影响公网 smoke，不阻断已有真实成功记录与协议 fixture；Tavily/X 缺凭据只截断 live E2E 声明。
+- TC-C01/C02先证明持久不变量；失败时不执行依赖它的Dashboard成功声明。
+- TC-C03/C04共享freshness fixture；TC-C05/C08共享loopback API；TC-C06/C07分别验证Run与Probe并可并行。
+- TC-C09只操作隔离过期数据；最终代码冻结后执行TC-C10。
 
 ## 计划攻击与开放缺口
 
-- 仍可能全绿但产品错误的路径：只验证 Adapter 会掩盖 CLI/REST/MCP 的配置和错误漂移，TC-B06/B07 从真实公共入口闭合；只看成功 Envelope 会掩盖 partial 与来源篡改，TC-B05 使用混合失败和 spoofed Source；只加载 Bundle 会冒充运行支持，TC-B08 回读零 Channel 和非 ready health。
-- 仍需现场发明的输入或步骤：none。
-- 下一步：Test Report 已通过，独立 Review 已批准；提交并 push Stage B 后进入 Stage C。
+- 仍可能全绿但产品错误的路径：只测Store会漏掉HTTP另造状态，TC-C04—C08从真实transport闭合；只测Feed 200会漏掉隐藏抓取和失败伪空，TC-C04断言请求计数与503；只测单Channel会误放大ready_dependent，TC-C07含严格反例；只看prune计数会漏误删，TC-C09逐类回读。
+- 仍需现场发明的输入或步骤：none；具体类型/字段以实现后的同源Schema更新，但不改变上述用户终态。
+- 下一步：TC-C01—C10 已执行，当前裁决与证据边界见 `test/test-report.md`。

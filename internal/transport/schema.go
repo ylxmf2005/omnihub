@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/management"
+	"github.com/ylxmf2005/omnihub/internal/readiness"
+	"github.com/ylxmf2005/omnihub/internal/subscription"
 )
 
 type CommandManifest struct {
@@ -40,6 +44,7 @@ type MCPManifest struct {
 }
 
 type Schemas struct {
+	Problem           json.RawMessage `json:"problem"`
 	Operation         json.RawMessage `json:"operation"`
 	Envelope          json.RawMessage `json:"envelope"`
 	Item              json.RawMessage `json:"item"`
@@ -47,8 +52,18 @@ type Schemas struct {
 	Coverage          json.RawMessage `json:"coverage"`
 	Error             json.RawMessage `json:"error"`
 	Run               json.RawMessage `json:"run"`
+	DashboardSummary  json.RawMessage `json:"dashboard_summary"`
+	Readiness         json.RawMessage `json:"readiness"`
+	Source            json.RawMessage `json:"source"`
 	RouteTemplate     json.RawMessage `json:"route_template"`
 	Channel           json.RawMessage `json:"channel"`
+	EndpointProfile   json.RawMessage `json:"endpoint_profile"`
+	EgressSummary     json.RawMessage `json:"egress_profile_summary"`
+	Collection        json.RawMessage `json:"collection"`
+	View              json.RawMessage `json:"view"`
+	ViewDetail        json.RawMessage `json:"view_detail"`
+	ViewSnapshot      json.RawMessage `json:"view_snapshot"`
+	ViewItems         json.RawMessage `json:"view_items"`
 	CredentialInput   json.RawMessage `json:"credential_input"`
 	CredentialSummary json.RawMessage `json:"credential_summary"`
 	CredentialDetail  json.RawMessage `json:"credential_detail"`
@@ -66,6 +81,14 @@ type Artifacts struct {
 }
 
 func Generate() (Artifacts, error) {
+	return generateArtifacts(true)
+}
+
+func generateArtifacts(includeDashboard bool) (Artifacts, error) {
+	problem, err := schemaFor(reflect.TypeFor[Problem]())
+	if err != nil {
+		return Artifacts{}, err
+	}
 	operation, err := schemaFor(reflect.TypeFor[core.Operation]())
 	if err != nil {
 		return Artifacts{}, err
@@ -75,11 +98,16 @@ func Generate() (Artifacts, error) {
 		return Artifacts{}, err
 	}
 
-	schemas := Schemas{Operation: operation, Envelope: envelope}
+	schemas := Schemas{Problem: problem, Operation: operation, Envelope: envelope}
 	for target, typ := range map[*json.RawMessage]reflect.Type{
 		&schemas.Item: reflect.TypeFor[core.Item](), &schemas.Observation: reflect.TypeFor[core.Observation](),
 		&schemas.Coverage: reflect.TypeFor[core.Coverage](), &schemas.Error: reflect.TypeFor[core.Error](),
 		&schemas.Run: reflect.TypeFor[core.Run](), &schemas.RouteTemplate: reflect.TypeFor[core.RouteTemplate](),
+		&schemas.DashboardSummary: reflect.TypeFor[DashboardSummary](), &schemas.Readiness: reflect.TypeFor[readiness.Report](),
+		&schemas.Source: reflect.TypeFor[core.Source](), &schemas.EndpointProfile: reflect.TypeFor[core.EndpointProfile](),
+		&schemas.EgressSummary: reflect.TypeFor[core.EgressProfileSummary](), &schemas.Collection: reflect.TypeFor[core.Collection](),
+		&schemas.View: reflect.TypeFor[core.View](), &schemas.ViewDetail: reflect.TypeFor[subscription.ViewDetail](),
+		&schemas.ViewSnapshot: reflect.TypeFor[ViewSnapshotResponse](), &schemas.ViewItems: reflect.TypeFor[ViewItemsResponse](),
 		&schemas.Channel: reflect.TypeFor[core.Channel](), &schemas.CredentialInput: reflect.TypeFor[core.CredentialInput](),
 		&schemas.CredentialSummary: reflect.TypeFor[core.CredentialSummary](), &schemas.CredentialDetail: reflect.TypeFor[core.CredentialDetail](),
 		&schemas.BrowserBridge: reflect.TypeFor[core.BrowserBridge](), &schemas.Managed: reflect.TypeFor[core.ManagedResource](),
@@ -111,7 +139,12 @@ func Generate() (Artifacts, error) {
 		}
 		commands = append(commands, CommandSpec{Name: "omnihub " + name, Operation: name, Description: entry.description, InputSchema: inputSchema, OutputSchema: envelope})
 		tools = append(tools, MCPToolManifest{Name: "omnihub_" + name, Description: entry.description, InputSchema: inputSchema, OutputSchema: envelope})
-		paths["/v1/"+name] = map[string]any{"post": operationEndpoint(name, entry.description, inputSchema, envelope)}
+		paths["/v1/"+name] = map[string]any{"post": operationEndpoint(name, entry.description, inputSchema, envelope, problem)}
+	}
+	if includeDashboard {
+		if err := addDashboardOpenAPI(paths, problem); err != nil {
+			return Artifacts{}, err
+		}
 	}
 	return Artifacts{
 		Schemas: schemas,
@@ -125,28 +158,323 @@ func Generate() (Artifacts, error) {
 	}, nil
 }
 
-func operationEndpoint(operation, description string, input, output json.RawMessage) map[string]any {
-	problem := map[string]any{
-		"type": "object", "additionalProperties": false,
-		"required": []any{"type", "title", "status", "detail"},
-		"properties": map[string]any{
-			"type": map[string]any{"type": "string"}, "title": map[string]any{"type": "string"},
-			"status": map[string]any{"type": "integer"}, "detail": map[string]any{"type": "string"},
-		},
-	}
+func operationEndpoint(operation, description string, input, output, problem json.RawMessage) map[string]any {
 	return map[string]any{
 		"operationId": operation + "Operation",
 		"summary":     description,
 		"requestBody": map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": decode(input)}}},
 		"responses": map[string]any{
 			"200": map[string]any{"description": "Complete or partial Operation result", "content": map[string]any{"application/json": map[string]any{"schema": decode(output)}}},
-			"400": map[string]any{"description": "Invalid request", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
-			"403": map[string]any{"description": "Untrusted Host or Origin", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
-			"409": map[string]any{"description": "Configuration prevents execution", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
-			"413": map[string]any{"description": "Request body is too large", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
-			"415": map[string]any{"description": "Unsupported request media type", "content": map[string]any{"application/problem+json": map[string]any{"schema": problem}}},
+			"400": map[string]any{"description": "Invalid request", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
+			"403": map[string]any{"description": "Untrusted Host or Origin", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
+			"409": map[string]any{"description": "Configuration prevents execution", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
+			"413": map[string]any{"description": "Request body is too large", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
+			"415": map[string]any{"description": "Unsupported request media type", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
+			"405": map[string]any{"description": "Method not allowed", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
 			"502": map[string]any{"description": "All selected Channels failed", "content": map[string]any{"application/json": map[string]any{"schema": decode(output)}}},
+			"500": map[string]any{"description": "Internal execution failure", "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}},
 		},
+	}
+}
+
+func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessage) error {
+	types := map[string]reflect.Type{
+		"summary": reflect.TypeFor[DashboardSummary](), "readiness": reflect.TypeFor[readiness.Report](),
+		"sources": reflect.TypeFor[[]core.Source](), "source": reflect.TypeFor[core.Source](),
+		"templates": reflect.TypeFor[[]core.RouteTemplate](), "template": reflect.TypeFor[core.RouteTemplate](),
+		"channels": reflect.TypeFor[[]core.Channel](), "channel": reflect.TypeFor[core.Channel](),
+		"channel_input": reflect.TypeFor[management.ApplyChannelInput](),
+		"endpoints":     reflect.TypeFor[[]core.EndpointProfile](), "endpoint": reflect.TypeFor[core.EndpointProfile](),
+		"endpoint_input":  reflect.TypeFor[management.ApplyEndpointInput](),
+		"egress_profiles": reflect.TypeFor[[]core.EgressProfileSummary](), "egress_profile": reflect.TypeFor[core.EgressProfileSummary](),
+		"egress_input": reflect.TypeFor[management.ApplyEgressProfileInput](),
+		"credentials":  reflect.TypeFor[[]core.CredentialSummary](), "credential_summary": reflect.TypeFor[core.CredentialSummary](),
+		"credential_detail": reflect.TypeFor[core.CredentialDetail](), "credential_input": reflect.TypeFor[management.ApplyCredentialInput](),
+		"collections": reflect.TypeFor[[]core.Collection](), "collection": reflect.TypeFor[core.Collection](),
+		"collection_input": reflect.TypeFor[management.ApplyCollectionInput](),
+		"views":            reflect.TypeFor[[]subscription.ViewDetail](), "view": reflect.TypeFor[core.View](),
+		"view_detail": reflect.TypeFor[subscription.ViewDetail](), "view_input": reflect.TypeFor[ViewInput](),
+		"snapshot": reflect.TypeFor[ViewSnapshotResponse](), "items": reflect.TypeFor[ViewItemsResponse](),
+		"runs": reflect.TypeFor[[]core.Run](), "run": reflect.TypeFor[core.Run](), "run_input": reflect.TypeFor[CreateRunInput](),
+	}
+	schemas := make(map[string]json.RawMessage, len(types))
+	for name, typ := range types {
+		var generated json.RawMessage
+		var err error
+		if strings.HasSuffix(name, "_input") && name != "view_input" && name != "run_input" {
+			generated, err = schemaForWithoutBodyRevision(typ)
+		} else {
+			generated, err = schemaFor(typ)
+		}
+		if err != nil {
+			return err
+		}
+		schemas[name] = generated
+	}
+
+	paths["/v1/dashboard/summary"] = map[string]any{"get": readEndpoint("dashboardSummary", "读取本机实例摘要。", schemas["summary"], problem, false)}
+	paths["/v1/readiness"] = map[string]any{"get": readinessEndpoint(schemas["readiness"], problem)}
+	paths["/v1/sources"] = map[string]any{"get": readEndpoint("listSources", "列出 Source。", schemas["sources"], problem, false)}
+	paths["/v1/sources/{id}"] = map[string]any{"get": readEndpoint("getSource", "读取 Source。", schemas["source"], problem, true)}
+	paths["/v1/route-templates"] = map[string]any{"get": readEndpoint("listRouteTemplates", "列出 RouteTemplate。", schemas["templates"], problem, false)}
+	paths["/v1/route-templates/{id}"] = map[string]any{"get": readEndpoint("getRouteTemplate", "读取 RouteTemplate。", schemas["template"], problem, true)}
+
+	for _, resource := range []struct {
+		name, collectionPath, itemPath     string
+		input, collection, detail, written json.RawMessage
+	}{
+		{"Channel", "/v1/channels", "/v1/channels/{id}", schemas["channel_input"], schemas["channels"], schemas["channel"], schemas["channel"]},
+		{"EndpointProfile", "/v1/endpoint-profiles", "/v1/endpoint-profiles/{id}", schemas["endpoint_input"], schemas["endpoints"], schemas["endpoint"], schemas["endpoint"]},
+		{"EgressProfile", "/v1/egress-profiles", "/v1/egress-profiles/{id}", schemas["egress_input"], schemas["egress_profiles"], schemas["egress_profile"], schemas["egress_profile"]},
+		{"Credential", "/v1/credentials", "/v1/credentials/{id}", schemas["credential_input"], schemas["credentials"], schemas["credential_detail"], schemas["credential_summary"]},
+		{"Collection", "/v1/collections", "/v1/collections/{id}", schemas["collection_input"], schemas["collections"], schemas["collection"], schemas["collection"]},
+		{"View", "/v1/views", "/v1/views/{id}", schemas["view_input"], schemas["views"], schemas["view_detail"], schemas["view"]},
+	} {
+		paths[resource.collectionPath] = map[string]any{
+			"get":  readEndpoint("list"+resource.name+"s", "列出 "+resource.name+"。", resource.collection, problem, false),
+			"post": createEndpoint("create"+resource.name, "创建 "+resource.name+"。", resource.input, resource.written, problem),
+		}
+		paths[resource.itemPath] = map[string]any{
+			"get":    resourceReadEndpoint("get"+resource.name, "读取 "+resource.name+"。", resource.detail, problem, resource.name == "Credential"),
+			"put":    replaceEndpoint("replace"+resource.name, "完整替换 "+resource.name+"。", resource.input, resource.written, problem),
+			"delete": deleteEndpoint("delete"+resource.name, "删除 "+resource.name+"。", problem),
+		}
+	}
+
+	revokeCredential := revisionActionEndpoint("revokeCredential", "清除 Credential 值并禁用记录。", schemas["credential_summary"], problem)
+	revokeCredential["responses"].(map[string]any)["200"].(map[string]any)["headers"].(map[string]any)["Cache-Control"] = map[string]any{"schema": map[string]any{"type": "string"}}
+	paths["/v1/credentials/{id}/revoke"] = map[string]any{"post": revokeCredential}
+	paths["/v1/views/{id}/snapshot"] = map[string]any{"get": snapshotEndpoint("getViewSnapshot", "读取 View 当前 Snapshot。", schemas["snapshot"], problem)}
+	paths["/v1/views/{id}/items"] = map[string]any{"get": snapshotEndpoint("getViewItems", "读取 View 当前 Item。", schemas["items"], problem)}
+	paths["/v1/views/{id}/refresh"] = map[string]any{"post": runActionEndpoint("refreshView", "创建 View refresh Run。", schemas["run"], problem, false)}
+	paths["/v1/channels/{id}/probe"] = map[string]any{"post": runActionEndpoint("probeChannel", "创建 Channel Probe Run。", schemas["run"], problem, true)}
+	paths["/v1/runs"] = map[string]any{
+		"get":  listRunsEndpoint(schemas["runs"], problem),
+		"post": createRunEndpoint(schemas["run_input"], schemas["run"], problem),
+	}
+	paths["/v1/runs/{id}"] = map[string]any{"get": resourceReadEndpoint("getRun", "读取持久 Run。", schemas["run"], problem, false)}
+	for _, feed := range []struct{ path, media, operationID string }{
+		{"/feeds/{view}.json", "application/feed+json", "getJSONFeed"},
+		{"/feeds/{view}.rss", "application/rss+xml", "getRSSFeed"},
+		{"/feeds/{view}.atom", "application/atom+xml", "getAtomFeed"},
+	} {
+		paths[feed.path] = map[string]any{"get": feedEndpoint(feed.operationID, feed.media, problem)}
+	}
+	return nil
+}
+
+func schemaForWithoutBodyRevision(typ reflect.Type) (json.RawMessage, error) {
+	schema, err := jsonschema.ForType(typ, schemaOptions())
+	if err != nil {
+		return nil, fmt.Errorf("generate schema for %s: %w", typ, err)
+	}
+	applyContractConstraints(schema, typ)
+	delete(schema.Properties, "expected_revision")
+	required := schema.Required[:0]
+	for _, name := range schema.Required {
+		if name != "expected_revision" {
+			required = append(required, name)
+		}
+	}
+	schema.Required = required
+	data, err := json.MarshalIndent(schema, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode schema for %s: %w", typ, err)
+	}
+	return data, nil
+}
+
+func readEndpoint(operationID, summary string, output, problem json.RawMessage, withID bool) map[string]any {
+	operation := map[string]any{"operationId": operationID, "summary": summary, "responses": readResponses(output, problem, withID)}
+	if withID {
+		operation["parameters"] = []any{pathParameter("id")}
+	}
+	return operation
+}
+
+func resourceReadEndpoint(operationID, summary string, output, problem json.RawMessage, credential bool) map[string]any {
+	operation := readEndpoint(operationID, summary, output, problem, true)
+	responses := operation["responses"].(map[string]any)
+	responses["200"].(map[string]any)["headers"] = map[string]any{
+		"ETag": map[string]any{"schema": map[string]any{"type": "string"}},
+	}
+	if credential {
+		operation["parameters"] = append(operation["parameters"].([]any), map[string]any{
+			"name": "include_value", "in": "query", "required": false, "schema": map[string]any{"type": "boolean"},
+			"description": "显式返回持久 API Key/Token；响应使用 Cache-Control: no-store。",
+		})
+		responses["200"].(map[string]any)["headers"].(map[string]any)["Cache-Control"] = map[string]any{"schema": map[string]any{"type": "string"}}
+	}
+	return operation
+}
+
+func createEndpoint(operationID, summary string, input, output, problem json.RawMessage) map[string]any {
+	return map[string]any{
+		"operationId": operationID, "summary": summary, "requestBody": jsonRequest(input),
+		"responses": withProblems(map[string]any{"201": revisionJSONResponse("Resource created", output)}, problem, "400", "403", "409", "413", "415", "500"),
+	}
+}
+
+func replaceEndpoint(operationID, summary string, input, output, problem json.RawMessage) map[string]any {
+	return map[string]any{
+		"operationId": operationID, "summary": summary,
+		"parameters": []any{pathParameter("id"), ifMatchParameter()}, "requestBody": jsonRequest(input),
+		"responses": withProblems(map[string]any{"200": revisionJSONResponse("Resource replaced", output)}, problem, "400", "403", "404", "409", "413", "415", "428", "500"),
+	}
+}
+
+func deleteEndpoint(operationID, summary string, problem json.RawMessage) map[string]any {
+	return map[string]any{
+		"operationId": operationID, "summary": summary, "parameters": []any{pathParameter("id"), ifMatchParameter()},
+		"responses": withProblems(map[string]any{"204": map[string]any{"description": "Resource deleted"}}, problem, "400", "403", "404", "409", "428", "500"),
+	}
+}
+
+func revisionActionEndpoint(operationID, summary string, output, problem json.RawMessage) map[string]any {
+	return map[string]any{
+		"operationId": operationID, "summary": summary, "parameters": []any{pathParameter("id"), ifMatchParameter()},
+		"responses": withProblems(map[string]any{"200": revisionJSONResponse("Resource updated", output)}, problem, "400", "403", "404", "409", "428", "500"),
+	}
+}
+
+func snapshotEndpoint(operationID, summary string, output, problem json.RawMessage) map[string]any {
+	responses := withProblems(map[string]any{"200": jsonResponse("Snapshot projection", output)}, problem, "403", "404", "409", "503", "500")
+	responses["503"].(map[string]any)["headers"] = map[string]any{
+		"Retry-After": map[string]any{"schema": map[string]any{"type": "string", "const": "60"}},
+	}
+	return map[string]any{
+		"operationId": operationID, "summary": summary, "parameters": []any{pathParameter("id")},
+		"responses": responses,
+	}
+}
+
+func runActionEndpoint(operationID, summary string, output, problem json.RawMessage, probe bool) map[string]any {
+	responses := withProblems(map[string]any{"202": revisionJSONResponse("Run accepted", output)}, problem, "400", "403", "404", "409", "500")
+	if probe {
+		responses["501"] = problemResponse("Probe dependency is not configured", problem)
+	}
+	return map[string]any{
+		"operationId": operationID, "summary": summary,
+		"parameters": []any{pathParameter("id"), idempotencyParameter()}, "responses": responses,
+	}
+}
+
+func createRunEndpoint(input, output, problem json.RawMessage) map[string]any {
+	return map[string]any{
+		"operationId": "createQueryRun", "summary": "创建 Query Workbench Run。",
+		"parameters": []any{idempotencyParameter()}, "requestBody": jsonRequest(input),
+		"responses": withProblems(map[string]any{"202": revisionJSONResponse("Run accepted", output)}, problem, "400", "403", "409", "413", "415", "500"),
+	}
+}
+
+func listRunsEndpoint(output, problem json.RawMessage) map[string]any {
+	parameters := make([]any, 0, 4)
+	for _, name := range []string{"resource_type", "resource_id", "status", "limit"} {
+		schema := map[string]any{"type": "string"}
+		if name == "limit" {
+			schema = map[string]any{"type": "integer", "minimum": 1, "maximum": 1000}
+		}
+		parameters = append(parameters, map[string]any{"name": name, "in": "query", "required": false, "schema": schema})
+	}
+	return map[string]any{
+		"operationId": "listRuns", "summary": "列出持久 Run。", "parameters": parameters,
+		"responses": withProblems(map[string]any{"200": jsonResponse("Run list", output)}, problem, "400", "403", "500"),
+	}
+}
+
+func readinessEndpoint(output, problem json.RawMessage) map[string]any {
+	parameters := make([]any, 0, 5)
+	for _, name := range []string{"source", "provider", "endpoint", "template", "channel"} {
+		parameters = append(parameters, map[string]any{"name": name, "in": "query", "required": false, "schema": map[string]any{"type": "string"}})
+	}
+	return map[string]any{
+		"operationId": "getReadiness", "summary": "读取分层 readiness。", "parameters": parameters,
+		"responses": withProblems(map[string]any{"200": jsonResponse("Readiness report", output)}, problem, "400", "403", "409", "500"),
+	}
+}
+
+func feedEndpoint(operationID, mediaType string, problem json.RawMessage) map[string]any {
+	representation := map[string]any{"type": "string"}
+	if mediaType == "application/feed+json" {
+		representation = map[string]any{"type": "object"}
+	}
+	feedHeaders := map[string]any{
+		"ETag":            map[string]any{"schema": map[string]any{"type": "string"}},
+		"Last-Modified":   map[string]any{"schema": map[string]any{"type": "string"}},
+		"X-OmniHub-Stale": map[string]any{"schema": map[string]any{"type": "string"}},
+	}
+	feedResponse := map[string]any{
+		"description": "Current fresh or stale Snapshot", "content": map[string]any{mediaType: map[string]any{"schema": representation}},
+		"headers": feedHeaders,
+	}
+	responses := withProblems(map[string]any{
+		"200": feedResponse, "304": map[string]any{"description": "Snapshot not modified", "headers": feedHeaders},
+	}, problem, "403", "404", "409", "503", "500")
+	responses["503"].(map[string]any)["headers"] = map[string]any{
+		"Retry-After": map[string]any{"schema": map[string]any{"type": "string", "const": "60"}},
+	}
+	return map[string]any{
+		"operationId": operationID, "summary": "读取 View Feed。",
+		"parameters": []any{
+			pathParameter("view"),
+			map[string]any{"name": "If-None-Match", "in": "header", "required": false, "schema": map[string]any{"type": "string"}},
+			map[string]any{"name": "If-Modified-Since", "in": "header", "required": false, "schema": map[string]any{"type": "string"}},
+		},
+		"responses": responses,
+	}
+}
+
+func readResponses(output, problem json.RawMessage, notFound bool) map[string]any {
+	responses := withProblems(map[string]any{"200": jsonResponse("Successful response", output)}, problem, "403", "409", "500")
+	if notFound {
+		responses["404"] = problemResponse("Resource not found", problem)
+	}
+	return responses
+}
+
+func jsonRequest(schema json.RawMessage) map[string]any {
+	return map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": decode(schema)}}}
+}
+
+func jsonResponse(description string, schema json.RawMessage) map[string]any {
+	return map[string]any{"description": description, "content": map[string]any{"application/json": map[string]any{"schema": decode(schema)}}}
+}
+
+func revisionJSONResponse(description string, schema json.RawMessage) map[string]any {
+	response := jsonResponse(description, schema)
+	response["headers"] = map[string]any{"ETag": map[string]any{"schema": map[string]any{"type": "string"}}}
+	return response
+}
+
+func problemResponse(description string, problem json.RawMessage) map[string]any {
+	return map[string]any{"description": description, "content": map[string]any{"application/problem+json": map[string]any{"schema": decode(problem)}}}
+}
+
+func withProblems(responses map[string]any, problem json.RawMessage, statuses ...string) map[string]any {
+	for _, status := range statuses {
+		responses[status] = problemResponse("Request failed", problem)
+	}
+	if _, exists := responses["405"]; !exists {
+		responses["405"] = problemResponse("Method not allowed", problem)
+	}
+	return responses
+}
+
+func pathParameter(name string) map[string]any {
+	return map[string]any{"name": name, "in": "path", "required": true, "schema": map[string]any{"type": "string", "minLength": 1}}
+}
+
+func ifMatchParameter() map[string]any {
+	return map[string]any{
+		"name": "If-Match", "in": "header", "required": true,
+		"schema": map[string]any{"type": "string", "pattern": `^"[1-9][0-9]*"$`},
+	}
+}
+
+func idempotencyParameter() map[string]any {
+	return map[string]any{
+		"name": "Idempotency-Key", "in": "header", "required": true,
+		"schema": map[string]any{"type": "string", "minLength": 1, "maxLength": 256},
 	}
 }
 
@@ -206,8 +534,12 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 	if requestID := schema.Properties["request_id"]; requestID != nil {
 		requestID.Pattern = `^req_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`
 	}
-	if schema.Properties["operation"] != nil {
-		applyOperationKindConstraints(schema)
+	if operation := schema.Properties["operation"]; operation != nil {
+		if typ == reflect.TypeFor[core.Operation]() {
+			applyOperationKindConstraints(schema)
+		} else if operation.Type == "object" {
+			applyContractConstraints(operation, reflect.TypeFor[core.Operation]())
+		}
 	}
 	if typ == reflect.TypeFor[core.Envelope]() {
 		schema.Comment = "JSON Schema validates the transport shape. Producers must also call core.Envelope.Validate to enforce selected-channel terminal coverage, cross-array channel identity, aggregate status, and metadata consistency."
@@ -215,6 +547,12 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 	}
 	if typ == reflect.TypeFor[core.Item]() {
 		requireArray(schema.Properties["observations"], true)
+	}
+	if typ == reflect.TypeFor[CreateRunInput]() {
+		if kind := schema.Properties["kind"]; kind != nil {
+			value := any(subscription.RunKindQuery)
+			kind.Const = &value
+		}
 	}
 }
 
@@ -392,8 +730,17 @@ func schemaOptions() *jsonschema.ForOptions {
 			string(core.ErrorNetwork), string(core.ErrorUpstream), string(core.ErrorProtocol), string(core.ErrorParse), string(core.ErrorInternal),
 			string(core.ErrorBrowserUnavailable), string(core.ErrorBrowserPermission), string(core.ErrorCookieMissing),
 		),
-		reflect.TypeFor[core.Verification](): enumSchema(string(core.VerificationCandidate), string(core.VerificationMetadata), string(core.VerificationBody)),
-		reflect.TypeFor[core.RunStatus]():    enumSchema(string(core.RunQueued), string(core.RunRunning), string(core.RunComplete), string(core.RunPartial), string(core.RunFailed), string(core.RunCancelled)),
+		reflect.TypeFor[core.Verification]():      enumSchema(string(core.VerificationCandidate), string(core.VerificationMetadata), string(core.VerificationBody)),
+		reflect.TypeFor[core.RunStatus]():         enumSchema(string(core.RunQueued), string(core.RunRunning), string(core.RunComplete), string(core.RunPartial), string(core.RunFailed), string(core.RunCancelled)),
+		reflect.TypeFor[readiness.DesiredState](): enumSchema(string(readiness.DesiredEnabled), string(readiness.DesiredDisabled)),
+		reflect.TypeFor[readiness.State](): enumSchema(
+			string(readiness.StateUnknown), string(readiness.StateNotConfigured), string(readiness.StateNeedsPermission), string(readiness.StateNeedsLogin),
+			string(readiness.StateBlocked), string(readiness.StateReady), string(readiness.StateReadyDependent), string(readiness.StateDegraded),
+		),
+		reflect.TypeFor[readiness.CheckStatus](): enumSchema(string(readiness.CheckPassed), string(readiness.CheckFailed), string(readiness.CheckUnknown)),
+		reflect.TypeFor[subscription.ViewStatus](): enumSchema(
+			string(subscription.ViewFresh), string(subscription.ViewStale), string(subscription.ViewRefreshing), string(subscription.ViewEmpty), string(subscription.ViewFailed),
+		),
 	}}
 }
 

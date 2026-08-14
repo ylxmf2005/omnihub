@@ -630,6 +630,7 @@ type Run struct {
 	Kind           string      `json:"kind"`
 	Resource       ResourceRef `json:"resource"`
 	RequestID      string      `json:"request_id"`
+	Request        *Operation  `json:"request,omitempty"`
 	PayloadHash    string      `json:"-"`
 	IdempotencyKey string      `json:"idempotency_key"`
 	Status         RunStatus   `json:"status"`
@@ -667,10 +668,13 @@ const (
 )
 
 type ViewSnapshot struct {
-	ID        string    `json:"id"`
-	ViewID    string    `json:"view_id"`
-	Envelope  []byte    `json:"envelope"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string     `json:"id"`
+	ViewID     string     `json:"view_id"`
+	RunID      string     `json:"run_id"`
+	StateKeys  []StateKey `json:"state_keys"`
+	Envelope   []byte     `json:"envelope"`
+	CreatedAt  time.Time  `json:"created_at"`
+	FreshUntil time.Time  `json:"fresh_until"`
 }
 
 type ChannelCheckpoint struct {

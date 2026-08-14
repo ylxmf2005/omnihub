@@ -26,12 +26,14 @@
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
 - 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。2026-08-14 已重新调研 `sqlite-vec`、Chromem、LanceDB 与 Qdrant：当前 Go/三平台/单二进制约束下，新方案要么仍是 exact scan，要么引入 C extension、第二持久状态或 sidecar，无法给单次最多 100 个结果带来相称收益。MVP 因而复用现有 pure-Go SQLite，以 little-endian `float32` BLOB 缓存 embedding 并做精确余弦比较；达到单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时优先重评 `sqlite-vec`。Embedding 通过用户显式配置的本地 Ollama/OpenAI-compatible Endpoint 获取，不自动安装/下载/启动模型，也不自动从本地回退云端。
-- 实施状态：Shape 与 Grill 已收口；Stage 0—A 已提交并推送。Stage B 已在当前工作树完成 GitHub/Tavily/xurl、Provider 管理、统一 Query Service、CLI fetch/JSONL、REST/OpenAPI、MCP、Skill 与 Feed Source Bundle；全量 test/race/vet、真实匿名 GitHub/V2EX、REST、四平台构建和独立 Review 已闭合。Tavily/X 因无用户真实凭据只声明 fixture 证据；Dashboard、Chrome 与 semantic grouping 仍分别等待 Stage C—E。NodeSeek 由独立 side 任务处理。
+- 实施状态：Shape 与 Grill 已收口；Stage 0—B 已提交并推送。Stage C 已在 `feature/stage-c-subscriptions` 完成 SQLite v3、View/Snapshot/Run、Subscription/SWR、Dashboard Backend、持久 Probe health、RSS/Atom/JSON Feed、CLI refresh/prune 与统一 Schema；全量 test/race/vet、真实 CLI/loopback E2E、三平台构建和独立 Review 已闭合。Chrome 与 semantic grouping 分别等待 Stage D/E；Tavily/X 因无用户真实凭据仍只声明 fixture 证据。NodeSeek 由独立 side 任务处理。
 - 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
-- Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；跨绑定 `ready_dependent` 等待 Stage C 的 Probe health 持久化与 Dashboard aggregate consumer，不能用无调用者 helper 或伪历史提前实现。
+- Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；Stage C 已在 Dashboard readiness 的 route-group 聚合读模型中实现跨绑定 `ready_dependent`，单 Channel 仍只表达自身事实。
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
 - Stage B 的代表 Provider 已冻结为窄能力：GitHub 只检索 Repository metadata 并按仓库读取 metadata，Token 可选；Tavily 默认 basic、最多 20 条且不取 answer/raw content/images，结果 Source 取规范化目标 hostname、Provider 固定为 tavily；xurl 只接受 direct/environment/http_proxy，SOCKS5 fail-closed，命令执行不伪造分层网络观测。
-- Stage C 的管理边界已冻结：生产 Dashboard 与 Backend 同源，开发态只允许一个显式 loopback Origin；删除不级联或静默解绑，Credential 撤销会清值并阻断依赖 Channel；`ready_dependent` 只聚合除 Egress 外完全相同的执行路线，成功 Probe TTL 为 15 分钟、瞬时失败为 5 分钟；每个 View 只保留最新成功 Snapshot，Run/Probe 30 天、identity tombstone 180 天、孤立 embedding 30 天，由显式 maintenance/启动清理或外部 cron 执行。
+- Stage C 的管理边界已冻结：生产 Dashboard 与 Backend 同源，开发态只允许一个显式 loopback Origin；删除不级联或静默解绑，Credential 撤销会清值并阻断依赖 Channel；`ready_dependent` 只在 readiness 的 route-group 聚合读模型中出现，并且只聚合除 Egress 外完全相同的执行路线；成功 Probe TTL 为 15 分钟、瞬时失败为 5 分钟。每个 View 只暴露当前成功 Snapshot，Run/Probe 30 天、identity tombstone 180 天、孤立 embedding 30 天；v1 只提供默认 dry-run 的显式 `maintenance prune`，由用户或外部 cron 加 `--apply` 执行，不在 `serve` 启动或普通读取时隐式删除。
+- Stage C 的剩余执行语义已由 Agent 按本地 MVP 收口：无 Snapshot 的首次有界刷新失败返回 `503 Service Unavailable`、`Retry-After: 60` 与 RFC 9457；Query Workbench Run 直接保存现有规范化 Operation，不引入 Query Session/cursor 模型。可写资源使用 `POST` 创建、`PUT + If-Match` 完整替换，不实现 partial PATCH 或 preview 兼容；Credential 通过显式 revoke action 清值并 disable，仍被引用的普通资源删除返回 409。View 的 Operation 创建后不可变，更新只允许名称与启用状态变化；disabled View 可分发既有 Snapshot，但不会产生任何刷新。
+- Stage C 的 Snapshot/Probe 取舍按 Ponytail full 冻结：Snapshot 内容保持 immutable append-only，`current_view_snapshots` 每个 View 只保存一个当前指针；新 Snapshot、指针、checkpoint、tombstone 与 Run 终态同事务提交，避免为“只留一份”隐式覆盖用户数据。旧 schema Snapshot 不参与读取；v0.1 不隐式覆盖或删除非当前 Snapshot，也不暴露历史读取 API，磁盘增长达到真实阈值后再以用户明确授权的 compaction 处理。Snapshot 保存实际执行 StateKey，identity tombstone 只过滤命中的 Observation，仍有其他 provenance 时保留 Item。持久 Probe 只保存脱敏 health 投影；v0.1 的分层 Probe 只覆盖 Feed/RSSHub，GitHub、Tavily 与 xurl 明确返回 unsupported，不拿普通查询冒充诊断。
 - Stage D 只交付可安装的 Chrome Bridge/Native Host、安全合同和 mock consumer，不为演示增加通用 Cookie Adapter；Host 安装必须接收一个精确 Extension ID。OmniHub v1 只保证自身 Item/Observation 引用可追溯，不宣称审计任意 Agent 最终文本。首发使用三平台 archive、checksum 与 `go install`，不把包管理器和平台签名纳入完成条件。
 - 已确认剩余 MVP 默认值：`serve` 只提供前台 loopback 进程，不实现三平台服务管理器；View 优先遵守上游 freshness hint，无 hint 时使用 15 分钟，不增加 per-View 覆盖项；SQLite 自动执行事务化、仅向前 migration，不支持降级；普通卸载保留用户数据。首个公开版本按 `0.1.x` preview 准备，传输 Schema 保持独立版本，正式 1.0 前完成 compatibility review。
 
@@ -97,8 +99,8 @@
 - `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
 - `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
 - `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`ready`，Stage 0—B 已完成，下一入口为 Stage C。
-- `dev/implementation.md`：`completed`，Stage B 三个代表 Provider 与 Agent Query 发布面已实现并通过聚焦反馈。
-- `test/test-plan.md`：`completed`，TC-B01—B08 已执行。
-- `test/test-report.md`：`passed`，Provider、aggregate、CLI/REST/MCP/JSONL/Skill/Bundle、真实 smoke、四平台构建与质量闸已闭合。
-- `review/review.md`：`approve`，Stage B 当前完整对象无未解决 P0–P2。
+- `plan.md`：`ready`，Stage 0—C 已完成，下一入口为 Stage D Chrome Cookie Backend。
+- `dev/implementation.md`：`completed`，Stage C Subscription、Dashboard Backend 与 Feed 分发已实现并通过聚焦反馈。
+- `test/test-plan.md`：`completed`，TC-C01—C10 已执行。
+- `test/test-report.md`：`passed`，SQLite/Subscription/Dashboard/Run/Probe/Feed、真实 CLI E2E、三平台构建与质量闸已闭合。
+- `review/review.md`：`approve`，Stage C 当前完整对象无未解决 P0–P2。

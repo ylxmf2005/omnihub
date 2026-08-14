@@ -1,6 +1,6 @@
 # OmniHub Implementation Plan
 
-状态：`Stage B completed`；下一入口为 `Stage C`
+状态：`Stage C completed；下一入口 Stage D`
 
 已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
@@ -63,7 +63,7 @@
 目标：所有真实 Provider 先共享一个可审计出口，主动诊断能指出故障层，普通 Query 不支付额外 Probe 成本。
 
 - 新增 revision 化 EgressProfile：`environment | direct | http_proxy | socks5`，SOCKS5 显式 local/proxy DNS；代理 Credential 复用现有 Credential。
-- 有 Endpoint 的路线只使用 Endpoint 固定绑定的 profile；无 Endpoint Channel 固定绑定自己的 profile；Operation/Probe 不覆盖。同一 BaseURL 多出口用多个 EndpointProfile 表达。
+- 有 Endpoint 的路线只使用 Endpoint 固定绑定的 profile；无 Endpoint Channel 固定绑定自己的 profile；Operation/Probe 不覆盖。同一 BaseURL 多出口用多个 EndpointProfile 表达，同一 Direct Feed URL 多出口用不同 Channel 表达。
 - migration 允许旧绑定为空，但缺绑定即 `not_configured/config_error`。一次性 Direct Feed 以显式 ephemeral Channel 选择 `direct|environment`；代理只能引用已保存 profile，不接受临时 proxy URL。
 - 以一个内部 transport builder 构造可信 `http.Transport`；不新增单实现 Factory/interface，不隐式 fallback、公共 DoH/代理或关闭 TLS。
 - Probe 复用真实 transport、`httptrace`、HTTP CONNECT hook 与 Feed parser，按真实拓扑产生 DNS/TCP/proxy-connect/TLS/HTTP/Feed-parse observation；SOCKS proxy DNS 不伪造 target IP。
@@ -86,20 +86,20 @@
 
 完成证据：每个宣称来源都有成功、缺配置/凭据、rate-limit/上游失败与 provenance/redaction 测试；GitHub/Tavily/xurl 可 aggregate 并正确 partial；同一 Operation 经 CLI/REST/MCP 得到语义等价 Envelope，JSONL 与 Skill 不丢 coverage/error/最终引用。
 
-## Stage C：Subscription、Dashboard Backend 与 Feed 分发
+## Stage C：Subscription、Dashboard Backend 与 Feed 分发（已完成）
 
 目标：一次性 Query 与持久 View 使用同一内核，前端不读数据库也不猜终态。
 
-- 实现 View、Snapshot、Channel checkpoint、identity tombstone 与 Run 的最小 Repository/SQLite migration；补齐 Run 模型中当前未持久化的 resource/request/progress/error 字段。
+- 实现 View、immutable Snapshot、当前 Snapshot 指针、Channel checkpoint、identity tombstone 与 Run 的最小 Repository/SQLite migration；补齐 Run 模型中当前未持久化的 resource/request/progress/error 字段。旧 Snapshot 在 v3 中不可见但不由 migration 删除。
 - View refresh 走 Create/Claim/Execute/Commit/Finish；Snapshot+checkpoint 原子提交，失败保留旧 Snapshot；支持 fresh/stale/empty、singleflight、显式 refresh 与外部 cron，不内置 scheduler。freshness 优先使用上游 hint，无 hint 时 15 分钟，不增加 per-View 覆盖项。
 - 持久化有 TTL 的逐 Channel Probe health；Dashboard 聚合多个显式绑定时，一个成功且其他失败才输出 `ready_dependent`，并列出成功/失败 profile ID。单 Channel 永不使用该聚合态。
 - Probe 成功/瞬时失败默认 TTL 为 15/5 分钟；聚合键除 Egress 外必须拥有相同 Source、RouteTemplate、目标、参数与 Credential revision。
 - 一个 Snapshot renderer 投影 RSS/Atom/JSON Feed，并实现 ETag/Last-Modified 与 stale metadata。
-- `serve` 扩展为 loopback Dashboard Backend：summary、catalog/Channel/Endpoint/Egress/Credential/Collection/View/Run/readiness、Query Workbench；写入用 revision/If-Match 与 Idempotency-Key，预执行错误用 RFC9457。
+- `serve` 扩展为 loopback Dashboard Backend：summary、catalog/Channel/Endpoint/Egress/Credential/Collection/View/Run/readiness、Query Workbench；配置写入用 `POST`、完整 `PUT/DELETE + If-Match`，外部执行命令才使用 Idempotency-Key，预执行错误用 RFC9457。
 - Credential 列表只返回掩码，detail 仅 `include_value=true` 回显并设置 `Cache-Control: no-store`；Cookie 永不进入 HTTP。
-- 生产 Dashboard 同源，开发态只接受一个显式 loopback Origin；删除不级联，普通被引用资源返回 409。每个 View 只保留最新成功 Snapshot，Run/Probe 30 天、tombstone 180 天、孤立 embedding 30 天。
+- 生产 Dashboard 同源，开发态只接受一个显式 loopback Origin，CORS 只开放 Dashboard/Workbench 路由；删除不级联，普通被引用资源返回 409。每个 View 只暴露当前 Snapshot；Run/Probe 30 天、tombstone 180 天、孤立 embedding 30 天。Snapshot immutable append-only，非当前内容不提供历史 API且 v0.1 不清理。View Operation 创建后不可变，disabled View 只读既有 Snapshot。
 
-完成证据：故障注入、重复 idempotency、lease 过期重领、刷新失败保留旧 Snapshot、retention tombstone 不复活、三种 Feed 200→304；Dashboard CRUD/409/202 polling/Host-Origin-CORS/credential no-store 和前端 mock/OpenAPI 全通过。
+当前证据：SQLite v3 migration、故障注入、重复 idempotency、lease 过期重领、刷新失败保留旧 Snapshot、Observation/StateKey tombstone、三种 Feed 200→304、Dashboard 全资源 CRUD/409/202 polling/Host-Origin-CORS/credential no-store、Probe TTL/严格 route-group 与显式 prune 均通过。真实 CLI/loopback E2E、全量 test/race/vet/diff、三平台构建和独立 Review 已闭合；Dashboard 前端仍由独立工作流承担。
 
 ## Stage D：Chrome Cookie Backend
 

@@ -1,25 +1,22 @@
 # OmniHub
 
-把 Feed、GitHub、Web 与 X 统一成 Agent 可调用、可追溯的搜索入口。
+把 Feed、GitHub、Web 与 X 统一成 Agent 可调用、可订阅、可追溯的信息入口。
 
-OmniHub 是本地优先的 Go CLI/MCP Server。CLI、REST、MCP 与配套 Skill 共用同一份 `Operation → Envelope` 合同；每条结果都保留实际 Source、Provider、Channel、RouteTemplate、URL、覆盖范围和错误终态。
+OmniHub 是本地优先的 Go CLI/MCP Server。CLI、REST、MCP、持久 View 与配套 Skill 共用同一份 `Operation → Envelope` 合同；每条结果都保留实际 Source、Provider、Channel、RouteTemplate、URL、覆盖范围和错误终态。
 
-> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl，以及 JSON、JSONL、REST、MCP 和 Agent Skill。Dashboard、Feed 分发、Subscription/Run、Chrome Cookie Bridge 与 semantic grouping 仍未实现。
+> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl，以及 JSON、JSONL、REST、MCP、Dashboard Backend、持久 Run/View、RSS/Atom/JSON Feed 分发和 Agent Skill。Dashboard 前端、Chrome Cookie Bridge 与 semantic grouping 仍未实现。
 
 ```text
-Agent / App ── CLI / REST / MCP ── Operation Service ── Router
-                                                        ├─ Feed / RSSHub
-                                                        ├─ GitHub API
-                                                        ├─ Tavily API
-                                                        └─ xurl process
-                                                               │
-                                         Envelope + provenance + coverage
+Agent / App ── CLI / REST / MCP ── Operation Service ── Router ── Providers
+Dashboard ───── Management API ─── Subscription Service ─┬─ SQLite Run/Snapshot
+                                                         └─ JSON/RSS/Atom Feed
 ```
 
 - [快速开始](#快速开始)
 - [当前能力](#当前能力)
 - [配置 Provider](#配置-provider)
 - [Feed、RSSHub 与 OPML](#feedrsshub-与-opml)
+- [View、Run 与 Dashboard Backend](#viewrun-与-dashboard-backend)
 - [统一查询合同](#统一查询合同)
 - [REST 与 MCP](#rest-与-mcp)
 - [Agent Skill](#agent-skill)
@@ -212,7 +209,37 @@ OPML 只承载 Feed Source、Collection 与 membership，不承载 Credential、
 ./omnihub opml export > subscriptions.opml
 ```
 
-Import 是非破坏性 merge；重复 URL 复用 Direct Feed Channel，同一 Channel 可以属于多个 Collection。
+Import 是非破坏性 merge；相同 URL 与相同 Egress 复用 Direct Feed Channel，相同 URL 经不同 Egress 可以并存。同一 Channel 可以属于多个 Collection。
+
+## View、Run 与 Dashboard Backend
+
+`serve` 同时提供一次性 Query、Dashboard 管理 API 与持久 Subscription。View 保存一条不可变的 Operation；更新只允许修改名称和启用状态，改变查询需要创建新 View。
+
+```bash
+# view.json 包含 id、display_name、operation 与 enabled
+curl --fail-with-body \
+  -H 'Content-Type: application/json' \
+  --data-binary @view.json \
+  http://127.0.0.1:8787/v1/views
+
+curl --fail-with-body http://127.0.0.1:8787/v1/views/my-view/snapshot
+curl --fail-with-body http://127.0.0.1:8787/feeds/my-view.rss
+```
+
+首次读取没有 Snapshot 的 enabled View 时会有界等待一次刷新；已有过期 Snapshot 时立即返回旧结果并在后台刷新。刷新失败不会覆盖当前 Snapshot。Disabled View 仍可读取已有 Snapshot，但不会启动刷新；没有 Snapshot 时返回 `409 view_disabled`。
+
+显式刷新、Query Workbench 与 Channel Probe 都返回持久 Run。调用方用 `Idempotency-Key` 防止重复创建，再轮询 Run 终态：
+
+```bash
+./omnihub refresh my-view --idempotency-key refresh-20260814-01
+
+curl --fail-with-body \
+  -X POST \
+  -H 'Idempotency-Key: refresh-20260814-01' \
+  http://127.0.0.1:8787/v1/views/my-view/refresh
+```
+
+Dashboard 可管理 Channel、Endpoint、Egress、Credential、Collection 与 View，并读取 Run、readiness 和 catalog。创建使用 `POST`；完整更新与删除必须携带响应中的强 `ETag` 作为 `If-Match`。Credential 默认只返回掩码；只有 detail 显式使用 `include_value=true` 才回显原值，并设置 `Cache-Control: no-store`。
 
 ## 统一查询合同
 
@@ -238,7 +265,7 @@ Envelope 的顶层 `status` 含义：
 
 ## REST 与 MCP
 
-`serve` 是前台、单机、literal-loopback 服务，不安装系统服务：
+`serve` 是前台、单机、literal-loopback 服务，不安装系统服务或内置调度器：
 
 ```bash
 ./omnihub serve --listen 127.0.0.1:8787
@@ -247,6 +274,9 @@ Envelope 的顶层 `status` 含义：
 它暴露：
 
 - `POST /v1/search`、`/v1/latest`、`/v1/fetch`：与 CLI 相同的 typed JSON 输入和 Envelope 输出；
+- `/v1/channels`、`/v1/endpoint-profiles`、`/v1/egress-profiles`、`/v1/credentials`、`/v1/collections`、`/v1/views`：Dashboard 管理资源；
+- `/v1/runs`、`/v1/readiness`、`/v1/dashboard/summary`：异步执行、健康与汇总状态；
+- `/feeds/{view}.json|rss|atom`：当前成功 Snapshot 的三种 Feed 投影；
 - `GET /openapi.json`：OpenAPI 3.1；
 - `/mcp`：stateless Streamable HTTP MCP。
 
@@ -259,7 +289,7 @@ curl --fail-with-body \
   http://127.0.0.1:8787/v1/search
 ```
 
-HTTP 入口校验 Host、Origin 与 `Content-Type`，不接受非 loopback 监听。它当前是 Query API，不是 Dashboard Backend。
+HTTP 入口校验 Host、Origin 与 `Content-Type`，不接受非 loopback 监听。生产 Dashboard 与 Backend 同源；本地前端开发可用 `--dev-origin http://localhost:PORT` 显式开放一个 loopback Origin，CORS 不会扩展到同步 Query、MCP 或 Feed 路由。
 
 MCP client 可直接把下面的进程配置为 stdio server：
 
@@ -295,7 +325,14 @@ cp -R skills/omnihub ~/.codex/skills/omnihub
 ./omnihub channels probe CHANNEL_ID
 ```
 
-`plan` 只选择 Channel，不访问上游。主动 Probe 会按实际拓扑报告 DNS、TCP、proxy connect、TLS、HTTP 与 Feed parse，但 v1 只为 Feed/RSSHub 实现分层 Probe；GitHub、Tavily 与 xurl 的实际可用性在执行时返回。`doctor` 不发网络请求，也不会把 declared/configured 冒充成 ready。
+`plan` 只选择 Channel，不访问上游。主动 Probe 会按实际拓扑报告 DNS、TCP、proxy connect、TLS、HTTP 与 Feed parse，并把脱敏健康投影按 TTL 保存给 Dashboard/readiness；正文、Item、Cookie、代理地址与 Credential 不进入持久报告。v1 只为 Feed/RSSHub 实现分层 Probe，GitHub、Tavily 与 xurl 明确返回 `probe_unsupported`。`doctor` 不发网络请求，也不会把 declared/configured 冒充成 ready。
+
+过期 Run、Probe health 与 tombstone 只通过显式维护命令清理；默认 dry-run，不在读取或 `serve` 启动时偷偷删除：
+
+```bash
+./omnihub maintenance prune
+./omnihub maintenance prune --apply
+```
 
 ## 配置与数据边界
 
@@ -321,9 +358,8 @@ CLI exit code：
 
 - GitHub 只实现 Repository Search 首页与 Repository metadata fetch；匿名请求配额更低。
 - Tavily 和 X/xurl 需要用户自己的凭据、套餐与网络。仓库测试使用确定性 fixture 覆盖请求、错误、来源链和脱敏；当前不宣称用真实 Tavily Key 或 X quota 完成了 live E2E。
-- Provider Channel 尚无持久 health TTL 或分层 Probe；当前 readiness 是配置事实与单次执行事实。
-- `serve` 不负责后台常驻、自启动、Feed 输出或 Dashboard；HTTP MCP 也不是外部 Adapter 协议。
-- Stage C 尚待实现 Subscription、View/Snapshot、Run refresh、保留策略、Dashboard Backend 与 RSS/Atom/JSON Feed 分发。
+- `serve` 不负责后台常驻、自启动或调度；Dashboard 前端由独立工作流实现，HTTP MCP 也不是外部 Adapter 协议。
+- Snapshot 采用 immutable append-only + 每 View 一个 current pointer；当前不暴露历史 API，也不自动 compaction。长期磁盘增长需要后续基于真实规模增加显式清理策略。
 - Stage D 尚待实现 Chrome Native Host/Bridge 与 Cookie 授权链；前端不在当前后端实现内。
 - Stage E 尚待完成本地向量方案的最终实现与 semantic grouping；当前不会安装 Ollama、下载模型或自动回退云端。
 - MySQL Store、多实例运行、PAC/VPN/TUN、公共代理池与隐式“最快线路”不在当前 preview 内。

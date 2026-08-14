@@ -224,7 +224,7 @@ spec:
 
 Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder；它只接受用户已配置的 EgressProfile ID，并为 `environment | direct | http_proxy | socks5` 构造受信任 transport。`environment` 是用户显式选择，不是默认读取；`direct` 明确不使用代理；HTTP/SOCKS5 代理认证从 Credential 注入，代理 URL 不带 userinfo。任何构造或引用失败都在发网前结束，不自动直连、切公共 DoH/公共代理、关闭 TLS 或尝试未知出口。
 
-绑定不建立 precedence 表：有 Endpoint 的路线只读 `EndpointProfile.egress_profile_id`；无 Endpoint 的 Channel 只读自己的 `egress_profile_id`；Operation/Probe 无覆盖入口。同一 BaseURL 若确需多个出口就建立多个 EndpointProfile。migration 允许旧字段为空，但缺绑定即 `not_configured/config_error`，不补 direct/environment。Probe、readiness 与 Execution 均记录同一 Endpoint×Egress（无 Endpoint时为目标连接×Egress）键，并只输出 profile ID、mode、proxied；代理密码和完整 proxy URL 始终脱敏。
+绑定不建立 precedence 表：有 Endpoint 的路线只读 `EndpointProfile.egress_profile_id`；无 Endpoint 的 Channel 只读自己的 `egress_profile_id`；Operation/Probe 无覆盖入口。同一 BaseURL 若确需多个出口就建立多个 EndpointProfile；同一 Direct Feed URL 则建立不同 ID、分别绑定出口的 Channel，同 URL + 同 Egress 仍唯一。migration 允许旧字段为空，但缺绑定即 `not_configured/config_error`，不补 direct/environment。Probe、readiness 与 Execution 均记录同一 Endpoint×Egress（无 Endpoint时为目标连接×Egress）键，并只输出 profile ID、mode、proxied；代理密码和完整 proxy URL 始终脱敏。
 
 主动 `channels probe` 复用已解析 transport，并按真实连接拓扑生成 observation：Direct 是 target DNS/TCP/TLS/HTTP/Feed；HTTP CONNECT 是 proxy DNS/TCP、CONNECT、tunnel 内 target TLS/HTTP/Feed；SOCKS5 local DNS 才记录本地 target resolution，proxy DNS 把该层标为 `not_run/delegated_to_egress`，不编造 resolved IP。每层关联 Egress 与 target/proxy subject，保存 `passed | degraded | failed | not_run`、duration、可行动 reason 与 retryable；某个实际前置层失败后，依赖它的下游层统一 `not_run`。普通 Query 只执行真实业务请求，不自动支付重型诊断链的额外 DNS/连接/握手/Feed 请求成本。
 
@@ -336,6 +336,8 @@ Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Ret
 4. refresh 失败保留旧 snapshot、checkpoint 和错误状态；
 5. 用户仍可显式 `refresh`，或用 cron/systemd timer/launchd/Agent 调度。`omnihub serve` 自身只以前台 loopback 进程运行，不安装系统服务。
 
+无 Snapshot 的首次阻塞 refresh 若失败，Feed HTTP 入口返回 `503`、`Retry-After: 60` 与 RFC 9457；它不输出格式正确但内容为空的 Feed。保留策略也不挂在读取或启动路径上：`omnihub maintenance prune` 默认 dry-run，只有用户或外部 cron 显式 `--apply` 才删除过期记录。
+
 若未来选择内置 scheduler，需要额外 Shape 重试、错过执行、休眠恢复、任务租约、告警和监控；不能把一个 ticker 当成已完成的调度系统。
 
 ## 12. 分页与排序
@@ -354,11 +356,11 @@ Dashboard v1 Backend 围绕七个用户任务提供资源，而不是围绕数�
 2. **渠道管理**：基于只读 RouteTemplate 创建/启停 Channel，配置 Endpoint、Credential、parameters、priority/fallback 与 Collection membership。
 3. **凭据与登录**：录入/查看 API Key Credential；查看 Chrome Bridge 状态，跳转登录页，授予/撤销 origin permission；前端永远不接触 Cookie。
 4. **诊断**：分别显示 configuration、browser bridge、permission、credential、endpoint 与真实 Channel Probe 证据。
-5. **View 管理**：保存 Operation、Feed URL、当前 Snapshot 与最近刷新结果。
+5. **View 管理**：创建时固定 Operation，之后只修改名称/启用状态；展示 Feed URL、当前 Snapshot 与最近刷新结果。
 6. **Run 观察**：queued/running/complete/partial/failed/cancelled、Channel progress 和最终 Envelope。
 7. **Item 浏览**：读取 Snapshot Item/Observation，严格区分 snippet 与 body。
 
-Management API 写操作使用 revision/If-Match 和 idempotency key。`dashboard/summary` 只是资源聚合缓存，不能成为另一份状态来源。Run 是长操作事实源；v1 已确认前端轮询持久 Run，不提供 SSE/WebSocket，并包含显式 scope/Provider/cost/trust/coverage 的 Query Workbench。
+Management API 使用 `POST` 创建、`PUT + If-Match` 完整替换和 `DELETE + If-Match` 删除；不实现 partial PATCH。只有 Run、refresh 与 Probe 外部执行命令使用持久 idempotency key。`dashboard/summary` 只是资源聚合缓存，不能成为另一份状态来源。Run 是长操作事实源；v1 已确认前端轮询持久 Run，不提供 SSE/WebSocket，并包含显式 scope/Provider/cost/trust/coverage 的 Query Workbench。
 
 后端 Task 只交付 API、Schema、错误、Run/事件合同和可供前端开发的 fixture/示例；不创建前端页面，不替前端选择框架。
 
@@ -419,7 +421,7 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 | API Key | Dashboard 录入，SQLite 原样保存；列表掩码，detail 仅在 `include_value=true` 时完整回显 | 数据库备份可读到 Key | 已确认 |
 | Chrome 授权 | MV3 optional host permission + cookies API + connectNative 长连接；每次执行直接读 | Chrome/Bridge 离线时 Channel blocked | 已确认 |
 | RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
-| EgressProfile | Endpoint 固定绑定；无 Endpoint Channel 固定绑定；Operation 无覆盖；缺绑定 fail-closed | 同一 BaseURL 多出口需多个 EndpointProfile | 已确认 |
+| EgressProfile | Endpoint 固定绑定；无 Endpoint Channel 固定绑定；Operation 无覆盖；缺绑定 fail-closed | 同一 BaseURL 多出口需多个 EndpointProfile；同一 Direct Feed URL 多出口需多个 Channel | 已确认 |
 | 扩展 | 窄 Built-in + Manifest + command/MCP；同形 API 出现后再抽取 | 首批会有少量专用 Adapter；不另造协议/DSL | 已确认 |
 | 去重 | identity 默认；semantic 显式 opt-in，只分组；调研后采用 SQLite BLOB + exact cosine | 相似内容仍占多条；约 1 万向量、p95>150ms 或跨 Snapshot ANN 再评估 `sqlite-vec` | 已确认 |
 | v1 纵切 | Feed、V2EX/RSSHub、GitHub、Tavily、X/xurl | 首版不宣称大量平台 ready | 已确认 |
@@ -428,7 +430,7 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 | Tavily | basic 默认、advanced 显式、最多 20；Source 取结果 hostname | 不读取 answer/raw content/images | 已确认 |
 | xurl 出站 | direct/environment/http_proxy；无分层 Probe | SOCKS5 fail-closed，命令网络证据较窄 | 已确认 |
 | Dashboard Origin | 生产同源；开发单一显式 loopback Origin | 不支持任意跨域前端 | 已确认 |
-| 保留 | 最新 Snapshot；Run/Probe 30 天；tombstone 180 天；孤立 embedding 30 天 | 不提供历史归档 | 已确认 |
+| 保留 | 当前 Snapshot 指针；Run/Probe 30 天；tombstone 180 天；孤立 embedding 30 天 | Snapshot immutable append-only，非当前内容无历史 API且 v0.1 不清理；真实磁盘压力出现后再授权 compaction | 已确认 |
 | Chrome v1 | Host/Bridge + mock consumer；安装时固定一个 Extension ID | 不为演示增加 Cookie Adapter | 已确认 |
 | 发布 | 三平台 archive/checksum + `go install` | 包管理器与签名后置 | 已确认 |
 | 服务生命周期 | 前台 loopback `serve`；用户现有 OS 工具可外部托管 | v1 不提供自启动管理 | 已确认 |

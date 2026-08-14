@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"math"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/health"
 	"github.com/ylxmf2005/omnihub/internal/management"
 	queryservice "github.com/ylxmf2005/omnihub/internal/query"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
@@ -28,6 +30,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/router"
 	sqlitestore "github.com/ylxmf2005/omnihub/internal/store/sqlite"
+	"github.com/ylxmf2005/omnihub/internal/subscription"
 )
 
 func contractExample(t *testing.T, path string, block int) map[string]any {
@@ -660,6 +663,10 @@ type fakeFeedExecutor struct {
 	requests []adapter.FeedRequest
 }
 
+type fakeFeedProber struct {
+	report adapter.FeedProbeReport
+}
+
 type fakeRSSHubExecutor struct {
 	results  map[string]core.AdapterResult
 	calls    []string
@@ -706,6 +713,10 @@ func (executor *fakeFeedExecutor) Execute(_ context.Context, request adapter.Fee
 	executor.calls = append(executor.calls, request.Channel.ID)
 	executor.requests = append(executor.requests, request)
 	return executor.results[request.Channel.ID]
+}
+
+func (prober fakeFeedProber) Probe(context.Context, adapter.FeedRequest) adapter.FeedProbeReport {
+	return prober.report
 }
 
 func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog {
@@ -2274,4 +2285,714 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 			t.Fatalf("unsafe ImportOPML report = %s", encoded)
 		}
 	})
+}
+
+func TestStageCDashboardSubscriptionAndHealthContracts(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "omnihub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	managementService := management.Service{Store: store, Catalog: registry.BuiltinCatalog()}
+
+	// 三条 Direct Feed Channel 同时承担普通订阅、双来源 tombstone 与
+	// 同路线不同出口的 health aggregate，避免为每条合同再造一套数据库。
+	if _, err := managementService.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "stage-c-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	primary, err := managementService.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+		SourceID: "stage-c-primary-source", ChannelID: "stage-c-primary", EgressProfileID: "stage-c-direct",
+		URL: "https://feeds.example.com/stage-c.xml", Priority: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := managementService.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+		SourceID: "stage-c-secondary-source", ChannelID: "stage-c-secondary", EgressProfileID: "stage-c-direct",
+		URL: "https://feeds.example.com/stage-c-secondary.xml", Priority: 90,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	feed := &fakeFeedExecutor{results: make(map[string]core.AdapterResult)}
+	loadCatalog := func(ctx context.Context) (*registry.Catalog, error) {
+		return registry.Load(ctx, store, "")
+	}
+	execute := func(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+		return (queryservice.Service{Feed: feed, Now: func() time.Time { return now }}).Execute(ctx, catalog, operation)
+	}
+	queued := make([]func(), 0)
+	subscriptionService := &subscription.Service{
+		Store: store, LoadCatalog: loadCatalog, Execute: execute, Now: func() time.Time { return now },
+		InstanceID: "stage-c-test", Dispatch: func(task func()) { queued = append(queued, task) },
+	}
+	handler, err := NewDashboardHTTPHandler(DashboardHTTPDependencies{
+		Execute: func(ctx context.Context, operation core.Operation) (core.Envelope, error) {
+			catalog, err := loadCatalog(ctx)
+			if err != nil {
+				return core.Envelope{}, err
+			}
+			return execute(ctx, catalog, operation)
+		},
+		LoadCatalog: loadCatalog, Management: &managementService, Subscription: subscriptionService,
+		Readiness: func(ctx context.Context) (readiness.Report, error) {
+			catalog, err := loadCatalog(ctx)
+			if err != nil {
+				return readiness.Report{}, err
+			}
+			records, err := store.ListProbeHealth(ctx, repository.ProbeHealthFilter{ActiveAt: now, Limit: 100})
+			if err != nil {
+				return readiness.Report{}, err
+			}
+			return readiness.FromProbeHealth(catalog, records, now), nil
+		},
+		Version: "0.1.0-test", InstanceID: "stage-c-test", DevOrigin: "http://localhost:5173",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		var encoded []byte
+		if body != nil {
+			var err error
+			encoded, err = json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		request := operationHTTPRequest(method, path, encoded)
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+	itemResult := func(title, target string, freshUntil time.Time) core.AdapterResult {
+		body, publishedAt := "Stage C fixture body", now.Add(-time.Minute)
+		result := successfulFeedResult(core.Item{
+			URL: target, Title: title, PublishedAt: &publishedAt,
+			Content: core.Content{Role: core.ContentBody, Text: &body, SourceSupplied: true},
+			Observations: []core.Observation{{
+				OriginalURL: target, CanonicalURL: target, Verification: core.VerificationBody,
+			}},
+		})
+		freshUntil = freshUntil.UTC()
+		result.FreshUntil = &freshUntil
+		return result
+	}
+	emptyResult := func(freshUntil time.Time) core.AdapterResult {
+		result := successfulFeedResult()
+		freshUntil = freshUntil.UTC()
+		result.FreshUntil = &freshUntil
+		return result
+	}
+
+	// Empty View 的首次读取同步物化；同一个 fresh Snapshot 的后续读取和
+	// 三种 Feed 投影均不得再次调用 Adapter。
+	operation := stage2Operation(core.OperationLatest, []string{primary.ID}, 10)
+	freshUntil := now.Add(time.Hour)
+	feed.results[primary.ID] = itemResult("Stage C item", "https://example.com/stage-c-item", freshUntil)
+	created := do(http.MethodPost, "/v1/views", ViewInput{
+		ID: "stage-c", DisplayName: "Stage C", Operation: operation, Enabled: true,
+	}, nil)
+	if created.Code != http.StatusCreated || created.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create View = %d %s: %s", created.Code, created.Header().Get("ETag"), created.Body.String())
+	}
+	first := do(http.MethodGet, "/v1/views/stage-c/snapshot", nil, nil)
+	var firstSnapshot ViewSnapshotResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstSnapshot); err != nil || first.Code != http.StatusOK || firstSnapshot.Stale || len(firstSnapshot.Envelope.Items) != 1 || len(feed.calls) != 1 {
+		t.Fatalf("first Snapshot = %d %#v calls=%v err=%v", first.Code, firstSnapshot, feed.calls, err)
+	}
+	feed.calls = nil
+	fresh := do(http.MethodGet, "/v1/views/stage-c/items", nil, nil)
+	var freshItems ViewItemsResponse
+	if err := json.Unmarshal(fresh.Body.Bytes(), &freshItems); err != nil || fresh.Code != http.StatusOK || freshItems.Stale || len(freshItems.Items) != 1 || len(feed.calls) != 0 {
+		t.Fatalf("fresh Snapshot = %d %#v calls=%v err=%v", fresh.Code, freshItems, feed.calls, err)
+	}
+
+	for _, format := range []struct {
+		suffix, mediaType string
+	}{
+		{suffix: "json", mediaType: "application/feed+json; charset=utf-8"},
+		{suffix: "rss", mediaType: "application/rss+xml; charset=utf-8"},
+		{suffix: "atom", mediaType: "application/atom+xml; charset=utf-8"},
+	} {
+		response := do(http.MethodGet, "/feeds/stage-c."+format.suffix, nil, nil)
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != format.mediaType || response.Header().Get("ETag") == "" || response.Header().Get("Last-Modified") == "" {
+			t.Fatalf("%s Feed = %d %s ETag=%q Last-Modified=%q: %s", format.suffix, response.Code, response.Header().Get("Content-Type"), response.Header().Get("ETag"), response.Header().Get("Last-Modified"), response.Body.String())
+		}
+		switch format.suffix {
+		case "json":
+			var parsed struct {
+				Version string `json:"version"`
+				Items   []struct {
+					Title   string         `json:"title"`
+					OmniHub map[string]any `json:"_omnihub"`
+				} `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &parsed); err != nil || parsed.Version == "" || len(parsed.Items) != 1 || parsed.Items[0].Title != "Stage C item" || len(parsed.Items[0].OmniHub) == 0 {
+				t.Fatalf("parse JSON Feed = %#v, %v", parsed, err)
+			}
+		case "rss":
+			var parsed struct {
+				XMLName xml.Name `xml:"rss"`
+				Channel struct {
+					Items []struct {
+						Title string `xml:"title"`
+					} `xml:"item"`
+				} `xml:"channel"`
+			}
+			if err := xml.Unmarshal(response.Body.Bytes(), &parsed); err != nil || parsed.XMLName.Local != "rss" || len(parsed.Channel.Items) != 1 || parsed.Channel.Items[0].Title != "Stage C item" {
+				t.Fatalf("parse RSS = %#v, %v", parsed, err)
+			}
+		case "atom":
+			var parsed struct {
+				XMLName xml.Name `xml:"feed"`
+				Entries []struct {
+					Title string `xml:"title"`
+				} `xml:"entry"`
+			}
+			if err := xml.Unmarshal(response.Body.Bytes(), &parsed); err != nil || parsed.XMLName.Local != "feed" || len(parsed.Entries) != 1 || parsed.Entries[0].Title != "Stage C item" {
+				t.Fatalf("parse Atom = %#v, %v", parsed, err)
+			}
+		}
+		for name, headers := range map[string]map[string]string{
+			"etag":          {"If-None-Match": response.Header().Get("ETag")},
+			"last-modified": {"If-Modified-Since": response.Header().Get("Last-Modified")},
+		} {
+			cached := do(http.MethodGet, "/feeds/stage-c."+format.suffix, nil, headers)
+			if cached.Code != http.StatusNotModified || cached.Body.Len() != 0 {
+				t.Fatalf("%s %s conditional Feed = %d: %s", format.suffix, name, cached.Code, cached.Body.String())
+			}
+		}
+	}
+	if len(feed.calls) != 0 {
+		t.Fatalf("Feed projection called upstream: %v", feed.calls)
+	}
+
+	// 过期读取立即返回旧结果。Dispatch 被测试接管后，两个读取只留下一个
+	// 后台任务；执行该任务后也只产生一次上游调用。
+	now = freshUntil.Add(time.Second)
+	nextFreshUntil := now.Add(time.Hour)
+	feed.results[primary.ID] = itemResult("Stage C refreshed", "https://example.com/stage-c-refreshed", nextFreshUntil)
+	feed.calls, queued = nil, nil
+	for range 2 {
+		response := do(http.MethodGet, "/v1/views/stage-c/snapshot", nil, nil)
+		var snapshot ViewSnapshotResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil || response.Code != http.StatusOK || !snapshot.Stale || snapshot.Envelope.Items[0].Title != "Stage C item" {
+			t.Fatalf("stale Snapshot = %d %#v, %v", response.Code, snapshot, err)
+		}
+	}
+	if len(queued) != 1 || len(feed.calls) != 0 {
+		t.Fatalf("stale singleflight queued/calls = %d/%v", len(queued), feed.calls)
+	}
+	queued[0]()
+	queued = nil
+	if len(feed.calls) != 1 {
+		t.Fatalf("background refresh calls = %v", feed.calls)
+	}
+
+	// Disabled View 继续分发已有 Snapshot，但不会触发 stale refresh；没有
+	// Snapshot 的 disabled View 和首次刷新失败分别给出 409 与 503。Operation
+	// 创建后不可变，避免旧 Snapshot 被当成另一个查询的结果。
+	changedViewOperation := operation
+	changedViewOperation.Limit--
+	immutable := do(http.MethodPut, "/v1/views/stage-c", ViewInput{
+		ID: "stage-c", DisplayName: "Changed query", Operation: changedViewOperation, Enabled: true,
+	}, map[string]string{"If-Match": `"1"`})
+	var immutableProblem Problem
+	if err := json.Unmarshal(immutable.Body.Bytes(), &immutableProblem); err != nil || immutable.Code != http.StatusConflict || immutableProblem.Code != "revision_conflict" {
+		t.Fatalf("change immutable View Operation = %d %#v, %v", immutable.Code, immutableProblem, err)
+	}
+	disabled := do(http.MethodPut, "/v1/views/stage-c", ViewInput{
+		ID: "stage-c", DisplayName: "Stage C disabled", Operation: operation, Enabled: false,
+	}, map[string]string{"If-Match": `"1"`})
+	if disabled.Code != http.StatusOK || disabled.Header().Get("ETag") != `"2"` {
+		t.Fatalf("disable View = %d %s: %s", disabled.Code, disabled.Header().Get("ETag"), disabled.Body.String())
+	}
+	now = nextFreshUntil.Add(time.Second)
+	feed.calls, queued = nil, nil
+	disabledSnapshot := do(http.MethodGet, "/v1/views/stage-c/snapshot", nil, nil)
+	if disabledSnapshot.Code != http.StatusOK || len(feed.calls) != 0 || len(queued) != 0 {
+		t.Fatalf("disabled View Snapshot = %d calls=%v queued=%d: %s", disabledSnapshot.Code, feed.calls, len(queued), disabledSnapshot.Body.String())
+	}
+	disabledEmpty := do(http.MethodPost, "/v1/views", ViewInput{
+		ID: "stage-c-disabled-empty", DisplayName: "Disabled empty", Operation: operation, Enabled: false,
+	}, nil)
+	if disabledEmpty.Code != http.StatusCreated {
+		t.Fatalf("create disabled empty View = %d: %s", disabledEmpty.Code, disabledEmpty.Body.String())
+	}
+	disabledEmpty = do(http.MethodGet, "/v1/views/stage-c-disabled-empty/snapshot", nil, nil)
+	var disabledProblem Problem
+	if err := json.Unmarshal(disabledEmpty.Body.Bytes(), &disabledProblem); err != nil || disabledEmpty.Code != http.StatusConflict || disabledProblem.Code != "view_disabled" {
+		t.Fatalf("disabled empty View = %d %#v, %v", disabledEmpty.Code, disabledProblem, err)
+	}
+	empty := do(http.MethodPost, "/v1/views", ViewInput{
+		ID: "stage-c-empty", DisplayName: "Empty failure", Operation: operation, Enabled: true,
+	}, nil)
+	if empty.Code != http.StatusCreated {
+		t.Fatalf("create empty View = %d: %s", empty.Code, empty.Body.String())
+	}
+	feed.results[primary.ID] = core.AdapterResult{Errors: []core.Error{{Code: core.ErrorUpstream, Message: "fixture upstream unavailable", Retryable: true}}}
+	empty = do(http.MethodGet, "/v1/views/stage-c-empty/snapshot", nil, nil)
+	var unavailable Problem
+	if err := json.Unmarshal(empty.Body.Bytes(), &unavailable); err != nil || empty.Code != http.StatusServiceUnavailable || empty.Header().Get("Retry-After") != "60" || unavailable.Code != "snapshot_unavailable" {
+		t.Fatalf("empty refresh failure = %d retry=%q %#v, %v", empty.Code, empty.Header().Get("Retry-After"), unavailable, err)
+	}
+
+	// Query Workbench 的异步入口持久化 queued Run；相同幂等键重放同一 Run，
+	// 不同 payload 冲突，执行后可从轮询入口读到终态 Envelope。
+	runFreshUntil := now.Add(time.Hour)
+	feed.results[primary.ID] = itemResult("Workbench result", "https://example.com/workbench", runFreshUntil)
+	feed.calls, queued = nil, nil
+	runBody := CreateRunInput{Kind: subscription.RunKindQuery, Operation: operation}
+	runHeaders := map[string]string{"Idempotency-Key": "stage-c-query"}
+	runResponse := do(http.MethodPost, "/v1/runs", runBody, runHeaders)
+	var queuedRun core.Run
+	if err := json.Unmarshal(runResponse.Body.Bytes(), &queuedRun); err != nil || runResponse.Code != http.StatusAccepted || queuedRun.Status != core.RunQueued || len(queued) != 1 {
+		t.Fatalf("create query Run = %d %#v queued=%d, %v", runResponse.Code, queuedRun, len(queued), err)
+	}
+	replayed := do(http.MethodPost, "/v1/runs", runBody, runHeaders)
+	var replayedRun core.Run
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replayedRun); err != nil || replayed.Code != http.StatusAccepted || replayedRun.ID != queuedRun.ID || len(queued) != 2 {
+		t.Fatalf("replay query Run = %d %#v queued=%d, %v", replayed.Code, replayedRun, len(queued), err)
+	}
+	changedOperation := operation
+	changedOperation.Limit--
+	conflict := do(http.MethodPost, "/v1/runs", CreateRunInput{Kind: subscription.RunKindQuery, Operation: changedOperation}, runHeaders)
+	var conflictProblem Problem
+	if err := json.Unmarshal(conflict.Body.Bytes(), &conflictProblem); err != nil || conflict.Code != http.StatusConflict || conflictProblem.Code != "idempotency_conflict" {
+		t.Fatalf("query Run idempotency conflict = %d %#v, %v", conflict.Code, conflictProblem, err)
+	}
+	// replay 会再次派发 queued Run 以恢复孤儿任务；两个 task 都执行，Store
+	// claim CAS 仍只允许一个 task 真正访问上游。
+	for _, task := range queued {
+		task()
+	}
+	queued = nil
+	polled := do(http.MethodGet, "/v1/runs/"+queuedRun.ID, nil, nil)
+	var completedRun core.Run
+	if err := json.Unmarshal(polled.Body.Bytes(), &completedRun); err != nil || polled.Code != http.StatusOK || completedRun.Status != core.RunComplete || completedRun.Result == nil || len(feed.calls) != 1 {
+		t.Fatalf("poll query Run = %d %#v calls=%v, %v", polled.Code, completedRun, feed.calls, err)
+	}
+
+	// Credential 默认和列表只回显掩码，include_value 才回显原值且禁止缓存；
+	// PUT 使用强 If-Match，PATCH、陈旧 CAS 与被引用 DELETE 都被拒绝。
+	credentialValue := "user:fixture-password"
+	credential := map[string]any{
+		"id": "stage-c-proxy-credential", "provider": "egress", "auth_kind": "basic",
+		"label": "Stage C proxy", "value": credentialValue, "enabled": true,
+	}
+	credentialResponse := do(http.MethodPost, "/v1/credentials", credential, nil)
+	var credentialSummary core.CredentialSummary
+	if err := json.Unmarshal(credentialResponse.Body.Bytes(), &credentialSummary); err != nil || credentialResponse.Code != http.StatusCreated || !credentialSummary.HasValue || credentialSummary.ValueMasked == "" || bytes.Contains(credentialResponse.Body.Bytes(), []byte(credentialValue)) {
+		t.Fatalf("create Credential = %d %#v, %v: %s", credentialResponse.Code, credentialSummary, err, credentialResponse.Body.String())
+	}
+	defaultDetail := do(http.MethodGet, "/v1/credentials/stage-c-proxy-credential", nil, nil)
+	var credentialDetail core.CredentialDetail
+	if err := json.Unmarshal(defaultDetail.Body.Bytes(), &credentialDetail); err != nil || defaultDetail.Code != http.StatusOK || credentialDetail.Value != nil || !credentialDetail.HasValue || defaultDetail.Header().Get("Cache-Control") != "" {
+		t.Fatalf("default Credential detail = %d %#v cache=%q, %v", defaultDetail.Code, credentialDetail, defaultDetail.Header().Get("Cache-Control"), err)
+	}
+	includeValue := do(http.MethodGet, "/v1/credentials/stage-c-proxy-credential?include_value=true", nil, nil)
+	if err := json.Unmarshal(includeValue.Body.Bytes(), &credentialDetail); err != nil || includeValue.Code != http.StatusOK || credentialDetail.Value == nil || *credentialDetail.Value != credentialValue || includeValue.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Credential include_value = %d %#v cache=%q, %v", includeValue.Code, credentialDetail, includeValue.Header().Get("Cache-Control"), err)
+	}
+	if response := do(http.MethodPatch, "/v1/credentials/stage-c-proxy-credential", map[string]any{"enabled": false}, nil); response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("Credential PATCH = %d: %s", response.Code, response.Body.String())
+	}
+	if response := do(http.MethodPut, "/v1/credentials/stage-c-proxy-credential", credential, nil); response.Code != http.StatusPreconditionRequired {
+		t.Fatalf("Credential PUT without If-Match = %d: %s", response.Code, response.Body.String())
+	}
+	if response := do(http.MethodPut, "/v1/credentials/stage-c-proxy-credential", credential, map[string]string{"If-Match": "1"}); response.Code != http.StatusBadRequest {
+		t.Fatalf("Credential PUT with bare revision = %d: %s", response.Code, response.Body.String())
+	}
+	replacementValue := "user:replacement-password"
+	replacement := map[string]any{
+		"id": "stage-c-proxy-credential", "provider": "egress", "auth_kind": "basic",
+		"label": "Stage C proxy", "value": replacementValue, "enabled": true,
+	}
+	updatedCredential := do(http.MethodPut, "/v1/credentials/stage-c-proxy-credential", replacement, map[string]string{"If-Match": `"1"`})
+	if updatedCredential.Code != http.StatusOK || updatedCredential.Header().Get("ETag") != `"2"` || bytes.Contains(updatedCredential.Body.Bytes(), []byte(replacementValue)) {
+		t.Fatalf("Credential PUT = %d %s: %s", updatedCredential.Code, updatedCredential.Header().Get("ETag"), updatedCredential.Body.String())
+	}
+	if response := do(http.MethodPut, "/v1/credentials/stage-c-proxy-credential", replacement, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusConflict {
+		t.Fatalf("Credential stale PUT = %d: %s", response.Code, response.Body.String())
+	}
+	egressResponse := do(http.MethodPost, "/v1/egress-profiles", map[string]any{
+		"id": "stage-c-http-proxy", "mode": core.EgressModeHTTPProxy,
+		"proxy_endpoint": "http://127.0.0.1:18080", "credential_id": "stage-c-proxy-credential", "enabled": true,
+	}, nil)
+	if egressResponse.Code != http.StatusCreated {
+		t.Fatalf("create referenced Egress = %d: %s", egressResponse.Code, egressResponse.Body.String())
+	}
+	deleteCredential := do(http.MethodDelete, "/v1/credentials/stage-c-proxy-credential", nil, map[string]string{"If-Match": `"2"`})
+	var inUse Problem
+	if err := json.Unmarshal(deleteCredential.Body.Bytes(), &inUse); err != nil || deleteCredential.Code != http.StatusConflict || inUse.Code != "resource_in_use" {
+		t.Fatalf("delete referenced Credential = %d %#v, %v", deleteCredential.Code, inUse, err)
+	}
+	revoked := do(http.MethodPost, "/v1/credentials/stage-c-proxy-credential/revoke", nil, map[string]string{"If-Match": `"2"`})
+	if err := json.Unmarshal(revoked.Body.Bytes(), &credentialSummary); err != nil || revoked.Code != http.StatusOK || revoked.Header().Get("ETag") != `"3"` || revoked.Header().Get("Cache-Control") != "no-store" || credentialSummary.HasValue || credentialSummary.Enabled {
+		t.Fatalf("revoke Credential = %d %#v cache=%q, %v", revoked.Code, credentialSummary, revoked.Header().Get("Cache-Control"), err)
+	}
+
+	// 其余 Dashboard 资源走同一 POST / 完整 PUT / DELETE 合同，但每条路由
+	// 仍用真实 Management + SQLite 重放一次，避免 OpenAPI 存在却 handler 漏装。
+	crudEgress := map[string]any{"id": "stage-c-crud-egress", "mode": core.EgressModeDirect, "enabled": true}
+	if response := do(http.MethodPost, "/v1/egress-profiles", crudEgress, nil); response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create CRUD Egress = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodGet, "/v1/egress-profiles/stage-c-crud-egress", nil, nil); response.Code != http.StatusOK || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("get CRUD Egress = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodPut, "/v1/egress-profiles/stage-c-crud-egress", crudEgress, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace CRUD Egress = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodDelete, "/v1/egress-profiles/stage-c-crud-egress", nil, map[string]string{"If-Match": `"2"`}); response.Code != http.StatusNoContent {
+		t.Fatalf("delete CRUD Egress = %d: %s", response.Code, response.Body.String())
+	}
+
+	githubEndpoint := map[string]any{
+		"id": "stage-c-github-endpoint", "provider": "github-api", "base_url": "https://api.github.com",
+		"egress_profile_id": "stage-c-direct",
+	}
+	if response := do(http.MethodPost, "/v1/endpoint-profiles", githubEndpoint, nil); response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create CRUD Endpoint = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodGet, "/v1/endpoint-profiles/stage-c-github-endpoint", nil, nil); response.Code != http.StatusOK || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("get CRUD Endpoint = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodPut, "/v1/endpoint-profiles/stage-c-github-endpoint", githubEndpoint, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace CRUD Endpoint = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	githubChannel := map[string]any{
+		"id": "stage-c-github-channel", "display_name": "Stage C GitHub", "source_id": "github",
+		"route_template_id": "github-native-search", "endpoint_profile_id": "stage-c-github-endpoint",
+		"priority": 70, "enabled": true,
+	}
+	if response := do(http.MethodPost, "/v1/channels", githubChannel, nil); response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create CRUD Channel = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodGet, "/v1/channels/stage-c-github-channel", nil, nil); response.Code != http.StatusOK || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("get CRUD Channel = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	githubChannel["display_name"] = "Stage C GitHub replaced"
+	if response := do(http.MethodPut, "/v1/channels/stage-c-github-channel", githubChannel, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace CRUD Channel = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	collection := map[string]any{
+		"id": "stage-c-crud-collection", "title": "Stage C collection", "position": 1,
+		"channel_ids": []string{"stage-c-github-channel"}, "enabled": true,
+	}
+	if response := do(http.MethodPost, "/v1/collections", collection, nil); response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create CRUD Collection = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodGet, "/v1/collections/stage-c-crud-collection", nil, nil); response.Code != http.StatusOK || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("get CRUD Collection = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	collection["title"] = "Stage C collection replaced"
+	if response := do(http.MethodPut, "/v1/collections/stage-c-crud-collection", collection, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace CRUD Collection = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	disposableView := ViewInput{ID: "stage-c-crud-view", DisplayName: "Stage C CRUD view", Operation: operation, Enabled: false}
+	if response := do(http.MethodPost, "/v1/views", disposableView, nil); response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create CRUD View = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodGet, "/v1/views/stage-c-crud-view", nil, nil); response.Code != http.StatusOK || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("get CRUD View = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	disposableView.DisplayName = "Stage C CRUD view replaced"
+	if response := do(http.MethodPut, "/v1/views/stage-c-crud-view", disposableView, map[string]string{"If-Match": `"1"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace CRUD View = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if response := do(http.MethodDelete, "/v1/views/stage-c-crud-view", nil, map[string]string{"If-Match": `"2"`}); response.Code != http.StatusNoContent {
+		t.Fatalf("delete CRUD View = %d: %s", response.Code, response.Body.String())
+	}
+
+	// 非 Feed Provider 必须在执行 Adapter 前返回 unsupported，并且不创建
+	// 可被 readiness 当成实时网络事实的 Probe health。
+	unsupportedCatalog, err := loadCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupportedService := health.Service{Store: store, Catalog: unsupportedCatalog, InstanceID: "stage-c-health-unsupported", Now: func() time.Time { return now }}
+	unsupportedRun, createdUnsupported, err := unsupportedService.CreateProbeRun(ctx, "stage-c-github-channel", "stage-c-health-unsupported")
+	if err != nil || !createdUnsupported {
+		t.Fatalf("create unsupported Probe = %#v created=%v, %v", unsupportedRun, createdUnsupported, err)
+	}
+	unsupportedRun, err = unsupportedService.ProcessRun(ctx, unsupportedRun.ID)
+	unsupportedRecords, listErr := store.ListProbeHealth(ctx, repository.ProbeHealthFilter{ChannelID: "stage-c-github-channel", ActiveAt: now, Limit: 10})
+	if err != nil || listErr != nil || unsupportedRun.Status != core.RunFailed || unsupportedRun.LastError == nil || unsupportedRun.LastError.Details["reason"] != "probe_unsupported" || len(unsupportedRecords) != 0 {
+		t.Fatalf("unsupported Probe = %#v records=%#v, process=%v list=%v", unsupportedRun, unsupportedRecords, err, listErr)
+	}
+	collection["channel_ids"] = []string{}
+	if response := do(http.MethodPut, "/v1/collections/stage-c-crud-collection", collection, map[string]string{"If-Match": `"2"`}); response.Code != http.StatusOK || response.Header().Get("ETag") != `"3"` {
+		t.Fatalf("clear CRUD Collection = %d %s: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	for _, deletion := range []struct {
+		path     string
+		revision string
+	}{
+		{path: "/v1/collections/stage-c-crud-collection", revision: `"3"`},
+		{path: "/v1/channels/stage-c-github-channel", revision: `"2"`},
+		{path: "/v1/endpoint-profiles/stage-c-github-endpoint", revision: `"2"`},
+	} {
+		if response := do(http.MethodDelete, deletion.path, nil, map[string]string{"If-Match": deletion.revision}); response.Code != http.StatusNoContent {
+			t.Fatalf("delete CRUD resource %s = %d: %s", deletion.path, response.Code, response.Body.String())
+		}
+	}
+
+	// 显式 loopback 开发 Origin 只获得 Dashboard 管理面的 CORS；同步 Query
+	// API 仍拒绝跨 Origin，请求不会借开发配置扩大无状态检索面。
+	devOrigin := map[string]string{"Origin": "http://localhost:5173"}
+	managementCORS := do(http.MethodGet, "/v1/credentials", nil, devOrigin)
+	if managementCORS.Code != http.StatusOK || managementCORS.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
+		t.Fatalf("Dashboard CORS = %d allow=%q: %s", managementCORS.Code, managementCORS.Header().Get("Access-Control-Allow-Origin"), managementCORS.Body.String())
+	}
+	preflight := do(http.MethodOptions, "/v1/credentials", nil, map[string]string{
+		"Origin": "http://localhost:5173", "Access-Control-Request-Method": http.MethodPost,
+		"Access-Control-Request-Headers": "content-type",
+	})
+	if preflight.Code != http.StatusNoContent || preflight.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" {
+		t.Fatalf("Dashboard preflight = %d allow=%q: %s", preflight.Code, preflight.Header().Get("Access-Control-Allow-Origin"), preflight.Body.String())
+	}
+	queryCORS := do(http.MethodPost, "/v1/search", map[string]any{}, devOrigin)
+	if queryCORS.Code != http.StatusForbidden || queryCORS.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("Query CORS = %d allow=%q: %s", queryCORS.Code, queryCORS.Header().Get("Access-Control-Allow-Origin"), queryCORS.Body.String())
+	}
+
+	// Probe health 只持久化脱敏报告。两个除 Egress 外相同的 Channel 保留各自
+	// ready/degraded 事实，只在 route-group 聚合层得到 ready_dependent。
+	if _, err := managementService.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "stage-c-direct-alt", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	primaryAlt, err := managementService.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+		SourceID: primary.Source, ChannelID: "stage-c-primary-alt", EgressProfileID: "stage-c-direct-alt",
+		URL: "https://feeds.example.com/stage-c.xml", Priority: 80,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := loadCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryChannel, _ := catalog.Channel(primary.ID)
+	primaryAltChannel, _ := catalog.Channel(primaryAlt.ID)
+	primaryEgress, _ := catalog.EgressProfile(primaryChannel.EgressProfileID)
+	primaryAltEgress, _ := catalog.EgressProfile(primaryAltChannel.EgressProfileID)
+	routeGroup, err := health.RouteGroupKey(catalog, primaryChannel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	altRouteGroup, err := health.RouteGroupKey(catalog, primaryAltChannel)
+	if err != nil || routeGroup != altRouteGroup {
+		t.Fatalf("health route groups = %q/%q, %v", routeGroup, altRouteGroup, err)
+	}
+	differentSource := primaryChannel
+	differentSource.Source = secondary.Source
+	differentTarget := primaryChannel
+	differentTarget.Parameters = map[string]any{"url": "https://feeds.example.com/other.xml"}
+	differentParameters := primaryChannel
+	differentParameters.Parameters = map[string]any{"url": primaryChannel.Parameters["url"], "variant": "different"}
+	differentCredential := primaryChannel
+	differentCredential.CredentialID = "stage-c-proxy-credential"
+	for name, candidate := range map[string]core.Channel{
+		"source": differentSource, "target": differentTarget,
+		"parameters": differentParameters, "credential": differentCredential,
+	} {
+		candidateGroup, err := health.RouteGroupKey(catalog, candidate)
+		if err != nil || candidateGroup == routeGroup {
+			t.Fatalf("health route group ignored %s difference: %q, %v", name, candidateGroup, err)
+		}
+	}
+	checkedAt, expiresAt := now.UTC(), now.Add(15*time.Minute).UTC()
+	probeSecret := "probe-body-must-not-persist"
+	probeResult := successfulFeedResult(core.Item{
+		URL: "https://example.com/probe-secret", Title: "Probe item",
+		Content: core.Content{Role: core.ContentBody, Text: &probeSecret, SourceSupplied: true},
+		Observations: []core.Observation{{
+			OriginalURL: "https://example.com/probe-secret", Verification: core.VerificationBody,
+		}},
+	})
+	probeResult.ProviderState = map[string]string{"http_status": "200", "content_type": "application/rss+xml", "feed_type": "rss"}
+	probeService := health.Service{
+		Store: store, Catalog: catalog, InstanceID: "stage-c-health", Now: func() time.Time { return checkedAt },
+		Feed: fakeFeedProber{report: adapter.FeedProbeReport{
+			CheckedAt: checkedAt,
+			Egress:    core.ExecutionEgress{ProfileID: primaryEgress.ID, Mode: primaryEgress.Mode},
+			Result:    probeResult,
+		}},
+	}
+	probeRun, createdProbe, err := probeService.CreateProbeRun(ctx, primary.ID, "stage-c-health-ready")
+	if err != nil || !createdProbe {
+		t.Fatalf("create health Probe = %#v created=%v, %v", probeRun, createdProbe, err)
+	}
+	probeRun, err = probeService.ProcessRun(ctx, probeRun.ID)
+	if err != nil || probeRun.Status != core.RunComplete {
+		t.Fatalf("process health Probe = %#v, %v", probeRun, err)
+	}
+	storedReady, err := store.ListProbeHealth(ctx, repository.ProbeHealthFilter{ChannelID: primary.ID, ActiveAt: checkedAt, Limit: 10})
+	if err != nil || len(storedReady) != 1 || !storedReady[0].Passed {
+		t.Fatalf("stored ready Probe = %#v, %v", storedReady, err)
+	}
+	degradedReport, err := json.Marshal(map[string]any{
+		"readiness": "degraded",
+		"feed":      map[string]any{"error": core.Error{Code: core.ErrorNetwork, Message: "fixture network unavailable", Retryable: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []core.ChannelProbeRecord{
+		storedReady[0],
+		{ID: "probe-stage-c-degraded", ChannelID: primaryAlt.ID, RouteGroup: routeGroup, Egress: core.ExecutionEgress{ProfileID: primaryAltEgress.ID, Mode: primaryAltEgress.Mode}, ChannelRevision: primaryAltChannel.Revision, EgressRevision: primaryAltEgress.Revision, CheckedAt: checkedAt, ExpiresAt: expiresAt, Report: degradedReport},
+	}
+	if err := store.PutProbeHealth(ctx, records[1]); err != nil {
+		t.Fatal(err)
+	}
+	encodedRecords, err := json.Marshal(records)
+	if err != nil || bytes.Contains(encodedRecords, []byte(`"items"`)) || bytes.Contains(encodedRecords, []byte(`"body"`)) || bytes.Contains(encodedRecords, []byte(probeSecret)) || bytes.Contains(encodedRecords, []byte("127.0.0.1:18080")) {
+		t.Fatalf("persisted Probe report contains content or proxy material: %s, %v", encodedRecords, err)
+	}
+	readinessResponse := do(http.MethodGet, "/v1/readiness", nil, nil)
+	var report readiness.Report
+	if err := json.Unmarshal(readinessResponse.Body.Bytes(), &report); err != nil || readinessResponse.Code != http.StatusOK || len(report.RouteGroups) != 1 || report.RouteGroups[0].Readiness != readiness.StateReadyDependent {
+		t.Fatalf("readiness aggregate = %d %#v, %v", readinessResponse.Code, report, err)
+	}
+	states := make(map[string]readiness.State)
+	for _, channel := range report.Channels {
+		states[channel.ChannelID] = channel.Readiness
+		if channel.Readiness == readiness.StateReadyDependent {
+			t.Fatalf("single Channel leaked ready_dependent: %#v", channel)
+		}
+	}
+	if states[primary.ID] != readiness.StateReady || states[primaryAlt.ID] != readiness.StateDegraded {
+		t.Fatalf("single Channel health states = %#v", states)
+	}
+
+	// Probe 失败 TTL 由错误是否可重试决定；过期或资源 revision 不匹配的
+	// 记录不能继续改变 readiness，不同执行语义也不能误聚合成出口依赖。
+	secondaryChannel, _ := catalog.Channel(secondary.ID)
+	secondaryEgress, _ := catalog.EgressProfile(secondaryChannel.EgressProfileID)
+	failureRecords := make([]core.ChannelProbeRecord, 0, 2)
+	for _, failure := range []struct {
+		key       string
+		problem   core.Error
+		transient bool
+		ttl       time.Duration
+	}{
+		{key: "stage-c-health-transient", problem: core.Error{Code: core.ErrorNetwork, Message: "fixture network unavailable", Retryable: true}, transient: true, ttl: 5 * time.Minute},
+		{key: "stage-c-health-deterministic", problem: core.Error{Code: core.ErrorProtocol, Message: "fixture feed is invalid"}, transient: false, ttl: 15 * time.Minute},
+	} {
+		failureService := health.Service{
+			Store: store, Catalog: catalog, InstanceID: "stage-c-health-failure", Now: func() time.Time { return checkedAt },
+			Feed: fakeFeedProber{report: adapter.FeedProbeReport{
+				CheckedAt: checkedAt,
+				Egress:    core.ExecutionEgress{ProfileID: secondaryEgress.ID, Mode: secondaryEgress.Mode},
+				Result:    core.AdapterResult{Errors: []core.Error{failure.problem}},
+			}},
+		}
+		failureRun, created, err := failureService.CreateProbeRun(ctx, secondary.ID, failure.key)
+		if err != nil || !created {
+			t.Fatalf("create failed Probe %s = %#v created=%v, %v", failure.key, failureRun, created, err)
+		}
+		failureRun, err = failureService.ProcessRun(ctx, failureRun.ID)
+		if err != nil || failureRun.Status != core.RunFailed {
+			t.Fatalf("process failed Probe %s = %#v, %v", failure.key, failureRun, err)
+		}
+		stored, err := store.ListProbeHealth(ctx, repository.ProbeHealthFilter{ChannelID: secondary.ID, ActiveAt: checkedAt, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var matched *core.ChannelProbeRecord
+		for index := range stored {
+			if stored[index].Transient == failure.transient && !stored[index].Passed && stored[index].ExpiresAt.Sub(stored[index].CheckedAt) == failure.ttl {
+				matched = &stored[index]
+				break
+			}
+		}
+		if matched == nil {
+			t.Fatalf("failed Probe %s misses transient=%v ttl=%s: %#v", failure.key, failure.transient, failure.ttl, stored)
+		}
+		failureRecords = append(failureRecords, *matched)
+	}
+
+	revisionMismatch := storedReady[0]
+	revisionMismatch.ChannelRevision++
+	mismatchReport := readiness.FromProbeHealth(catalog, []core.ChannelProbeRecord{revisionMismatch}, checkedAt)
+	for _, channel := range mismatchReport.Channels {
+		if channel.ChannelID == primary.ID && channel.Readiness == readiness.StateReady {
+			t.Fatalf("revision-mismatched Probe remained ready: %#v", channel)
+		}
+	}
+	expiredReport := readiness.FromProbeHealth(catalog, []core.ChannelProbeRecord{storedReady[0]}, storedReady[0].ExpiresAt)
+	for _, channel := range expiredReport.Channels {
+		if channel.ChannelID == primary.ID && channel.Readiness == readiness.StateReady {
+			t.Fatalf("expired Probe remained ready: %#v", channel)
+		}
+	}
+	wrongGroupReport := readiness.FromProbeHealth(catalog, []core.ChannelProbeRecord{storedReady[0], failureRecords[0]}, checkedAt)
+	for _, group := range wrongGroupReport.RouteGroups {
+		if group.Readiness == readiness.StateReadyDependent {
+			t.Fatalf("different targets were aggregated as ready_dependent: %#v", group)
+		}
+	}
+
+	// Tombstone 使用真实 Snapshot StateKey：命中的 primary Observation 被滤除，
+	// 同一 identity 的 secondary Observation 仍使 Item 保持可见。
+	tombstoneOperation := stage2Operation(core.OperationLatest, []string{primary.ID, secondary.ID}, 10)
+	tombstoneOperation.RoutePolicy.Aggregate = true
+	tombstoneView := do(http.MethodPost, "/v1/views", ViewInput{
+		ID: "stage-c-tombstone", DisplayName: "Stage C tombstone", Operation: tombstoneOperation, Enabled: true,
+	}, nil)
+	if tombstoneView.Code != http.StatusCreated {
+		t.Fatalf("create tombstone View = %d: %s", tombstoneView.Code, tombstoneView.Body.String())
+	}
+	sharedURL := "https://example.com/shared-identity"
+	refresh := func(key string) core.Run {
+		t.Helper()
+		run, created, err := subscriptionService.CreateViewRefreshRun(ctx, "stage-c-tombstone", key)
+		if err != nil || !created {
+			t.Fatalf("create tombstone refresh Run = %#v created=%v, %v", run, created, err)
+		}
+		run, err = subscriptionService.ProcessRun(ctx, run.ID)
+		if err != nil || run.Status != core.RunComplete {
+			t.Fatalf("process tombstone refresh Run = %#v, %v", run, err)
+		}
+		return run
+	}
+	freshUntil = now.Add(time.Hour)
+	feed.results[primary.ID] = itemResult("Shared item", sharedURL, freshUntil)
+	feed.results[secondary.ID] = itemResult("Shared item", sharedURL, freshUntil)
+	refresh("stage-c-tombstone-1")
+	firstTombstoneSnapshot, err := subscriptionService.ReadSnapshot(ctx, "stage-c-tombstone", false)
+	if err != nil || len(firstTombstoneSnapshot.Envelope.Items) != 1 || len(firstTombstoneSnapshot.Envelope.Items[0].Observations) != 2 {
+		t.Fatalf("first tombstone Snapshot = %#v, %v", firstTombstoneSnapshot, err)
+	}
+	identity := firstTombstoneSnapshot.Envelope.Items[0].Identity.ClusterID
+	now = now.Add(time.Hour)
+	freshUntil = now.Add(time.Hour)
+	feed.results[primary.ID], feed.results[secondary.ID] = emptyResult(freshUntil), itemResult("Shared item", sharedURL, freshUntil)
+	refresh("stage-c-tombstone-2")
+	tombstones, err := store.ListActiveTombstones(ctx, repository.TombstoneFilter{ViewID: "stage-c-tombstone", ActiveAt: now})
+	if err != nil || len(tombstones) != 1 || tombstones[0].Identity != identity || tombstones[0].State.ChannelID != primary.ID {
+		t.Fatalf("persisted tombstones = %#v, %v", tombstones, err)
+	}
+	now = now.Add(time.Hour)
+	freshUntil = now.Add(time.Hour)
+	feed.results[primary.ID] = itemResult("Shared item", sharedURL, freshUntil)
+	feed.results[secondary.ID] = itemResult("Shared item", sharedURL, freshUntil)
+	refresh("stage-c-tombstone-3")
+	filtered, err := subscriptionService.ReadSnapshot(ctx, "stage-c-tombstone", false)
+	if err != nil || len(filtered.Envelope.Items) != 1 || filtered.Envelope.Items[0].Identity.ClusterID != identity || len(filtered.Envelope.Items[0].Observations) != 1 || filtered.Envelope.Items[0].Observations[0].ChannelID != secondary.ID {
+		t.Fatalf("tombstone filtered Snapshot = %#v, %v", filtered, err)
+	}
 }

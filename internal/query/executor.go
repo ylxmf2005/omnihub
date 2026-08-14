@@ -347,6 +347,14 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 
 	// Coverage 是 Adapter 成功完成其声明窗口的证据；即使 Items 为空或同时
 	// 带有局部 Error，该 Channel 仍是 completed，由 Envelope 聚合为 partial。
+	if result.FreshUntil != nil {
+		_, offset := result.FreshUntil.Zone()
+		if result.FreshUntil.IsZero() || offset != 0 {
+			return false, fmt.Errorf("%w: adapter channel %s returned invalid fresh_until", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		freshUntil := result.FreshUntil.UTC()
+		execution.FreshUntil = &freshUntil
+	}
 	execution.Status = core.ExecutionCompleted
 	run.executions = append(run.executions, execution)
 	run.coverage = append(run.coverage, result.Coverage...)

@@ -167,6 +167,7 @@ type Execution struct {
 	Reason          *string          `json:"reason,omitempty"`
 	StartedAt       time.Time        `json:"started_at"`
 	DurationMS      int64            `json:"duration_ms"`
+	FreshUntil      *time.Time       `json:"fresh_until,omitempty"`
 	Examined        int              `json:"examined"`
 	Returned        int              `json:"returned"`
 	Auth            ExecutionAuth    `json:"auth"`
@@ -353,4 +354,5 @@ type AdapterResult struct {
 	Errors        []Error           `json:"errors"`
 	Limitations   []string          `json:"limitations,omitempty"`
 	ProviderState map[string]string `json:"provider_state,omitempty"`
+	FreshUntil    *time.Time        `json:"fresh_until,omitempty"`
 }

@@ -20,18 +20,44 @@ import (
 
 const maxOperationBodyBytes = 1 << 20
 
+const problemTypeBase = "https://omnihub.dev/problems/"
+
 // ErrExecutionConfiguration 让所有公共出口区分本机配置不可用与内部故障。
 var ErrExecutionConfiguration = errors.New("operation execution configuration is unavailable")
 
 // ExecuteFunc 是 CLI、HTTP 与 MCP 共享的唯一 Operation 执行边界。
 type ExecuteFunc func(context.Context, core.Operation) (core.Envelope, error)
 
+// Problem 是所有预执行 HTTP 错误共享的 RFC 9457 载体。Code 供本地
+// Dashboard 稳定分支，Detail 只解释本次失败且不得携带凭据。
+type Problem struct {
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+}
+
 // NewHTTPHandler 暴露无状态 Query API、OpenAPI 文档和 Streamable HTTP MCP。
 func NewHTTPHandler(execute ExecuteFunc) (http.Handler, error) {
+	handler, err := newQueryHTTPHandler(execute, false)
+	if err != nil {
+		return nil, err
+	}
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !trustedLoopbackHost(request.Host) || !sameOriginRequest(request) {
+			writeProblem(writer, http.StatusForbidden, "Forbidden", "request Host or Origin is not trusted")
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}), nil
+}
+
+func newQueryHTTPHandler(execute ExecuteFunc, dashboardOpenAPI bool) (http.Handler, error) {
 	if execute == nil {
 		return nil, errors.New("execute function is required")
 	}
-	artifacts, err := Generate()
+	artifacts, err := generateArtifacts(dashboardOpenAPI)
 	if err != nil {
 		return nil, fmt.Errorf("generate transport artifacts: %w", err)
 	}
@@ -46,10 +72,6 @@ func NewHTTPHandler(execute ExecuteFunc) (http.Handler, error) {
 	)
 
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !trustedLoopbackRequest(request) {
-			writeProblem(writer, http.StatusForbidden, "Forbidden", "request Host or Origin is not trusted")
-			return
-		}
 		var operation core.OperationKind
 		switch request.URL.Path {
 		case "/v1/search":
@@ -88,25 +110,42 @@ func NewHTTPHandler(execute ExecuteFunc) (http.Handler, error) {
 	}), nil
 }
 
-func trustedLoopbackRequest(request *http.Request) bool {
-	host := request.Host
+func trustedLoopbackHost(value string) bool {
+	host := value
 	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
 		host = parsedHost
 	}
 	host = strings.Trim(host, "[]")
 	address := net.ParseIP(host)
-	if host != "localhost" && (address == nil || !address.IsLoopback()) {
-		return false
-	}
-	origin := request.Header.Get("Origin")
-	if origin == "" {
+	return strings.EqualFold(host, "localhost") || address != nil && address.IsLoopback()
+}
+
+func sameOriginRequest(request *http.Request) bool {
+	origins := request.Header.Values("Origin")
+	if len(origins) == 0 {
 		return true
 	}
-	parsed, err := url.Parse(origin)
-	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" || parsed.Scheme != "http" && parsed.Scheme != "https" {
+	if len(origins) != 1 || origins[0] == "" {
 		return false
 	}
-	return strings.EqualFold(parsed.Host, request.Host)
+	origin := origins[0]
+	parsed, err := parseOrigin(origin)
+	if err != nil {
+		return false
+	}
+	scheme := "http"
+	if request.TLS != nil {
+		scheme = "https"
+	}
+	return parsed.Scheme == scheme && strings.EqualFold(parsed.Host, request.Host)
+}
+
+func parseOrigin(origin string) (*url.URL, error) {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" || parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("invalid origin")
+	}
+	return parsed, nil
 }
 
 // NewMCPServer 构造与 HTTP MCP 使用相同 Tool 和执行函数的 Server。
@@ -114,7 +153,7 @@ func NewMCPServer(execute ExecuteFunc) (*mcp.Server, error) {
 	if execute == nil {
 		return nil, errors.New("execute function is required")
 	}
-	artifacts, err := Generate()
+	artifacts, err := generateArtifacts(false)
 	if err != nil {
 		return nil, fmt.Errorf("generate transport artifacts: %w", err)
 	}
@@ -313,12 +352,32 @@ func methodNotAllowed(writer http.ResponseWriter, allowed string) {
 }
 
 func writeProblem(writer http.ResponseWriter, status int, title, detail string) {
+	writeProblemCode(writer, status, title, httpProblemCode(status), detail)
+}
+
+func writeProblemCode(writer http.ResponseWriter, status int, title, code, detail string) {
 	writer.Header().Set("Content-Type", "application/problem+json")
 	writer.WriteHeader(status)
-	_ = json.NewEncoder(writer).Encode(struct {
-		Type   string `json:"type"`
-		Title  string `json:"title"`
-		Status int    `json:"status"`
-		Detail string `json:"detail"`
-	}{"about:blank", title, status, detail})
+	_ = json.NewEncoder(writer).Encode(Problem{Type: problemTypeBase + code, Title: title, Status: status, Code: code, Detail: detail})
+}
+
+func httpProblemCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusForbidden:
+		return "untrusted_request"
+	case http.StatusNotFound:
+		return "endpoint_not_found"
+	case http.StatusMethodNotAllowed:
+		return "method_not_allowed"
+	case http.StatusConflict:
+		return "execution_conflict"
+	case http.StatusRequestEntityTooLarge:
+		return "payload_too_large"
+	case http.StatusUnsupportedMediaType:
+		return "unsupported_media_type"
+	default:
+		return "internal_error"
+	}
 }
