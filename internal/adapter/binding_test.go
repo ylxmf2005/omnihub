@@ -2867,6 +2867,29 @@ func TestBrowserHostManifestUsesOneExactExtensionOrigin(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("native host manifest mode = %#v, %v", info, err)
 	}
+	otherManifest := filepath.Join(filepath.Dir(result.ManifestPath), "com.example.other.json")
+	userData := filepath.Join(home, "omnihub.db")
+	for path, content := range map[string]string{otherManifest: "other host", userData: "user data"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	uninstalled, err := browser.UninstallHost()
+	if err != nil || !uninstalled.Removed || uninstalled.Registration != result.ManifestPath {
+		t.Fatalf("UninstallHost() = %#v, %v", uninstalled, err)
+	}
+	if _, err := os.Stat(result.ManifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("native host manifest remained after uninstall: %v", err)
+	}
+	for _, preserved := range []string{executable, otherManifest, userData} {
+		if _, err := os.Stat(preserved); err != nil {
+			t.Fatalf("UninstallHost() removed unrelated path %s: %v", preserved, err)
+		}
+	}
+	uninstalled, err = browser.UninstallHost()
+	if err != nil || uninstalled.Removed || uninstalled.Registration != result.ManifestPath {
+		t.Fatalf("second UninstallHost() = %#v, %v", uninstalled, err)
+	}
 }
 
 func TestBrowserAuthorizationComesFromEnabledTrustedCatalog(t *testing.T) {
@@ -2878,7 +2901,7 @@ func TestBrowserAuthorizationComesFromEnabledTrustedCatalog(t *testing.T) {
 		},
 	}
 	channel := core.Channel{ID: "channel_x_cookie", Source: "x", RouteTemplateID: template.RouteTemplateID, Enabled: true}
-	catalog, err := registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{channel}, nil, nil, nil, nil, nil)
+	catalog, err := registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{channel}, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2889,7 +2912,7 @@ func TestBrowserAuthorizationComesFromEnabledTrustedCatalog(t *testing.T) {
 
 	disabled := channel
 	disabled.Enabled = false
-	catalog, err = registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{disabled}, nil, nil, nil, nil, nil)
+	catalog, err = registry.NewCatalog(nil, []core.Provider{{ID: "fixture", Enabled: true}}, []core.RouteTemplate{template}, []core.Channel{disabled}, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

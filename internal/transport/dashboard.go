@@ -233,7 +233,7 @@ func allowedMethods(path string) string {
 		switch segments[1] {
 		case "sources", "route-templates", "readiness", "browser-bridges":
 			return http.MethodGet
-		case "channels", "endpoint-profiles", "egress-profiles", "credentials", "collections", "views", "runs":
+		case "channels", "endpoint-profiles", "semantic-profiles", "egress-profiles", "credentials", "collections", "views", "runs":
 			return "GET, POST"
 		}
 	}
@@ -242,7 +242,7 @@ func allowedMethods(path string) string {
 			return http.MethodGet
 		}
 		switch segments[1] {
-		case "channels", "endpoint-profiles", "egress-profiles", "credentials", "collections", "views":
+		case "channels", "endpoint-profiles", "semantic-profiles", "egress-profiles", "credentials", "collections", "views":
 			return "GET, PUT, DELETE"
 		}
 	}
@@ -344,6 +344,8 @@ func (server *dashboardHTTPServer) serveDashboard(writer http.ResponseWriter, re
 		server.serveChannels(writer, request, segments)
 	case "endpoint-profiles":
 		server.serveEndpoints(writer, request, segments)
+	case "semantic-profiles":
+		server.serveSemanticProfiles(writer, request, segments)
 	case "egress-profiles":
 		server.serveEgressProfiles(writer, request, segments)
 	case "credentials":
@@ -704,6 +706,57 @@ func (server *dashboardHTTPServer) serveEndpoints(writer http.ResponseWriter, re
 			return
 		}
 		writeDeleteResult(writer, server.dependencies.Management.DeleteEndpoint(request.Context(), id, revision))
+	default:
+		methodNotAllowed(writer, "GET, PUT, DELETE")
+	}
+}
+
+func (server *dashboardHTTPServer) serveSemanticProfiles(writer http.ResponseWriter, request *http.Request, segments []string) {
+	if len(segments) == 2 {
+		switch request.Method {
+		case http.MethodGet:
+			values, err := server.dependencies.Management.ListSemanticProfiles(request.Context())
+			writeDashboardResult(writer, http.StatusOK, values, err)
+		case http.MethodPost:
+			var input management.ApplySemanticProfileInput
+			if !decodeDashboardJSON(writer, request, &input) {
+				return
+			}
+			input.ExpectedRevision = 0
+			value, err := server.dependencies.Management.ApplySemanticProfile(request.Context(), input)
+			writeRevisionResult(writer, http.StatusCreated, value, value.Revision, err)
+		default:
+			methodNotAllowed(writer, "GET, POST")
+		}
+		return
+	}
+	if len(segments) != 3 {
+		writeProblemCode(writer, http.StatusNotFound, "Not Found", "resource_not_found", "the requested semantic profile does not exist")
+		return
+	}
+	id := segments[2]
+	switch request.Method {
+	case http.MethodGet:
+		value, err := server.dependencies.Management.GetSemanticProfile(request.Context(), id)
+		writeRevisionResult(writer, http.StatusOK, value, value.Revision, err)
+	case http.MethodPut:
+		revision, ok := requireRevision(writer, request)
+		if !ok {
+			return
+		}
+		var input management.ApplySemanticProfileInput
+		if !decodeDashboardJSON(writer, request, &input) || !bindResourceID(writer, &input.ID, id) {
+			return
+		}
+		input.ExpectedRevision = revision
+		value, err := server.dependencies.Management.ApplySemanticProfile(request.Context(), input)
+		writeRevisionResult(writer, http.StatusOK, value, value.Revision, err)
+	case http.MethodDelete:
+		revision, ok := requireRevision(writer, request)
+		if !ok {
+			return
+		}
+		writeDeleteResult(writer, server.dependencies.Management.DeleteSemanticProfile(request.Context(), id, revision))
 	default:
 		methodNotAllowed(writer, "GET, PUT, DELETE")
 	}
@@ -1427,6 +1480,7 @@ func invalidDashboardError(err error) bool {
 		repository.ErrInvalidCredential, management.ErrInvalidChannel, management.ErrInvalidEndpoint,
 		management.ErrInvalidCollection, management.ErrInvalidDirectFeed, management.ErrInvalidEgress,
 		management.ErrInvalidRSSHub, management.ErrInvalidProviderConfig, management.ErrInvalidOPML,
+		management.ErrInvalidSemantic,
 		management.ErrUnsupportedTemplate, subscription.ErrInvalidRequest, subscription.ErrInvalidSnapshot,
 		subscription.ErrUnsupportedRun, subscription.ErrRunRequestUnavailable,
 	} {

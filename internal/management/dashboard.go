@@ -64,8 +64,8 @@ type ApplyCollectionInput struct {
 	ExpectedRevision int64    `json:"expected_revision"`
 }
 
-// ApplyEndpoint 把 Dashboard 的统一输入分派给已实现的 RSSHub 或官方
-// Provider Endpoint 写入口，不复制这些入口的边界校验。
+// ApplyEndpoint 把 Dashboard 的统一输入分派给 RSSHub、固定官方 Provider
+// 或用户拥有的 embedding Endpoint，不复制这些入口的 URL 与出口校验。
 func (service Service) ApplyEndpoint(ctx context.Context, input ApplyEndpointInput) (core.EndpointProfile, error) {
 	provider := strings.TrimSpace(input.Provider)
 	if provider == "rsshub" {
@@ -74,7 +74,12 @@ func (service Service) ApplyEndpoint(ctx context.Context, input ApplyEndpointInp
 			Trust: input.Trust, ExpectedRevision: input.ExpectedRevision,
 		})
 	}
-	if trust := strings.TrimSpace(input.Trust); trust != "" && trust != "official" {
+	trust := strings.TrimSpace(input.Trust)
+	if provider == "embedding" {
+		if trust != "" && trust != "user" {
+			return core.EndpointProfile{}, fmt.Errorf("%w: embedding endpoint trust must be user", ErrInvalidEndpoint)
+		}
+	} else if trust != "" && trust != "official" {
 		return core.EndpointProfile{}, fmt.Errorf("%w: official provider endpoint trust cannot be overridden", ErrInvalidEndpoint)
 	}
 	return service.ApplyProviderEndpoint(ctx, ApplyProviderEndpointInput{
@@ -412,6 +417,10 @@ type credentialDeleteStore interface {
 	DeleteCredential(context.Context, repository.DeleteCredential) error
 }
 
+type semanticViewStore interface {
+	ListViews(context.Context) ([]core.View, error)
+}
+
 // DeleteCredential 拒绝删除仍被 Channel 或 Egress 引用的记录；Store 会在
 // 同一事务推进 routing revision，使并发新增引用的一方 CAS 失败。撤销应
 // 使用 RevokeCredential；View 间接引用由 Subscription/API 层检查。
@@ -435,6 +444,11 @@ func (service Service) DeleteCredential(ctx context.Context, id string, expected
 	for _, profile := range routing.EgressProfiles {
 		if profile.CredentialID == id {
 			return fmt.Errorf("%w: credential %s is referenced by egress profile %s", repository.ErrInUse, id, profile.ID)
+		}
+	}
+	for _, profile := range routing.SemanticProfiles {
+		if profile.CredentialID == id {
+			return fmt.Errorf("%w: credential %s is referenced by semantic profile %s", repository.ErrInUse, id, profile.ID)
 		}
 	}
 	store, ok := service.Store.(credentialDeleteStore)
@@ -513,7 +527,52 @@ func (service Service) DeleteEndpoint(ctx context.Context, id string, expectedRe
 			return fmt.Errorf("%w: endpoint %s is referenced by channel %s", repository.ErrInUse, id, channel.ID)
 		}
 	}
+	for _, profile := range working.SemanticProfiles {
+		if profile.EndpointProfileID == id {
+			return fmt.Errorf("%w: endpoint %s is referenced by semantic profile %s", repository.ErrInUse, id, profile.ID)
+		}
+	}
 	working.Endpoints = slices.Delete(working.Endpoints, index, index+1)
+	_, err = service.saveRoutingCatalog(ctx, routing.Revision, working)
+	return err
+}
+
+// DeleteSemanticProfile 不级联修改 View、Endpoint、Credential 或 cache。
+// 仍被持久 View Operation 引用时必须由调用方先改写或删除 View。
+func (service Service) DeleteSemanticProfile(ctx context.Context, id string, expectedRevision int64) error {
+	if err := service.requireStore(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	if err := validateResourceID(id); err != nil || expectedRevision < 1 {
+		return fmt.Errorf("%w: profile id or expected revision is invalid", ErrInvalidSemantic)
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	index, exists := indexSemanticProfiles(working.SemanticProfiles)[id]
+	if !exists {
+		return fmt.Errorf("%w: semantic profile %s", repository.ErrNotFound, id)
+	}
+	if working.SemanticProfiles[index].Revision != expectedRevision {
+		return fmt.Errorf("%w: semantic profile %s revision is %d, expected %d", repository.ErrConflict, id, working.SemanticProfiles[index].Revision, expectedRevision)
+	}
+	store, ok := service.Store.(semanticViewStore)
+	if !ok {
+		return errors.New("configured store does not support semantic profile reference checks")
+	}
+	views, err := store.ListViews(ctx)
+	if err != nil {
+		return fmt.Errorf("list views: %w", err)
+	}
+	for _, view := range views {
+		if view.Operation.SemanticProfileID != nil && *view.Operation.SemanticProfileID == id {
+			return fmt.Errorf("%w: semantic profile %s is referenced by view %s", repository.ErrInUse, id, view.ID)
+		}
+	}
+	working.SemanticProfiles = slices.Delete(working.SemanticProfiles, index, index+1)
 	_, err = service.saveRoutingCatalog(ctx, routing.Revision, working)
 	return err
 }

@@ -1,42 +1,41 @@
-# Implementation：OmniHub Stage D Chrome Cookie Backend
+# Implementation：Stage E Semantic Grouping 与发布候选
 
 ## 实际交付
 
-- 对象与基线：`/private/tmp/omnihub-stage-a` 的 `feature/stage-d-chrome-bridge` 工作树，相对 Stage C `55286d9138d4af679737d65d39040b54d3b6d516` 的完整 Stage D diff。
-- 已实现行为：同一 `omnihub` 二进制可安装并作为 Chrome Native Messaging Host 直接启动；Host 通过当前用户 Unix socket/Windows named pipe 向 CLI/`serve` 暴露在线状态、精确 Cookie scope读取与permission撤销。Query只把Cookie交给显式mock consumer，Dashboard提供连接/授权/撤销合同和实时blocked readiness。
-- 根因与实现边界：localhost页面不能读取其他站点HttpOnly Cookie，Chrome manifest又不能传CLI子命令。实现把用户手势和`chrome.cookies`留给独立Companion Extension，把可信scope和单次执行约束放在Registry/Operation Service，把同一binary直接argv分派放在CLI入口；不增加通用Cookie Adapter、浏览器数据库解密、CDP或wrapper script。
+- 对象与基线：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release` 工作树，相对 Stage D `a8ef7f3d9e7a944b0e46dd3a4b4bdd2e348b732a`。
+- 已实现行为：Search/Latest 可显式引用 SemanticProfile，在最终排序与 exact identity dedupe 后调用 OpenAI-compatible `/v1/embeddings`，复用 SQLite cache 做确定性 cosine leader grouping；Item 数量、顺序与 provenance 不变。CLI、REST、MCP、JSONL、View、Run、Snapshot 与三种 Feed 共用同一 Operation/Envelope。
+- 根因与实现边界：一次 Operation 最多 100 个最终 Item，当前没有跨 Snapshot KNN。复用已有 SQLite，以 little-endian `float32` BLOB 缓存 cohort 向量并在 Go 内精确比较，是比引入 sqlite-vec、ANN 或第二数据库更小的正确实现。模型、dimension、Endpoint revision 与输入配方 revision 任一变化都会自然 cache miss。
 
 ## 变更
 
-- `internal/browser/`：strict Native Messaging framing/JSON、单Profile broker、取消/迟到响应、Client、typed error、scope/result双重校验、当前用户IPC、三平台manifest安装与可信AuthorizationDescriptor。
-- `internal/query/executor.go`、`internal/adapter/browser.go`：`CookieReader`与窄mock consumer；consumer存在后才读取，Cookie返回后清空；任何JSON可观察结果反射secret均fail-closed。
-- `internal/registry/catalog.go`、`internal/management/service.go`：Browser auth descriptor加载期验证；仅enabled+trusted Chrome Template可使用nil-value `chrome_cookie` Credential。
-- `internal/readiness/readiness.go`：Bridge离线或permission缺失始终阻断Channel并移除失真的历史`ready_dependent`；在线/授权不能把未Probe Channel提升为ready。
-- `internal/transport/dashboard.go`、`schema.go`：Bridge状态、Channel授权描述和permission撤销API；严格body、稳定Problem、OpenAPI/JSON Schema与既有Host/Origin/CORS边界。
-- `cmd/omnihub/main.go`：`chrome-host run/install`、Chrome origin argv直启、共享runtime IPC、Dashboard Browser Client与实时readiness装配；新增可测试的`OMNIHUB_RUNTIME_DIR`覆盖。
-- 既有`internal/adapter/binding_test.go`、`internal/transport/examples_test.go`、`internal/transport/schema_test.go`追加Stage D回归；没有新增test文件。
-- `shape/evidence/local-vector-study.md`及关联Shape产物：按当前锁定`modernc.org/sqlite v1.56.0`源码修正sqlite-vec事实，为Stage E保留正确入口，不改变Stage D运行代码。
+- `internal/core`、`internal/registry`、`internal/management`：增加 SemanticProfile、`semantic_profile_id`、score、错误分类、资源 CRUD/CAS、View 引用保护和统一 Catalog 投影。
+- `internal/semantic`、`internal/query`：实现静态 preflight、8 KiB UTF-8 输入 recipe、OpenAI-compatible batch、严格响应校验、cache hit/miss 合并、确定性分组与 `similarity_unavailable` partial 降级。
+- `internal/repository`、`internal/store/sqlite`：Schema v4、embedding cache cohort/BLOB、坏向量 fail-closed、30 天显式 prune 与旧 schema 只向前迁移。
+- `internal/egress`：远程 embedding 强制 HTTPS；明文 HTTP 只允许字面 loopback IP 经 direct Egress，管理写入与运行时复用同一安全判断。
+- `cmd/omnihub`、`internal/transport`：接通 CLI/REST/OpenAPI/MCP/JSONL/Subscription，增加 `version`、内嵌 `skill`、SemanticProfile 管理、Chrome Host uninstall；`channels probe` 同时返回 Run 和最新脱敏分层报告。
+- `skills/omnihub`、`README.md`：Skill 与二进制同版本分发，固定 Tool/CLI 格式，要求消费终态、披露 coverage/partial/semantic/provenance；文档区分 live、fixture 与 conditional 能力。
+- `.github/workflows/ci.yml`、`scripts/release.sh`：三平台原生 test/vet/build/smoke，以及 clean commit 上的三平台 archive、第三方许可与 SHA-256 生成。
+- 只扩展既有测试文件，没有新增 `*_test.go`。
 
 ## 偏离与决定
 
-- Channel readiness表达“现在能否执行”：Bridge/permission缺失时即使近期Probe成功也为`blocked`；已有Snapshot继续由View的`stale`与最近刷新结果表达，不新增View `degraded`枚举。
-- v0.1要求permission、scope URL及去掉可选前导点的allowed domain为同一精确HTTPS host。冷审发现Catalog允许父域而Browser拒绝后，收紧加载期合同，避免配置成功但运行失败，也不扩大Cookie读取面。
-- Chrome直接启动manifest中的主二进制时，CLI识别Chrome传入的origin argv并进入Host；origin不作为授权事实，真正允许的Extension仍只由manifest单一`allowed_origins`控制。
-- Windows只把可确认的named-pipe名称冲突映射为`bridge_already_active`；ACL/资源/其他系统错误保留原始根因。
-- Ponytail full：复用现有Catalog、Credential、Query、readiness、Dashboard、SQLite与单binary；没有实现真实Cookie Provider、Extension客户端、多Profile、TCP daemon、wrapper、通用凭据导出或第二份permission状态。
+- 没有引入向量数据库。`modernc.org/sqlite v1.56.0` 虽能加载 sqlite-vec，但当前最多 100 Item 的请求内 exact grouping 不需要虚拟表、shadow table 或 ANN。单 cohort 接近 10,000 条、p95 超过 150 ms，或出现跨 Snapshot KNN 时再重新评估。
+- embedding failure 不回退云端，也不把检索判成失败；已取得的 Item 全部保留，未获得向量的 Item 保持 `similarity.strategy=off`，Envelope 为 `partial`。
+- Dashboard REST 资源由 `/v1` 与 OpenAPI 版本化，不在裸资源和数组重复 `schema_version`；Operation、Envelope、CLI catalog 与 JSONL 终态继续携带该字段。
+- Chrome Companion Extension、Dashboard 前端、真实 Tavily/X 凭据与 NodeSeek 可达性不由 fixture 冒充。NodeSeek 当前真实 Probe 在 TLS 层失败，状态继续为 conditional。
+- Ponytail full：不增加 ANN、模型安装、云端 fallback、Agent 私有目录探测、自动 PATH 修改、包管理器或第二份 Probe 状态。
 
 ## 聚焦反馈
 
-- `go test ./... -count=1`、`go test -race ./... -count=1`：最终全仓通过。
-- Browser取消/迟到响应同一用例连续20次：通过；没有deadlock或Host失活。
-- disabled Channel/Template readiness与xurl timeout单核压力各连续20次：通过；测试不再用子进程必须在500ms内启动的时序假设冒充产品合同。
-- `go vet ./...`、`git diff --check`：分别exit0。
-- 最终CLI E2E：隔离manifest为0600且只有一个Extension origin；同一binary按Chrome argv直启并返回connected hello ack，退出后socket消失。
-- 最终loopback Dashboard：offline Bridge/readiness为200真实状态；允许dev Origin为200，evil Origin为403；OpenAPI 3.1.0含三条Browser route且不暴露Cookie值。
-- 三平台构建：darwin/arm64 Mach-O、linux/amd64静态ELF、windows/amd64 PE32+；hash与清理见`test/test-report.md`。
+- `go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`gofmt -l cmd internal skills`、`git diff --check`：允许 loopback 的工作树上通过；最终冻结提交仍由 Test 阶段重跑。
+- 100 Item cache-hit exact grouping：30 次请求内采样 p95 `1.918375ms`，全部 100 Item/100 group 保留，embedding 上游请求总数保持 1。
+- 真实 binary E2E：CLI JSONL、REST、MCP stdio、View/Run/Snapshot/items、JSON/RSS/Atom Feed 均保留同两条 Item 与相同 semantic group/score；跨入口 embedding 请求仍为 1。
+- Live smoke：V2EX Atom、linux.do RSS、GitHub 匿名 Repository Search 和 metadata Fetch 成功；NodeSeek Probe 输出 DNS/TCP passed、TLS failed、HTTP/Feed parse `not_run`。
+- Skill forward-test：隔离 Agent 首轮网络受限时按 Skill 如实返回 failed 且不换工具；允许 OmniHub 公开网络后返回两个实际 GitHub URL，并披露 metadata verification、partial、first-page/truncated 与匿名配额限制。
+- 明文 embedding 安全缺口修复后，管理 API 拒绝远程 HTTP 与 loopback+environment，运行 preflight 拒绝旧有不安全配置；聚焦回归通过。
 
 ## 证据边界与交接
 
-- 尚未证明：真实Chrome Extension、真实Cookie Provider、Windows SID ACL/HKCU实机、Linux实机和Dashboard前端；这些缺口不能被mock或交叉构建写成已支持。
-- 剩余风险：Browser能力在Companion客户端交付前只能标为backend contract verified；Windows平台安全边界需发布矩阵中的真实Windows执行补证。
-- 下一入口：读取`test/test-report.md`与`review/review.md`；Stage D批准并提交后进入Stage E semantic grouping与发布候选。
+- 尚未证明：冻结 commit 的 release archive/fresh-install、`go install @commit/tag`、GitHub Actions 三平台结果与最终独立 Stage E Review。
+- 剩余风险：真实 Tavily/X 配额、Chrome Extension/Windows 实机与 NodeSeek 网络条件仍是明确的条件性边界，不阻塞 fixture/contract 已证明的 preview。
+- 下一入口：读取 `test/test-report.md`，冻结并 push Stage E；随后只从 clean commit 构建发布候选，完成 CI、archive、Review 与 completion audit。

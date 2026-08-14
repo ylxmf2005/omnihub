@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -115,6 +116,20 @@ type EndpointProfile struct {
 	Revision        int64          `json:"revision"`
 }
 
+// SemanticProfile 固定一次 embedding cohort 的执行与分组参数。模型或输入
+// 配方变化时由调用方提升 IndexRevision，旧向量不会与新 cohort 混算。
+type SemanticProfile struct {
+	ID                string  `json:"id"`
+	EndpointProfileID string  `json:"endpoint_profile_id"`
+	CredentialID      string  `json:"credential_id,omitempty"`
+	Model             string  `json:"model"`
+	Dimension         int     `json:"dimension"`
+	Threshold         float64 `json:"threshold"`
+	IndexRevision     int64   `json:"index_revision"`
+	Enabled           bool    `json:"enabled"`
+	Revision          int64   `json:"revision"`
+}
+
 type EgressMode string
 
 const (
@@ -176,13 +191,14 @@ type TemplateOverlay struct {
 }
 
 type RoutingCatalog struct {
-	Revision       int64             `json:"revision"`
-	Sources        []Source          `json:"sources"`
-	Endpoints      []EndpointProfile `json:"endpoints"`
-	EgressProfiles []EgressProfile   `json:"egress_profiles"`
-	Channels       []Channel         `json:"channels"`
-	Collections    []Collection      `json:"collections"`
-	Overlays       []TemplateOverlay `json:"overlays"`
+	Revision         int64             `json:"revision"`
+	Sources          []Source          `json:"sources"`
+	Endpoints        []EndpointProfile `json:"endpoints"`
+	EgressProfiles   []EgressProfile   `json:"egress_profiles"`
+	SemanticProfiles []SemanticProfile `json:"semantic_profiles"`
+	Channels         []Channel         `json:"channels"`
+	Collections      []Collection      `json:"collections"`
+	Overlays         []TemplateOverlay `json:"overlays"`
 }
 
 // ValidateForStorage 保护 SQLite user snapshot 的自包含不变量。Source、
@@ -208,6 +224,9 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	if _, err := uniqueIDs("egress profile", len(catalog.EgressProfiles), func(index int) string { return catalog.EgressProfiles[index].ID }); err != nil {
 		return err
 	}
+	if _, err := uniqueIDs("semantic profile", len(catalog.SemanticProfiles), func(index int) string { return catalog.SemanticProfiles[index].ID }); err != nil {
+		return err
+	}
 	channels, err := uniqueIDs("channel", len(catalog.Channels), func(index int) string { return catalog.Channels[index].ID })
 	if err != nil {
 		return err
@@ -226,6 +245,11 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 		}
 	}
 	for _, profile := range catalog.EgressProfiles {
+		if err := profile.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, profile := range catalog.SemanticProfiles {
 		if err := profile.Validate(); err != nil {
 			return err
 		}
@@ -266,6 +290,27 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	}
 	if hasCollectionCycle(catalog.Collections, collections) {
 		return fmt.Errorf("%w: collection hierarchy contains a cycle", ErrInvalidRoutingCatalog)
+	}
+	return nil
+}
+
+// Validate 校验一个 SemanticProfile 自身的持久化结构。Endpoint 与
+// Credential 允许在升级期间悬挂，管理写入和运行时负责裁决引用可用性。
+func (profile SemanticProfile) Validate() error {
+	if profile.ID == "" || profile.ID != strings.TrimSpace(profile.ID) || profile.EndpointProfileID == "" || profile.EndpointProfileID != strings.TrimSpace(profile.EndpointProfileID) {
+		return fmt.Errorf("%w: semantic profile id and endpoint_profile_id are required", ErrInvalidRoutingCatalog)
+	}
+	if profile.CredentialID != "" && profile.CredentialID != strings.TrimSpace(profile.CredentialID) {
+		return fmt.Errorf("%w: semantic profile %s has an invalid credential_id", ErrInvalidRoutingCatalog, profile.ID)
+	}
+	if profile.Model == "" || profile.Model != strings.TrimSpace(profile.Model) || len(profile.Model) > 256 || strings.IndexFunc(profile.Model, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%w: semantic profile %s has an invalid model", ErrInvalidRoutingCatalog, profile.ID)
+	}
+	if profile.Dimension < 1 || profile.Dimension > 16384 || math.IsNaN(profile.Threshold) || math.IsInf(profile.Threshold, 0) || profile.Threshold <= 0 || profile.Threshold > 1 {
+		return fmt.Errorf("%w: semantic profile %s has an invalid dimension or threshold", ErrInvalidRoutingCatalog, profile.ID)
+	}
+	if profile.IndexRevision < 1 || profile.Revision < 1 {
+		return fmt.Errorf("%w: semantic profile %s revisions must be positive", ErrInvalidRoutingCatalog, profile.ID)
 	}
 	return nil
 }

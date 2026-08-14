@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./... -count=1
+      - run: go vet ./...
+      - name: Build and smoke native binary
+        if: runner.os != 'Windows'
+        run: |
+          go build -trimpath -o omnihub ./cmd/omnihub
+          ./omnihub version
+          ./omnihub schema > /dev/null
+          ./omnihub doctor --json > /dev/null
+      - name: Build and smoke native binary
+        if: runner.os == 'Windows'
+        run: |
+          go build -trimpath -o omnihub.exe ./cmd/omnihub
+          .\omnihub.exe version
+          .\omnihub.exe schema > $null
+          .\omnihub.exe doctor --json > $null

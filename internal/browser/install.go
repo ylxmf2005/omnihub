@@ -15,6 +15,12 @@ type nativeHostManifest struct {
 	AllowedOrigins []string `json:"allowed_origins"`
 }
 
+// UninstallResult 只描述 Native Host 注册是否被移除，不回显 manifest 内容或任何凭据。
+type UninstallResult struct {
+	Registration string `json:"registration"`
+	Removed      bool   `json:"removed"`
+}
+
 func InstallHost(executable, extensionID string) (InstallResult, error) {
 	if !validExtensionID(extensionID) {
 		return InstallResult{}, bridgeError(ErrorScopeInvalid, "Chrome extension ID must be exactly 32 characters in the range a-p")

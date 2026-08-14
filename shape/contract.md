@@ -43,8 +43,8 @@
 - `scope` 至少给出 Channel、Source、Provider、Domain 或 Collection 之一。非空 `domains` 只允许 search，最多 20 个不重复 hostname，并且 Router 只选择 `allows_global_discovery=true` 的 Provider；v1 由 Tavily 映射为 `include_domains`，不会广播给 Feed、GitHub 或 xurl。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
-- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | semantic`，默认 `off`。semantic 只分组，不删除、折叠或 rerank 不同 Item；Stage E 完成前运行时仍只接受 `off`。
-- Stage E 会为 Operation 增加可选 `semantic_profile_id`：grouping=`semantic` 时必填，其他模式必须省略；它只选择 embedding 配置，不改变 Channel 路由或网络出口。该字段进入 Core/生成 Schema 前不放入当前可执行示例。
+- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | semantic`，默认 `off`。semantic 只分组，不删除、折叠或 rerank 不同 Item。
+- `semantic_profile_id` 在 grouping=`semantic` 时必填，其他模式省略；它只选择 embedding 配置，不改变 Channel 路由或网络出口。Fetch 不支持 semantic grouping。
 - `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。Stage 2 尚未签发 token，因此任何非 null continuation 都在上游调用前拒绝。
 
 ## 2. Result Envelope
@@ -491,7 +491,7 @@ spec:
 - Probe、readiness 与 Execution 以 Endpoint×Egress 为事实键。普通输出只可携带 `egress.profile_id`、`egress.mode` 与 `egress.proxied`；无 Endpoint 时使用目标连接 ID 与 Egress 形成等价键。
 - 新建 Endpoint 或无 Endpoint Channel 必须显式引用 profile ID。migration 允许旧字段为空，但该资源为 `not_configured` 且执行前返回 `config_error`；不得暗中生成或选择 direct/environment。
 
-显式 Channel Probe 的分层结果冻结 observation 与 Egress/subject 关联，不把代理路径伪装成 target 直连。以下示例表达 HTTP CONNECT，不承诺所有平台的额外诊断字段：
+显式 Channel Probe 的分层结果冻结 observation 与 Egress/subject 关联，不把代理路径伪装成 target 直连。CLI `channels probe` 返回持久 Run 与该 Channel 最新的脱敏 Probe 记录；Dashboard 从同一记录派生 readiness，不维护第二份诊断事实。以下示例表达 HTTP CONNECT，不承诺所有平台的额外诊断字段：
 
 ```json
 {
@@ -515,7 +515,7 @@ spec:
 
 ### 7.7 Semantic Profile 与 embedding cache
 
-`similarity_grouping=semantic` 必须引用一个 enabled SemanticProfile；Stage E 完成前运行时仍只接受 `off`：
+`similarity_grouping=semantic` 必须引用一个 enabled SemanticProfile：
 
 ```yaml
 apiVersion: omnihub.dev/v1alpha1
@@ -533,7 +533,7 @@ spec:
   enabled: true
 ```
 
-- Endpoint 必须由用户显式配置并遵守自己的 EgressProfile；v0.1 只发送 OpenAI-compatible embedding 请求，本地 Ollama 使用 `/v1/embeddings`，不实现或自动探测原生 `/api/embed`，也不自动下载模型、启动服务、切换 Provider 或从本地回退云端。
+- Endpoint 必须由用户显式配置并遵守自己的 EgressProfile；远程 embedding 只允许 HTTPS，明文 HTTP 只允许字面 loopback IP 经 direct Egress。本地 Ollama 使用 `/v1/embeddings`；v0.1 不实现或自动探测原生 `/api/embed`，也不自动下载模型、启动服务、切换 Provider 或从本地回退云端。
 - embedding 输入固定拼接 title + summary；summary 缺失时才回退 content.text，并按 UTF-8 截断到总计 8 KiB。该配方由 index revision 固定；Cookie、Credential、Authorization、请求头、Browser Bridge 消息与未选择的正文不得进入输入。
 - MVP 把向量按 little-endian `float32` BLOB 缓存在现有 SQLite；cache key 至少包含规范化输入 hash、Endpoint、model、dimension 与 index revision。不同 cohort 不得比较，模型或规范化规则变化使旧 cohort stale。
 - 写 cache 前必须验证响应条数、每条 dimension 与 profile 完全一致，所有分量为有限数且向量范数大于零；BLOB 长度、字节序或解码失败同样拒绝。失败条目不写 cache、不参与 grouping，并产生 `similarity_unavailable`，不得让 NaN/Inf 进入 score。
@@ -694,6 +694,7 @@ Query Workbench Run 的 `request` 直接保存现有规范化 Operation；View r
 | 查看 Source/RouteTemplate | `GET /v1/sources`、`GET /v1/route-templates` | 静态 Descriptor、Capability、auth/cost/limitations、origin/trust |
 | 管理 Channel | `GET/POST /v1/channels`、`GET/PUT/DELETE /v1/channels/{id}` | Template/Endpoint/Credential/parameters/priority/fallback、revision、Channel Health |
 | 管理 Endpoint | `GET/POST /v1/endpoint-profiles`、`GET/PUT/DELETE /v1/endpoint-profiles/{id}` | base URL 的安全显示、trust、Endpoint probe 摘要 |
+| 管理 SemanticProfile | `GET/POST /v1/semantic-profiles`、`GET/PUT/DELETE /v1/semantic-profiles/{id}` | Endpoint/Credential 引用、model、dimension、threshold、index revision、revision；不返回向量或 secret |
 | 管理 Credential | `GET/POST /v1/credentials`、`GET/PUT/DELETE /v1/credentials/{id}`、`POST /v1/credentials/{id}/revoke` | provider/auth kind/label/value、掩码、revision；detail 可显式 include value |
 | 管理 Chrome 连接 | `GET /v1/browser-bridges`、`GET /v1/channels/{id}/chrome/authorization-descriptor`、`POST /v1/browser-bridges/{id}/permissions/revoke` | connected/profile、登录/授权描述、granted origins、last seen/error；Extension 自行重连，无 Cookie |
 | 管理 Collection | `GET/POST /v1/collections`、`GET/PUT/DELETE /v1/collections/{id}` | Channel membership、revision |
@@ -845,7 +846,7 @@ Chrome 或 Bridge 离线时，依赖 Cookie 的 Channel 立即以 check/error co
 
 ## 16. 版本策略
 
-- JSON 顶层对象显式携带 `schema_version`；Manifest/Bundle 使用独立 `apiVersion`。
+- Operation、Envelope、CLI catalog 与 JSONL 终态显式携带 `schema_version`；Manifest/Bundle 使用独立 `apiVersion`。Dashboard REST 资源由 `/v1` 路径与 OpenAPI 版本化，单个资源对象和列表不重复该字段。
 - v1 前允许 `v1alpha1`/`0.x` 破坏性迭代；1.0 后同一 major 只增加可选字段或枚举值。
 - 未知可选字段应忽略；未知 operation、必需字段或 major version 必须拒绝。
 - Command/MCP Provider 的第三方 output schema 单独版本化，不把它们误写成 OmniHub 自有传输协议。

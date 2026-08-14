@@ -18,6 +18,7 @@ type Operation struct {
 	TimeRange          TimeRange          `json:"time_range" jsonschema:"可选的 UTC 时间范围。"`
 	IdentityDedupe     IdentityDedupe     `json:"identity_dedupe" jsonschema:"身份去重策略。"`
 	SimilarityGrouping SimilarityGrouping `json:"similarity_grouping" jsonschema:"相似内容仅分组，不删除 Item。"`
+	SemanticProfileID  *string            `json:"semantic_profile_id,omitempty" jsonschema:"semantic 分组使用的 embedding profile；其他模式省略。"`
 	Continuation       *string            `json:"continuation,omitempty" jsonschema:"OmniHub 签发的不透明续页 token。"`
 	DeadlineMS         int                `json:"deadline_ms" jsonschema:"整次 Operation 的毫秒 deadline。"`
 }
@@ -32,12 +33,13 @@ type SearchInput struct {
 	TimeRange          TimeRange          `json:"time_range"`
 	IdentityDedupe     IdentityDedupe     `json:"identity_dedupe"`
 	SimilarityGrouping SimilarityGrouping `json:"similarity_grouping"`
+	SemanticProfileID  *string            `json:"semantic_profile_id,omitempty"`
 	Continuation       *string            `json:"continuation,omitempty"`
 	DeadlineMS         int                `json:"deadline_ms"`
 }
 
 func (input SearchInput) OperationRequest() Operation {
-	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationSearch, Query: &input.Query, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, TimeRange: input.TimeRange, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
+	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationSearch, Query: &input.Query, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, TimeRange: input.TimeRange, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, SemanticProfileID: input.SemanticProfileID, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
 }
 
 type LatestInput struct {
@@ -48,12 +50,13 @@ type LatestInput struct {
 	TimeRange          TimeRange          `json:"time_range"`
 	IdentityDedupe     IdentityDedupe     `json:"identity_dedupe"`
 	SimilarityGrouping SimilarityGrouping `json:"similarity_grouping"`
+	SemanticProfileID  *string            `json:"semantic_profile_id,omitempty"`
 	Continuation       *string            `json:"continuation,omitempty"`
 	DeadlineMS         int                `json:"deadline_ms"`
 }
 
 func (input LatestInput) OperationRequest() Operation {
-	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationLatest, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, TimeRange: input.TimeRange, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
+	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationLatest, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, TimeRange: input.TimeRange, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, SemanticProfileID: input.SemanticProfileID, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
 }
 
 type FetchInput struct {
@@ -129,7 +132,8 @@ const (
 type SimilarityGrouping string
 
 const (
-	SimilarityOff SimilarityGrouping = "off"
+	SimilarityOff      SimilarityGrouping = "off"
+	SimilaritySemantic SimilarityGrouping = "semantic"
 )
 
 // Envelope 是同步执行和持久 Run 终态共享的结果模型。
@@ -246,8 +250,9 @@ type Identity struct {
 }
 
 type Similarity struct {
-	GroupID  *string `json:"group_id,omitempty"`
-	Strategy string  `json:"strategy"`
+	GroupID  *string  `json:"group_id,omitempty"`
+	Strategy string   `json:"strategy"`
+	Score    *float64 `json:"score,omitempty"`
 }
 
 type Content struct {
@@ -319,19 +324,20 @@ type Error struct {
 type ErrorCode string
 
 const (
-	ErrorParameter          ErrorCode = "parameter_error"
-	ErrorConfig             ErrorCode = "config_error"
-	ErrorAuth               ErrorCode = "auth_error"
-	ErrorRateLimit          ErrorCode = "rate_limited"
-	ErrorTimeout            ErrorCode = "timeout"
-	ErrorNetwork            ErrorCode = "network_error"
-	ErrorUpstream           ErrorCode = "upstream_error"
-	ErrorProtocol           ErrorCode = "protocol_error"
-	ErrorParse              ErrorCode = "parse_error"
-	ErrorInternal           ErrorCode = "internal_error"
-	ErrorBrowserUnavailable ErrorCode = "browser_unavailable"
-	ErrorBrowserPermission  ErrorCode = "browser_permission_missing"
-	ErrorCookieMissing      ErrorCode = "cookie_missing"
+	ErrorParameter             ErrorCode = "parameter_error"
+	ErrorConfig                ErrorCode = "config_error"
+	ErrorAuth                  ErrorCode = "auth_error"
+	ErrorRateLimit             ErrorCode = "rate_limited"
+	ErrorTimeout               ErrorCode = "timeout"
+	ErrorNetwork               ErrorCode = "network_error"
+	ErrorUpstream              ErrorCode = "upstream_error"
+	ErrorProtocol              ErrorCode = "protocol_error"
+	ErrorParse                 ErrorCode = "parse_error"
+	ErrorInternal              ErrorCode = "internal_error"
+	ErrorBrowserUnavailable    ErrorCode = "browser_unavailable"
+	ErrorBrowserPermission     ErrorCode = "browser_permission_missing"
+	ErrorCookieMissing         ErrorCode = "cookie_missing"
+	ErrorSimilarityUnavailable ErrorCode = "similarity_unavailable"
 )
 
 type Continuation struct {

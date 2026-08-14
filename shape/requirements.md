@@ -211,7 +211,7 @@ Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoi
 
 该路线已经过 2026-08-15 的近期本地方案复核，证据见 `shape/evidence/local-vector-study.md`。当前 Driver 已能通过 `modernc.org/sqlite/vec` 无 CGO 注册 sqlite-vec，但其 pre-v1 vec0 对当前最多 100 个 Item 仍是 exact scan，并会增加虚拟表与迁移状态；Chromem、LanceDB 与 Qdrant 同样没有相称收益。单 cohort 达到约 10,000 条、semantic p95 超过 150ms，或出现跨 Snapshot KNN 需求时，优先 spike 现有 Driver 的 vec 包；阈值未到前不为“向量数据库”标签增加状态。
 
-v0.1 只实现 OpenAI-compatible embedding wire contract；用户已有的 Ollama 通过 `/v1/embeddings` 接入，不另增原生 `/api/embed` dialect，也不自动探测协议。外部 Endpoint 是显式数据外发，必须显示 Endpoint、model 与 Egress，不自动下载模型、启动 daemon、切换 Provider 或从本地回退云端。semantic 只写 `group_id/strategy/score`，保留全部 Item；embedding 不可用时保留检索结果并使 Envelope `partial`，不得伪装 grouping 已完成。
+v0.1 只实现 OpenAI-compatible embedding wire contract；用户已有的 Ollama 通过 `/v1/embeddings` 接入，不另增原生 `/api/embed` dialect，也不自动探测协议。外部 Endpoint 是显式数据外发，必须显示 Endpoint、model 与 Egress；远程目标只允许 HTTPS，明文 HTTP 只允许字面 loopback IP 经 direct Egress 访问。不自动下载模型、启动 daemon、切换 Provider 或从本地回退云端。semantic 只写 `group_id/strategy/score`，保留全部 Item；embedding 不可用时保留检索结果并使 Envelope `partial`，不得伪装 grouping 已完成。
 
 写入 cache 前必须校验响应条数、dimension、有限分量与非零范数；BLOB 长度/字节序/解码失败也视为不可用。失败向量不写 cache、不参与 grouping，不允许 NaN/Inf score。
 

@@ -9,13 +9,14 @@ import (
 )
 
 var (
-	ErrConflict          = errors.New("revision conflict")
-	ErrNotFound          = errors.New("not found")
-	ErrLeaseHeld         = errors.New("run lease is held")
-	ErrInvalidState      = errors.New("invalid state transition")
-	ErrIdempotency       = errors.New("idempotency key payload mismatch")
-	ErrInvalidCredential = errors.New("invalid credential")
-	ErrInUse             = errors.New("resource is in use")
+	ErrConflict              = errors.New("revision conflict")
+	ErrNotFound              = errors.New("not found")
+	ErrLeaseHeld             = errors.New("run lease is held")
+	ErrInvalidState          = errors.New("invalid state transition")
+	ErrIdempotency           = errors.New("idempotency key payload mismatch")
+	ErrInvalidCredential     = errors.New("invalid credential")
+	ErrInvalidEmbeddingCache = errors.New("invalid embedding cache")
+	ErrInUse                 = errors.New("resource is in use")
 )
 
 // Store 只暴露领域原子操作；服务层不会拿到 SQL、连接或 SQLite 错误。
@@ -45,6 +46,8 @@ type Store interface {
 	ListActiveTombstones(context.Context, TombstoneFilter) ([]core.IdentityTombstone, error)
 	PutProbeHealth(context.Context, core.ChannelProbeRecord) error
 	ListProbeHealth(context.Context, ProbeHealthFilter) ([]core.ChannelProbeRecord, error)
+	GetEmbeddings(context.Context, []EmbeddingCacheKey, time.Time) (map[EmbeddingCacheKey]EmbeddingCacheEntry, error)
+	PutEmbeddings(context.Context, []EmbeddingCacheEntry) error
 	Prune(context.Context, Prune) (core.PruneResult, error)
 	SaveRoutingCatalog(context.Context, SaveRoutingCatalog) (core.RoutingCatalog, error)
 	LoadRoutingCatalog(context.Context) (core.RoutingCatalog, error)
@@ -146,11 +149,31 @@ type ProbeHealthFilter struct {
 	Limit      int
 }
 
+// EmbeddingCacheKey 隔离输入、Endpoint 与模型 cohort；任一执行配置或
+// 输入配方 revision 变化都会自然 miss，旧向量不会进入新一轮比较。
+type EmbeddingCacheKey struct {
+	InputHash         string
+	EndpointProfileID string
+	EndpointRevision  int64
+	Provider          string
+	Model             string
+	Dimension         int
+	IndexRevision     int64
+}
+
+type EmbeddingCacheEntry struct {
+	Key        EmbeddingCacheKey
+	Vector     []float32
+	CreatedAt  time.Time
+	LastUsedAt time.Time
+}
+
 type Prune struct {
 	DryRun                 bool
 	RunFinishedBefore      time.Time
 	ProbeCheckedBefore     time.Time
 	TombstoneExpiresBefore time.Time
+	EmbeddingUnusedBefore  time.Time
 }
 
 type UpdateCredential struct {

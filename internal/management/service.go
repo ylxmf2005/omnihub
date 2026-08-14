@@ -21,6 +21,7 @@ import (
 
 	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 )
@@ -38,6 +39,7 @@ var (
 	ErrInvalidEgress         = errors.New("invalid egress profile")
 	ErrInvalidRSSHub         = errors.New("invalid RSSHub configuration")
 	ErrInvalidProviderConfig = errors.New("invalid provider configuration")
+	ErrInvalidSemantic       = errors.New("invalid semantic profile")
 	ErrRSSHubUnavailable     = errors.New("RSSHub resource unavailable")
 	ErrInvalidOPML           = errors.New("invalid OPML")
 	ErrUnsupportedTemplate   = errors.New("unsupported route template")
@@ -136,6 +138,20 @@ type ApplyCredentialInput struct {
 	ExpectedRevision int64  `json:"expected_revision"`
 }
 
+// ApplySemanticProfileInput 是 semantic grouping 的完整替换输入。Endpoint、
+// Credential 与出口必须已经可用；profile 本身不复制任何 secret 或 URL。
+type ApplySemanticProfileInput struct {
+	ID                string  `json:"id"`
+	EndpointProfileID string  `json:"endpoint_profile_id"`
+	CredentialID      string  `json:"credential_id,omitempty"`
+	Model             string  `json:"model"`
+	Dimension         int     `json:"dimension"`
+	Threshold         float64 `json:"threshold"`
+	IndexRevision     int64   `json:"index_revision"`
+	Enabled           bool    `json:"enabled"`
+	ExpectedRevision  int64   `json:"expected_revision"`
+}
+
 // ApplyCredential 创建或更新已支持的 Credential，并只返回脱敏摘要。
 func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentialInput) (core.CredentialSummary, error) {
 	store, err := service.credentialStore()
@@ -202,11 +218,18 @@ func managedCredentialError(provider, authKind string) error {
 	if provider == "github-api" || provider == "tavily" || provider == "xurl" {
 		return ErrInvalidProviderConfig
 	}
+	if provider == "embedding" || authKind == "bearer" {
+		return ErrInvalidSemantic
+	}
 	return ErrInvalidRSSHub
 }
 
 func validateManagedCredential(provider, authKind, value string) error {
 	switch {
+	case provider == "embedding" && authKind == "bearer":
+		if value != "" && strings.IndexFunc(value, unicode.IsControl) < 0 {
+			return nil
+		}
 	case provider == "rsshub" && authKind == "api_key",
 		provider == "github-api" && authKind == "token",
 		provider == "tavily" && authKind == "api_key",
@@ -241,12 +264,170 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 			credential.Provider == "github-api" && credential.AuthKind == "token" ||
 			credential.Provider == "tavily" && credential.AuthKind == "api_key" ||
 			credential.Provider == "xurl" && credential.AuthKind == "app_only" ||
+			credential.Provider == "embedding" && credential.AuthKind == "bearer" ||
 			credential.AuthKind == "chrome_cookie" && service.supportsChromeCookieCredential(credential.Provider) {
 			result = append(result, summarizeCredential(credential))
 		}
 	}
 	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
 	return result, nil
+}
+
+// ApplySemanticProfile 使用资源 revision 和 routing catalog revision 两层
+// CAS。只接受已经绑定可用 Egress 的 enabled embedding Endpoint。
+func (service Service) ApplySemanticProfile(ctx context.Context, input ApplySemanticProfileInput) (core.SemanticProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return core.SemanticProfile{}, err
+	}
+	if input.ExpectedRevision < 0 {
+		return core.SemanticProfile{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidSemantic)
+	}
+	profile := core.SemanticProfile{
+		ID: strings.TrimSpace(input.ID), EndpointProfileID: strings.TrimSpace(input.EndpointProfileID),
+		CredentialID: strings.TrimSpace(input.CredentialID), Model: input.Model,
+		Dimension: input.Dimension, Threshold: input.Threshold, IndexRevision: input.IndexRevision, Enabled: input.Enabled, Revision: 1,
+	}
+	if err := validateResourceID(profile.ID); err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("%w: profile id: %v", ErrInvalidSemantic, err)
+	}
+	if err := profile.Validate(); err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("%w: %v", ErrInvalidSemantic, err)
+	}
+
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	endpointIndex, exists := indexEndpoints(working.Endpoints)[profile.EndpointProfileID]
+	if !exists {
+		return core.SemanticProfile{}, fmt.Errorf("%w: semantic endpoint %s", repository.ErrNotFound, profile.EndpointProfileID)
+	}
+	endpoint := working.Endpoints[endpointIndex]
+	if !endpoint.Enabled || endpoint.Provider != "embedding" {
+		return core.SemanticProfile{}, fmt.Errorf("%w: endpoint must be an enabled embedding endpoint", ErrInvalidSemantic)
+	}
+	egressProfile, err := enabledEgressProfile(working, endpoint.EgressProfileID)
+	if err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("%w: endpoint egress is unavailable: %v", ErrInvalidSemantic, err)
+	}
+	parsedEndpoint, err := url.Parse(endpoint.BaseURL)
+	if err != nil || egress.ValidateHTTPSOrDirectLoopback(parsedEndpoint, egressProfile) != nil {
+		return core.SemanticProfile{}, fmt.Errorf("%w: remote embedding endpoints require HTTPS; HTTP is limited to a literal loopback IP through direct egress", ErrInvalidSemantic)
+	}
+	if profile.CredentialID != "" {
+		if parsedEndpoint.Scheme != "https" {
+			return core.SemanticProfile{}, fmt.Errorf("%w: embedding bearer credential requires an HTTPS endpoint", ErrInvalidSemantic)
+		}
+		store, err := service.credentialStore()
+		if err != nil {
+			return core.SemanticProfile{}, err
+		}
+		credential, err := store.GetCredential(ctx, profile.CredentialID)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return core.SemanticProfile{}, fmt.Errorf("%w: semantic credential %s", repository.ErrNotFound, profile.CredentialID)
+			}
+			return core.SemanticProfile{}, fmt.Errorf("load semantic credential: %w", err)
+		}
+		if credential.Provider != "embedding" || credential.AuthKind != "bearer" || !credential.Enabled || credential.Value == nil || *credential.Value == "" || strings.IndexFunc(*credential.Value, unicode.IsControl) >= 0 {
+			return core.SemanticProfile{}, fmt.Errorf("%w: semantic credential is incompatible, disabled, or incomplete", ErrInvalidSemantic)
+		}
+	}
+
+	index, exists := indexSemanticProfiles(working.SemanticProfiles)[profile.ID]
+	if exists && working.SemanticProfiles[index].Revision != input.ExpectedRevision {
+		return core.SemanticProfile{}, fmt.Errorf("%w: semantic profile %s revision is %d, expected %d", repository.ErrConflict, profile.ID, working.SemanticProfiles[index].Revision, input.ExpectedRevision)
+	}
+	if !exists && input.ExpectedRevision != 0 {
+		return core.SemanticProfile{}, fmt.Errorf("%w: semantic profile %s does not exist at revision %d", repository.ErrConflict, profile.ID, input.ExpectedRevision)
+	}
+	if exists {
+		profile.Revision = working.SemanticProfiles[index].Revision + 1
+		working.SemanticProfiles[index] = profile
+	} else {
+		working.SemanticProfiles = append(working.SemanticProfiles, profile)
+	}
+	sortRoutingResources(&working)
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.SemanticProfile{}, err
+	}
+	for _, value := range saved.SemanticProfiles {
+		if value.ID == profile.ID {
+			return value, nil
+		}
+	}
+	return core.SemanticProfile{}, fmt.Errorf("save routing catalog: semantic profile %s missing from saved snapshot", profile.ID)
+}
+
+// DisableSemanticProfile 只改变 desired state，已持久化的 View 与 embedding
+// cache 保持原样，由执行入口如实报告 profile 不可用。
+func (service Service) DisableSemanticProfile(ctx context.Context, id string, expectedRevision int64) (core.SemanticProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return core.SemanticProfile{}, err
+	}
+	id = strings.TrimSpace(id)
+	if err := validateResourceID(id); err != nil || expectedRevision < 1 {
+		return core.SemanticProfile{}, fmt.Errorf("%w: profile id or expected revision is invalid", ErrInvalidSemantic)
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	index, exists := indexSemanticProfiles(working.SemanticProfiles)[id]
+	if !exists {
+		return core.SemanticProfile{}, fmt.Errorf("%w: semantic profile %s", repository.ErrNotFound, id)
+	}
+	profile := working.SemanticProfiles[index]
+	if profile.Revision != expectedRevision {
+		return core.SemanticProfile{}, fmt.Errorf("%w: semantic profile %s revision is %d, expected %d", repository.ErrConflict, id, profile.Revision, expectedRevision)
+	}
+	profile.Enabled = false
+	profile.Revision++
+	working.SemanticProfiles[index] = profile
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.SemanticProfile{}, err
+	}
+	for _, value := range saved.SemanticProfiles {
+		if value.ID == id {
+			return value, nil
+		}
+	}
+	return core.SemanticProfile{}, fmt.Errorf("save routing catalog: semantic profile %s missing from saved snapshot", id)
+}
+
+func (service Service) ListSemanticProfiles(ctx context.Context) ([]core.SemanticProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return nil, err
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load routing catalog: %w", err)
+	}
+	result := make([]core.SemanticProfile, len(routing.SemanticProfiles))
+	copy(result, routing.SemanticProfiles)
+	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
+	return result, nil
+}
+
+func (service Service) GetSemanticProfile(ctx context.Context, id string) (core.SemanticProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return core.SemanticProfile{}, err
+	}
+	id = strings.TrimSpace(id)
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.SemanticProfile{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	for _, profile := range routing.SemanticProfiles {
+		if profile.ID == id {
+			return profile, nil
+		}
+	}
+	return core.SemanticProfile{}, fmt.Errorf("%w: semantic profile %s", repository.ErrNotFound, id)
 }
 
 // supportsChromeCookieCredential 只接受当前 Catalog 中已经过 trust overlay
@@ -1420,6 +1601,14 @@ func indexEgressProfiles(profiles []core.EgressProfile) map[string]int {
 	return result
 }
 
+func indexSemanticProfiles(profiles []core.SemanticProfile) map[string]int {
+	result := make(map[string]int, len(profiles))
+	for index, profile := range profiles {
+		result[profile.ID] = index
+	}
+	return result
+}
+
 func enabledEgressProfile(catalog core.RoutingCatalog, id string) (core.EgressProfile, error) {
 	if id == "" {
 		return core.EgressProfile{}, errors.New("egress profile id is required")
@@ -1443,6 +1632,7 @@ func cloneRoutingCatalog(value core.RoutingCatalog) core.RoutingCatalog {
 		result.Endpoints[index].Options = cloneAnyMap(result.Endpoints[index].Options)
 	}
 	result.EgressProfiles = slices.Clone(value.EgressProfiles)
+	result.SemanticProfiles = slices.Clone(value.SemanticProfiles)
 	result.Channels = make([]core.Channel, len(value.Channels))
 	for index, channel := range value.Channels {
 		result.Channels[index] = cloneChannel(channel)
@@ -1481,6 +1671,9 @@ func sortRoutingResources(catalog *core.RoutingCatalog) {
 	sort.Slice(catalog.Sources, func(left, right int) bool { return catalog.Sources[left].ID < catalog.Sources[right].ID })
 	sort.Slice(catalog.Endpoints, func(left, right int) bool { return catalog.Endpoints[left].ID < catalog.Endpoints[right].ID })
 	sort.Slice(catalog.EgressProfiles, func(left, right int) bool { return catalog.EgressProfiles[left].ID < catalog.EgressProfiles[right].ID })
+	sort.Slice(catalog.SemanticProfiles, func(left, right int) bool {
+		return catalog.SemanticProfiles[left].ID < catalog.SemanticProfiles[right].ID
+	})
 	sort.Slice(catalog.Channels, func(left, right int) bool { return catalog.Channels[left].ID < catalog.Channels[right].ID })
 	sort.Slice(catalog.Collections, func(left, right int) bool { return catalog.Collections[left].ID < catalog.Collections[right].ID })
 }

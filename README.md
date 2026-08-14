@@ -1,13 +1,20 @@
 # OmniHub
 
-把 Feed、GitHub、Web 与 X 统一成 Agent 可调用、可订阅、可追溯的信息入口。
+让 Agent 用一个命令搜索多来源，并拿到可追溯的真实链接。
+
+[![CI](https://github.com/ylxmf2005/omnihub/actions/workflows/ci.yml/badge.svg)](https://github.com/ylxmf2005/omnihub/actions/workflows/ci.yml)
+[![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8.svg)](go.mod)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 OmniHub 是本地优先的 Go CLI/MCP Server。CLI、REST、MCP、持久 View 与配套 Skill 共用同一份 `Operation → Envelope` 合同；每条结果都保留实际 Source、Provider、Channel、RouteTemplate、URL、覆盖范围和错误终态。
 
-> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl，以及 JSON、JSONL、REST、MCP、Dashboard Backend、持久 Run/View、RSS/Atom/JSON Feed 分发和 Agent Skill。Dashboard 前端、Chrome Cookie Bridge 与 semantic grouping 仍未实现。
+> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl、可选 semantic grouping，以及 JSON、JSONL、REST、MCP、Dashboard Backend、持久 Run/View、RSS/Atom/JSON Feed、Chrome Native Host/Bridge Backend 和 Agent Skill。Dashboard 前端与 Chrome Companion Extension 不在本仓库中，因此不能据此宣称某个 Cookie 来源已经 ready。
 
 ```text
 Agent / App ── CLI / REST / MCP ── Operation Service ── Router ── Providers
+                                              │
+                                              └─ normalize → exact dedupe
+                                                   → optional semantic groups
 Dashboard ───── Management API ─── Subscription Service ─┬─ SQLite Run/Snapshot
                                                          └─ JSON/RSS/Atom Feed
 ```
@@ -15,45 +22,72 @@ Dashboard ───── Management API ─── Subscription Service ─┬�
 - [快速开始](#快速开始)
 - [当前能力](#当前能力)
 - [配置 Provider](#配置-provider)
+- [Semantic grouping](#semantic-grouping)
 - [Feed、RSSHub 与 OPML](#feedrsshub-与-opml)
 - [View、Run 与 Dashboard Backend](#viewrun-与-dashboard-backend)
 - [统一查询合同](#统一查询合同)
 - [REST 与 MCP](#rest-与-mcp)
 - [Agent Skill](#agent-skill)
+- [Chrome Browser Bridge](#chrome-browser-bridge)
 - [出口、Probe 与诊断](#出口probe-与诊断)
+- [配置与数据边界](#配置与数据边界)
 - [当前限制与验证边界](#当前限制与验证边界)
+- [开发](#开发)
 
 ## 快速开始
 
 需要 Go 1.25 或更高版本：
 
 ```bash
-git clone https://github.com/ylxmf2005/omnihub.git
-cd omnihub
-go build -o omnihub ./cmd/omnihub
+go install github.com/ylxmf2005/omnihub/cmd/omnihub@latest
+omnihub version
 
-./omnihub latest \
+omnihub latest \
   --feed-url https://www.v2ex.com/index.xml \
   --source v2ex \
   --egress-mode direct \
   --limit 5
 ```
 
-这条路径不需要 daemon 或 SQLite。`latest` 支持 RSS 2.0、Atom、JSON Feed，以及带明确 `rel=alternate` Feed 链接的 HTML 页面。
+这条路径不需要 daemon、Credential 或 SQLite；它会使用本机 Feed cache。`latest` 支持 RSS 2.0、Atom、JSON Feed，以及带明确 `rel=alternate` Feed 链接的 HTML 页面。
 
-需要全局命令时，可用 `go install github.com/ylxmf2005/omnihub/cmd/omnihub@latest` 安装到 Go bin 目录，并确保该目录在 `PATH` 中。
+也可以从源码构建：
+
+```bash
+git clone https://github.com/ylxmf2005/omnihub.git
+cd omnihub
+go build -o omnihub ./cmd/omnihub
+```
+
+### Release archive
+
+发布包提供 `darwin/arm64`、`linux/amd64` 与 `windows/amd64` 单二进制。每个 archive 同时包含 README、项目许可证、第三方许可证和构建信息；同一 GitHub Release 的 `checksums.txt` 用 SHA-256 校验所有 archive。以 macOS 为例：
+
+```bash
+VERSION=0.1.0
+curl -fLO "https://github.com/ylxmf2005/omnihub/releases/download/v${VERSION}/omnihub_${VERSION}_darwin_arm64.tar.gz"
+curl -fLO "https://github.com/ylxmf2005/omnihub/releases/download/v${VERSION}/checksums.txt"
+shasum -a 256 -c checksums.txt
+tar -xzf "omnihub_${VERSION}_darwin_arm64.tar.gz"
+"omnihub_${VERSION}_darwin_arm64/omnihub" version
+"omnihub_${VERSION}_darwin_arm64/omnihub" doctor --json
+```
+
+首个 archive 发布前可继续使用 `go install` 或源码构建。首发包不包含平台签名、公证、系统服务或自动 PATH 修改。
 
 ## 当前能力
 
-| 路线 | Operation | 凭据 | v1 边界 |
+| 路线 | Operation | 凭据/依赖 | 当前证据与边界 |
 | --- | --- | --- | --- |
-| Direct Feed | `latest`、Feed window 内本地 `search` | 无 | 不是源站全量索引 |
-| RSSHub | `latest` | 可选 access key | 只连接用户显式配置的实例 |
-| GitHub API | Repository `search`、metadata `fetch` | Token 可选 | 首页结果；不搜索 code/issue/PR/README |
-| Tavily | `search` | API Key 必需 | 最多 20 个 candidate/snippet；不取 answer/raw content/images |
-| X/xurl | recent `search` | app-only Token 必需 | 依赖本机 `xurl`；无 continuation |
+| Direct Feed | `latest`、Feed window 内本地 `search` | 无 | 自动化覆盖 RSS/Atom/JSON Feed；不是源站全量索引 |
+| RSSHub | `latest` | 用户 Endpoint；access key 可选 | 认证 fixture 已验证；不安装实例、不选公共默认实例 |
+| GitHub API | Repository `search`、metadata `fetch` | Token 可选 | 自动化与匿名公开仓库 smoke；不搜索 code/issue/PR/README |
+| Tavily | `search` | API Key 必需 | 协议 fixture；最多 20 个 candidate/snippet，不取 answer/raw content/images |
+| X/xurl | recent `search` | `xurl` + app-only Token | 协议 fixture；无 continuation，未使用用户真实 X quota 做发布 gate |
+| Semantic | Search/Latest 结果分组 | OpenAI-compatible Endpoint | loopback fixture + SQLite cache；默认关闭，不删除或 rerank Item |
+| Chrome Cookie | Browser Bridge 后端 | Companion Extension + origin permission | Host/IPC/mock consumer 已验证；仓库不包含 Extension，也没有来源可据此标为 ready |
 
-Source 声明、Channel 配置与 runtime ready 是三件事。内建 Source 或 `sources/feed-samples.yaml` 只声明可引用的逻辑来源，不会自动创建订阅，也不保证当前网络可达。
+Source 声明、Channel 配置与 runtime ready 是三件事。V2EX、linux.do 可通过 Direct Feed 使用；NodeSeek 保持 conditional，只有用户配置的真实 Channel Probe 成功后才显示 ready。`sources/feed-samples.yaml` 中的 arXiv、Hacker News、YouTube、Newsletter 与 Podcast 只是逻辑来源样例，不会自动创建订阅或证明可达。
 
 ## 配置 Provider
 
@@ -189,6 +223,58 @@ JSON
 
 xurl 当前只支持 `direct`、`environment` 和无认证 `http_proxy` 出口；SOCKS5 与带认证代理会在启动子进程前失败。命令路线也不宣称具有 DNS/TCP/TLS 分层 Probe。
 
+## Semantic grouping
+
+Semantic grouping 是显式 opt-in 的后处理：检索、排序与 exact identity dedupe 完成后，它只给相似 Item 增加 `group_id`、`strategy` 和 cosine `score`，不删除、折叠或重排结果。OmniHub 不安装 Ollama、不下载模型，也不自动从本地切到云端。
+
+先创建一个 OpenAI-compatible embedding Endpoint，再创建 SemanticProfile。下面假设本机 Ollama 已有输出维度为 768 的 `embeddinggemma`；换模型时必须同时填写它的真实维度，并在输入配方改变时提升 `index_revision`：
+
+```bash
+omnihub endpoints apply-provider <<'JSON'
+{
+  "id": "embedding_local",
+  "provider": "embedding",
+  "base_url": "http://127.0.0.1:11434",
+  "egress_profile_id": "egress_direct",
+  "expected_revision": 0
+}
+JSON
+
+omnihub semantic-profiles apply <<'JSON'
+{
+  "id": "semantic_local",
+  "endpoint_profile_id": "embedding_local",
+  "model": "embeddinggemma",
+  "dimension": 768,
+  "threshold": 0.88,
+  "index_revision": 1,
+  "enabled": true,
+  "expected_revision": 0
+}
+JSON
+```
+
+远程兼容服务必须使用 HTTPS Endpoint，并可引用 `provider=embedding`、`auth_kind=bearer` 的 Credential。明文 HTTP 只允许字面 loopback IP 与 `direct` Egress，用于本机 Ollama；不会经环境代理或自定义代理发送。启用远程 Profile 表示允许 OmniHub 把每个最终 Item 的 `title + summary`（summary 缺失时回退 `content.text`，每项最多 8 KiB）发送到该 Endpoint；Cookie、请求头和 Credential 不进入 embedding 输入。
+
+查询时显式选择 Profile：
+
+```json
+{
+  "schema_version": "1.0",
+  "query": "local-first agent search",
+  "scope": {"sources": ["github"]},
+  "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
+  "limit": 20,
+  "time_range": {},
+  "identity_dedupe": "exact",
+  "similarity_grouping": "semantic",
+  "semantic_profile_id": "semantic_local",
+  "deadline_ms": 30000
+}
+```
+
+当前最多对一次查询的 100 个结果做 Go 内精确 cosine，并把向量作为 little-endian `float32` BLOB 缓存在同一 SQLite。单 cohort 接近 10,000 条、p95 超过 150 ms，或出现跨 Snapshot KNN 需求时，再评估现有 SQLite Driver 可加载的 `sqlite-vec`；首发不增加第二数据库。
+
 ## Feed、RSSHub 与 OPML
 
 一次性 Feed 的 `search` 只在当前 Feed window 内执行 Unicode lowercase + 空白分词 AND 匹配，并在 Coverage 中披露 `local_feed_window_only`。需要复用时，可用 `channels apply` 保存为 Direct Feed Channel。
@@ -239,11 +325,11 @@ curl --fail-with-body \
   http://127.0.0.1:8787/v1/views/my-view/refresh
 ```
 
-Dashboard 可管理 Channel、Endpoint、Egress、Credential、Collection 与 View，并读取 Run、readiness 和 catalog。创建使用 `POST`；完整更新与删除必须携带响应中的强 `ETag` 作为 `If-Match`。Credential 默认只返回掩码；只有 detail 显式使用 `include_value=true` 才回显原值，并设置 `Cache-Control: no-store`。
+Dashboard 可管理 Channel、Endpoint、Egress、Credential、SemanticProfile、Collection 与 View，并读取 Run、readiness 和 catalog。创建使用 `POST`；完整更新与删除必须携带响应中的强 `ETag` 作为 `If-Match`。Credential 默认只返回掩码；只有 detail 显式使用 `include_value=true` 才回显原值，并设置 `Cache-Control: no-store`。
 
 ## 统一查询合同
 
-`search`、`latest` 与 `fetch` 都从严格 JSON stdin 读取对应 typed input。`scope` 可按 Channel、Source、Provider、Domain 或 Collection 选择；`route_policy.aggregate=true` 才会并行保留多个候选 Channel。`identity_dedupe` 支持 `exact|none`，当前 `similarity_grouping` 只可执行 `off`。
+`search`、`latest` 与 `fetch` 都从严格 JSON stdin 读取对应 typed input。`scope` 可按 Channel、Source、Provider、Domain 或 Collection 选择；`route_policy.aggregate=true` 才会并行保留多个候选 Channel。`identity_dedupe` 支持 `exact|none`；`similarity_grouping` 支持 `off|semantic`，semantic 只允许 Search/Latest，并必须携带 `semantic_profile_id`。
 
 Envelope 的顶层 `status` 含义：
 
@@ -274,7 +360,7 @@ Envelope 的顶层 `status` 含义：
 它暴露：
 
 - `POST /v1/search`、`/v1/latest`、`/v1/fetch`：与 CLI 相同的 typed JSON 输入和 Envelope 输出；
-- `/v1/channels`、`/v1/endpoint-profiles`、`/v1/egress-profiles`、`/v1/credentials`、`/v1/collections`、`/v1/views`：Dashboard 管理资源；
+- `/v1/channels`、`/v1/endpoint-profiles`、`/v1/semantic-profiles`、`/v1/egress-profiles`、`/v1/credentials`、`/v1/collections`、`/v1/views`：Dashboard 管理资源；
 - `/v1/runs`、`/v1/readiness`、`/v1/dashboard/summary`：异步执行、健康与汇总状态；
 - `/feeds/{view}.json|rss|atom`：当前成功 Snapshot 的三种 Feed 投影；
 - `GET /openapi.json`：OpenAPI 3.1；
@@ -291,6 +377,8 @@ curl --fail-with-body \
 
 HTTP 入口校验 Host、Origin 与 `Content-Type`，不接受非 loopback 监听。生产 Dashboard 与 Backend 同源；本地前端开发可用 `--dev-origin http://localhost:PORT` 显式开放一个 loopback Origin，CORS 不会扩展到同步 Query、MCP 或 Feed 路由。
 
+Operation、Envelope、CLI catalog 与 JSONL 终态携带 `schema_version`。Dashboard REST 资源由 `/v1` 路径与 OpenAPI 版本化，单个资源对象和列表不重复嵌入该字段。
+
 MCP client 可直接把下面的进程配置为 stdio server：
 
 ```text
@@ -302,11 +390,12 @@ args: ["mcp"]
 
 ## Agent Skill
 
-`skills/omnihub/SKILL.md` 约束 Agent 使用固定 Tool/CLI 入口、读取终态 Coverage，并只引用 OmniHub 实际返回的 URL。以 Codex 为例，可把整个目录复制到个人 Skill 目录：
+二进制内嵌与当前版本匹配的 Skill，用来约束 Agent 调用固定 Tool/CLI、读取终态 Coverage，并只引用 OmniHub 实际返回的 URL。`omnihub skill` 只输出内容，不猜测或修改任何 Agent 的私有目录。以 Codex 为例：
 
 ```bash
 mkdir -p ~/.codex/skills
-cp -R skills/omnihub ~/.codex/skills/omnihub
+mkdir -p ~/.codex/skills/omnihub
+omnihub skill > ~/.codex/skills/omnihub/SKILL.md
 ```
 
 随后可以直接要求：
@@ -314,6 +403,19 @@ cp -R skills/omnihub ~/.codex/skills/omnihub
 > 用 OmniHub 搜索 GitHub 和 X 上的 Agent 搜索基础设施，返回实际来源链接，并说明 partial 或 coverage 限制。
 
 宿主支持 MCP 时优先配置 `omnihub mcp`；否则 Skill 会原样调用全局 `omnihub` CLI。OmniHub 只能保证自身 Envelope 中的来源链路可检查，不能审计 Agent 在最终自然语言中另行生成的链接。
+
+## Chrome Browser Bridge
+
+OmniHub 已提供当前用户级 Native Messaging Host、IPC、精确 origin 授权合同和 Dashboard readiness。安装时必须给出一个 Chrome Extension ID：
+
+```bash
+omnihub chrome-host install --extension-id abcdefghijklmnopabcdefghijklmnop
+omnihub chrome-host uninstall
+```
+
+Chrome 会按 manifest 直接启动同一个二进制；一般不需要手工运行 `chrome-host run`。`uninstall` 只注销精确的 Native Host 注册，不删除 OmniHub binary、SQLite、配置或 cache。
+
+本仓库不包含 Chrome Companion Extension。只有 Extension 已安装、用户对精确 HTTPS origin 授权、Bridge 在线，并且某个受信任 Cookie Channel 真实 Probe 成功后，该 Channel 才能显示 ready。Cookie 只进入当前执行内存，不写 SQLite、不经过 Dashboard HTTP，也不进入 Run、Error 或日志。
 
 ## 出口、Probe 与诊断
 
@@ -325,7 +427,7 @@ cp -R skills/omnihub ~/.codex/skills/omnihub
 ./omnihub channels probe CHANNEL_ID
 ```
 
-`plan` 只选择 Channel，不访问上游。主动 Probe 会按实际拓扑报告 DNS、TCP、proxy connect、TLS、HTTP 与 Feed parse，并把脱敏健康投影按 TTL 保存给 Dashboard/readiness；正文、Item、Cookie、代理地址与 Credential 不进入持久报告。v1 只为 Feed/RSSHub 实现分层 Probe，GitHub、Tavily 与 xurl 明确返回 `probe_unsupported`。`doctor` 不发网络请求，也不会把 declared/configured 冒充成 ready。
+`plan` 只选择 Channel，不访问上游。`channels probe` 返回持久 Run 及该 Channel 最新的脱敏 Probe 记录；主动 Probe 会按实际拓扑报告 DNS、TCP、proxy connect、TLS、HTTP 与 Feed parse，并把健康投影按 TTL 保存给 Dashboard/readiness。正文、Item、Cookie、代理地址与 Credential 不进入持久报告。v1 只为 Feed/RSSHub 实现分层 Probe，GitHub、Tavily 与 xurl 明确返回 `probe_unsupported`。`doctor` 不发网络请求，也不会把 declared/configured 冒充成 ready。
 
 过期 Run、Probe health 与 tombstone 只通过显式维护命令清理；默认 dry-run，不在读取或 `serve` 启动时偷偷删除：
 
@@ -341,8 +443,11 @@ cp -R skills/omnihub ~/.codex/skills/omnihub
 | `OMNIHUB_CONFIG_DIR` | 可选 `sources.yaml` 所在目录 |
 | `OMNIHUB_DATABASE` | 用户 SQLite 文件路径 |
 | `OMNIHUB_CACHE_DIR` | Direct Feed 条件响应缓存目录 |
+| `OMNIHUB_RUNTIME_DIR` | Chrome Bridge 当前用户 IPC 目录 |
 
-API Key/Token 按个人本地 MVP 方案原样保存在 SQLite；能读取该文件的本机账号也能读取 secret。列表、Envelope、Error、cache 与普通输出不回显原值。Cookie 当前不落库，因为 Chrome Browser Bridge 尚未实现。
+API Key/Token 按个人本地 MVP 方案原样保存在 SQLite；能读取该文件的本机账号也能读取 secret。列表、Envelope、Error、cache 与普通输出不回显原值；Credential detail 只有显式 `include_value=true` 才返回原值并设置 `Cache-Control: no-store`。Chrome Cookie 始终不落库，embedding cache 只保存向量和 cohort key，不保存原始输入文本。
+
+普通升级、替换 binary 或 Native Host uninstall 都保留数据库、配置与 cache。v0.1 没有 backup/restore 或 destructive purge 命令；需要备份时先停止 `serve`，再离线复制 SQLite，或用 OPML/Source Bundle 导出不含密钥的可移植配置。
 
 CLI exit code：
 
@@ -360,8 +465,10 @@ CLI exit code：
 - Tavily 和 X/xurl 需要用户自己的凭据、套餐与网络。仓库测试使用确定性 fixture 覆盖请求、错误、来源链和脱敏；当前不宣称用真实 Tavily Key 或 X quota 完成了 live E2E。
 - `serve` 不负责后台常驻、自启动或调度；Dashboard 前端由独立工作流实现，HTTP MCP 也不是外部 Adapter 协议。
 - Snapshot 采用 immutable append-only + 每 View 一个 current pointer；当前不暴露历史 API，也不自动 compaction。长期磁盘增长需要后续基于真实规模增加显式清理策略。
-- Stage D 尚待实现 Chrome Native Host/Bridge 与 Cookie 授权链；前端不在当前后端实现内。
-- Stage E 尚待完成本地向量方案的最终实现与 semantic grouping；当前不会安装 Ollama、下载模型或自动回退云端。
+- Chrome Native Host/Bridge Backend 已实现，但 Companion Extension 和真实 Cookie Provider 不在本仓库；mock、manifest 或 Bridge 在线都不能证明某个来源 ready。
+- Semantic grouping 默认关闭，只在一次查询的最终结果上做精确分组。当前不会安装 Ollama、下载模型、自动回退云端，也不宣称已经提供 ANN 或向量数据库能力。
+- Source Bundle 可以声明受信任 Source/Provider/RouteTemplate；它不会执行远程代码。新增网络协议仍需实现窄 Go Adapter 并接入统一 Executor，v0.1 不提供 Go plugin 或稳定的第三方 Adapter SDK。
+- 发布脚本能交叉构建三平台 archive；Linux/Windows 原生运行结论只以 CI 或实机证据为准，不能由本机交叉构建推导。
 - MySQL Store、多实例运行、PAC/VPN/TUN、公共代理池与隐式“最快线路”不在当前 preview 内。
 
 可重放验证记录见 [Test Report](test/test-report.md)。完整的[需求](shape/requirements.md)、[公共合同](shape/contract.md)、[系统设计](shape/design.md)与[实施计划](plan.md)保留了后续阶段边界。
@@ -376,7 +483,15 @@ go vet ./...
 git diff --check
 ```
 
-新增能力先维护 `internal/core` 的统一合同，再从同一事实源投影 CLI、REST、MCP 与 Dashboard。
+CI 在 macOS arm64、Ubuntu 与 Windows runner 上执行 test/vet。新增能力先维护 `internal/core` 的统一合同，再从同一事实源投影 CLI、REST、MCP 与 Dashboard；不要只修改某一个出口。
+
+发布候选只能从 clean commit 构建：
+
+```bash
+VERSION=0.1.0 COMMIT="$(git rev-parse HEAD)" ./scripts/release.sh
+```
+
+脚本从实际 binary build list 收集第三方许可证，构建三平台 archive，生成并立即校验 `dist/checksums.txt`。它不承诺字节级 reproducible build，也不创建 tag 或 GitHub Release。
 
 ## License
 

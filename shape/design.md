@@ -256,7 +256,7 @@ Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder�
 
 semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 little-endian `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。`shape/evidence/local-vector-study.md` 已确认当前 Driver 可用无 CGO 的 `modernc.org/sqlite/vec`，但它在这条路径仍是 exact scan，并额外引入 pre-v1 虚拟表、shadow table 和全局自动注册；Chromem、LanceDB 与 Qdrant 则需要第二状态、FFI 或 sidecar。BLOB + Go cosine 的复杂度上限清楚，且复用现有事务、备份、权限与三平台发布链。
 
-SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；v0.1 只实现 OpenAI-compatible wire contract，本地 Ollama 经 `/v1/embeddings` 接入，云端兼容服务走同一条 Endpoint/Egress/Credential 边界。输入为 title + summary，summary 缺失时回退 content.text，总计最多 8 KiB UTF-8；配方变化提升 index revision。OmniHub 不实现原生 `/api/embed` 自动探测，不安装 Ollama、不下载模型、不启动 daemon。旧向量保持 stale 而不混算；embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec` 的 driver 与发布矩阵。
+SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；v0.1 只实现 OpenAI-compatible wire contract，本地 Ollama 经 `/v1/embeddings` 接入，云端兼容服务走同一条 Endpoint/Egress/Credential 边界。远程 embedding 只允许 HTTPS；明文 HTTP 只允许字面 loopback IP 经 direct Egress，避免用户内容进入明文网络或代理。输入为 title + summary，summary 缺失时回退 content.text，总计最多 8 KiB UTF-8；配方变化提升 index revision。OmniHub 不实现原生 `/api/embed` 自动探测，不安装 Ollama、不下载模型、不启动 daemon。旧向量保持 stale 而不混算；embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot ANN 需求时，优先 spike `sqlite-vec` 的 driver 与发布矩阵。
 
 ## 10. 状态、缓存与增量一致性
 

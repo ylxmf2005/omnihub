@@ -83,7 +83,19 @@ func (operation Operation) Validate() error {
 	if operation.IdentityDedupe != IdentityNone && operation.IdentityDedupe != IdentityExact {
 		return fmt.Errorf("%w: unsupported identity_dedupe %q", ErrInvalidOperation, operation.IdentityDedupe)
 	}
-	if operation.SimilarityGrouping != SimilarityOff {
+	switch operation.SimilarityGrouping {
+	case SimilarityOff:
+		if operation.SemanticProfileID != nil {
+			return fmt.Errorf("%w: semantic_profile_id is only valid for semantic grouping", ErrInvalidOperation)
+		}
+	case SimilaritySemantic:
+		if operation.Operation == OperationFetch {
+			return fmt.Errorf("%w: fetch does not support semantic grouping", ErrInvalidOperation)
+		}
+		if operation.SemanticProfileID == nil || *operation.SemanticProfileID == "" || *operation.SemanticProfileID != strings.TrimSpace(*operation.SemanticProfileID) {
+			return fmt.Errorf("%w: semantic grouping requires semantic_profile_id", ErrInvalidOperation)
+		}
+	default:
 		return fmt.Errorf("%w: unsupported similarity_grouping %q", ErrInvalidOperation, operation.SimilarityGrouping)
 	}
 	return nil

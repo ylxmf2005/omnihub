@@ -72,6 +72,13 @@ type BrowserCookieExecutor interface {
 	Execute(context.Context, adapter.BrowserCookieRequest) core.AdapterResult
 }
 
+// SemanticGrouper 在内容 Provider 前完成静态依赖预检，在最终排序与 identity
+// 去重后只补充 similarity 字段。运行失败必须保留全部 Item。
+type SemanticGrouper interface {
+	Preflight(*registry.Catalog, core.Operation) error
+	Group(context.Context, *registry.Catalog, core.Operation, []core.Item) ([]core.Item, *core.Error)
+}
+
 type Service struct {
 	Feed          FeedExecutor
 	RSSHub        RSSHubExecutor
@@ -80,6 +87,7 @@ type Service struct {
 	XURL          XURLExecutor
 	CookieReader  CookieReader
 	BrowserCookie BrowserCookieExecutor
+	Semantic      SemanticGrouper
 	Now           func() time.Time
 }
 
@@ -89,9 +97,6 @@ type Service struct {
 func (service Service) Execute(parent context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
 	if catalog == nil {
 		return core.Envelope{}, fmt.Errorf("%w: catalog is required", ErrInvalidExecutor)
-	}
-	if operation.SimilarityGrouping != core.SimilarityOff {
-		return core.Envelope{}, fmt.Errorf("%w: Stage 2 only supports similarity_grouping=off", core.ErrInvalidOperation)
 	}
 	now := service.Now
 	if now == nil {
@@ -106,6 +111,16 @@ func (service Service) Execute(parent context.Context, catalog *registry.Catalog
 		return core.Envelope{}, err
 	}
 	defer cancel()
+	if operation.SimilarityGrouping == core.SimilaritySemantic {
+		if service.Semantic == nil {
+			return core.Envelope{}, fmt.Errorf("%w: semantic grouper is required", ErrInvalidExecutor)
+		}
+		// Preflight 必须早于 Router 选中的任何内容 Adapter，避免检索完成后才
+		// 发现 profile、Store、Credential 或 Egress 根本不可执行。
+		if err := service.Semantic.Preflight(catalog, operation); err != nil {
+			return core.Envelope{}, err
+		}
+	}
 
 	plan, err := router.Build(catalog, operation)
 	if err != nil {
@@ -147,6 +162,13 @@ func (service Service) Execute(parent context.Context, catalog *registry.Catalog
 
 	items, returnedByChannel, globallyTruncated := finalizeItems(run.items, operation)
 	run.applyReturnedCounts(returnedByChannel, globallyTruncated)
+	if operation.SimilarityGrouping == core.SimilaritySemantic {
+		var problem *core.Error
+		items, problem = service.Semantic.Group(operationContext, catalog, operation, items)
+		if problem != nil {
+			run.problems = append(run.problems, *problem)
+		}
+	}
 	// Router 的最终 skipped 集合已经排除了被提升为 fallback 的 Channel；这些
 	// 记录没有发生运行，因此时间必须保持零值。
 	for _, decision := range plan.Skipped {

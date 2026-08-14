@@ -3,6 +3,7 @@
 package browser
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,4 +40,16 @@ func installHostManifest(payload []byte) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("write Chrome native host registry value: %w", err)
 	}
 	return InstallResult{ManifestPath: manifestPath, RegistryKey: `HKCU\` + chromeNativeHostRegistryKey}, nil
+}
+
+// UninstallHost 只删除当前用户下 HostName 的精确注册键；manifest 文件、binary 与用户数据均保留。
+func UninstallHost() (UninstallResult, error) {
+	registration := `HKCU\` + chromeNativeHostRegistryKey
+	if err := registry.DeleteKey(registry.CURRENT_USER, chromeNativeHostRegistryKey); err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return UninstallResult{Registration: registration}, nil
+		}
+		return UninstallResult{}, fmt.Errorf("remove Chrome native host registry key: %w", err)
+	}
+	return UninstallResult{Registration: registration, Removed: true}, nil
 }

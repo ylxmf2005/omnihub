@@ -11,11 +11,12 @@ import (
 	"unicode"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 )
 
-// ApplyProviderEndpointInput 只管理首批官方 HTTP Provider 的固定 Endpoint。
-// BaseURL 可做规范化输入，但不能把官方 origin 改成镜像或任意转发地址。
+// ApplyProviderEndpointInput 管理首批 HTTP Provider Endpoint。GitHub/Tavily
+// 固定官方 origin；embedding 由用户显式给出 OpenAI-compatible BaseURL。
 type ApplyProviderEndpointInput struct {
 	ID               string `json:"id"`
 	Provider         string `json:"provider"`
@@ -63,9 +64,25 @@ func (service Service) ApplyProviderEndpoint(ctx context.Context, input ApplyPro
 		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint id: %v", ErrInvalidProviderConfig, err)
 	}
 	provider := strings.TrimSpace(input.Provider)
-	baseURL, ok := officialProviderEndpoint(provider)
-	if !ok || !matchesOfficialEndpoint(input.BaseURL, baseURL) {
-		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint must use the selected provider's official HTTPS origin", ErrInvalidProviderConfig)
+	baseURL, trust := "", "official"
+	var parsedBaseURL *url.URL
+	if provider == "embedding" {
+		parsedInput, parseErr := url.Parse(strings.TrimSpace(input.BaseURL))
+		if parseErr != nil || parsedInput.User != nil || parsedInput.RawQuery != "" || parsedInput.ForceQuery || parsedInput.Fragment != "" {
+			return core.EndpointProfile{}, fmt.Errorf("%w: embedding endpoint must be an http(s) URL without credentials, query, or fragment", ErrInvalidSemantic)
+		}
+		var normalizeErr error
+		baseURL, parsedBaseURL, normalizeErr = normalizeHTTPURL(input.BaseURL)
+		if normalizeErr != nil {
+			return core.EndpointProfile{}, fmt.Errorf("%w: embedding endpoint base URL is invalid", ErrInvalidSemantic)
+		}
+		trust = "user"
+	} else {
+		var ok bool
+		baseURL, ok = officialProviderEndpoint(provider)
+		if !ok || !matchesOfficialEndpoint(input.BaseURL, baseURL) {
+			return core.EndpointProfile{}, fmt.Errorf("%w: endpoint must use the selected provider's official HTTPS origin", ErrInvalidProviderConfig)
+		}
 	}
 
 	routing, err := service.Store.LoadRoutingCatalog(ctx)
@@ -74,8 +91,12 @@ func (service Service) ApplyProviderEndpoint(ctx context.Context, input ApplyPro
 	}
 	working := cloneRoutingCatalog(routing)
 	egressID := strings.TrimSpace(input.EgressProfileID)
-	if _, err := enabledEgressProfile(working, egressID); err != nil {
+	egressProfile, err := enabledEgressProfile(working, egressID)
+	if err != nil {
 		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint egress: %v", ErrInvalidProviderConfig, err)
+	}
+	if provider == "embedding" && egress.ValidateHTTPSOrDirectLoopback(parsedBaseURL, egressProfile) != nil {
+		return core.EndpointProfile{}, fmt.Errorf("%w: remote embedding endpoints require HTTPS; HTTP is limited to a literal loopback IP through direct egress", ErrInvalidSemantic)
 	}
 
 	index, exists := indexEndpoints(working.Endpoints)[id]
@@ -91,7 +112,7 @@ func (service Service) ApplyProviderEndpoint(ctx context.Context, input ApplyPro
 
 	endpoint := core.EndpointProfile{
 		ID: id, Provider: provider, BaseURL: baseURL, EgressProfileID: egressID,
-		Trust: "official", Enabled: true,
+		Trust: trust, Enabled: true,
 	}
 	if exists {
 		endpoint.Revision = working.Endpoints[index].Revision + 1

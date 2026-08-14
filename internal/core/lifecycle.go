@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var ErrInvalidEnvelope = errors.New("invalid envelope input")
@@ -168,6 +170,9 @@ func (envelope Envelope) Validate() error {
 		if len(item.Observations) == 0 {
 			return fmt.Errorf("%w: item %d must contain at least one observation", ErrInvalidEnvelope, index)
 		}
+		if !validItemSimilarity(envelope.Request, item.Similarity) {
+			return fmt.Errorf("%w: item %d has invalid similarity facts", ErrInvalidEnvelope, index)
+		}
 	}
 	for index, problem := range envelope.Errors {
 		if !validErrorCode(problem.Code) {
@@ -325,11 +330,29 @@ func validFreshUntil(value *time.Time) bool {
 
 func validErrorCode(code ErrorCode) bool {
 	switch code {
-	case ErrorParameter, ErrorConfig, ErrorAuth, ErrorRateLimit, ErrorTimeout, ErrorNetwork, ErrorUpstream, ErrorProtocol, ErrorParse, ErrorInternal, ErrorBrowserUnavailable, ErrorBrowserPermission, ErrorCookieMissing:
+	case ErrorParameter, ErrorConfig, ErrorAuth, ErrorRateLimit, ErrorTimeout, ErrorNetwork, ErrorUpstream, ErrorProtocol, ErrorParse, ErrorInternal, ErrorBrowserUnavailable, ErrorBrowserPermission, ErrorCookieMissing, ErrorSimilarityUnavailable:
 		return true
 	default:
 		return false
 	}
+}
+
+func validItemSimilarity(operation Operation, similarity Similarity) bool {
+	if similarity.Strategy == string(SimilarityOff) {
+		return similarity.GroupID == nil && similarity.Score == nil
+	}
+	if operation.SimilarityGrouping != SimilaritySemantic || operation.SemanticProfileID == nil {
+		return false
+	}
+	prefix := "semantic:" + *operation.SemanticProfileID + ":"
+	model := strings.TrimPrefix(similarity.Strategy, prefix)
+	if model == similarity.Strategy || model == "" || model != strings.TrimSpace(model) || len(model) > 256 || strings.IndexFunc(model, unicode.IsControl) >= 0 {
+		return false
+	}
+	if similarity.GroupID == nil || *similarity.GroupID == "" || *similarity.GroupID != strings.TrimSpace(*similarity.GroupID) || similarity.Score == nil {
+		return false
+	}
+	return !math.IsNaN(*similarity.Score) && !math.IsInf(*similarity.Score, 0) && *similarity.Score >= -1 && *similarity.Score <= 1
 }
 
 func nonNil[T any](values []T) []T {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/management"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
 	"github.com/ylxmf2005/omnihub/internal/registry"
+	"github.com/ylxmf2005/omnihub/internal/store/sqlite"
 	"github.com/ylxmf2005/omnihub/internal/subscription"
 )
 
@@ -35,7 +37,7 @@ func TestOperationProjection(t *testing.T) {
 			t.Fatalf("%s schema type = %v, want object", name, schema["type"])
 		}
 		properties := schema["properties"].(map[string]any)
-		for _, field := range []string{"schema_version", "operation", "scope", "route_policy", "limit", "deadline_ms"} {
+		for _, field := range []string{"schema_version", "operation", "scope", "route_policy", "limit", "similarity_grouping", "semantic_profile_id", "deadline_ms"} {
 			if _, ok := properties[field]; !ok {
 				t.Errorf("%s schema misses %s", name, field)
 			}
@@ -50,12 +52,19 @@ func TestOperationProjection(t *testing.T) {
 		if got := mode["enum"].([]any); len(got) != 4 {
 			t.Errorf("%s route mode enum = %v", name, got)
 		}
+		similarity := properties["similarity_grouping"].(map[string]any)
+		if got := similarity["enum"].([]any); len(got) != 2 || got[0] != "off" || got[1] != "semantic" {
+			t.Errorf("%s similarity enum = %v", name, got)
+		}
 	}
 	for index, raw := range []json.RawMessage{artifacts.CLI.Commands[0].InputSchema, artifacts.MCP.Tools[0].InputSchema} {
 		schema := schemaObject(t, raw)
 		properties := schema["properties"].(map[string]any)
 		if _, ok := properties["query"]; !ok {
 			t.Errorf("search projection %d misses query", index)
+		}
+		if _, ok := properties["semantic_profile_id"]; !ok {
+			t.Errorf("search projection %d misses semantic_profile_id", index)
 		}
 		if _, ok := properties["operation"]; ok {
 			t.Errorf("search projection %d unexpectedly exposes operation selector", index)
@@ -65,9 +74,15 @@ func TestOperationProjection(t *testing.T) {
 	if _, ok := latest["query"]; ok {
 		t.Error("latest schema accepts query")
 	}
+	if _, ok := latest["semantic_profile_id"]; !ok {
+		t.Error("latest schema misses semantic_profile_id")
+	}
 	fetch := schemaObject(t, artifacts.CLI.Commands[2].InputSchema)["properties"].(map[string]any)
 	if _, ok := fetch["target"]; !ok {
 		t.Error("fetch schema misses target")
+	}
+	if _, ok := fetch["semantic_profile_id"]; ok {
+		t.Error("fetch schema exposes semantic_profile_id")
 	}
 
 	for _, operation := range []string{"search", "latest", "fetch"} {
@@ -117,6 +132,18 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	if err := searchSchema.Validate(&validSearch); err != nil {
 		t.Fatalf("valid search schema input failed: %v", err)
 	}
+	validSemantic := cloneJSONMap(t, validSearch)
+	validSemantic["similarity_grouping"] = "semantic"
+	validSemantic["semantic_profile_id"] = "semantic_local"
+	if err := searchSchema.Validate(&validSemantic); err != nil {
+		t.Fatalf("valid semantic search schema input failed: %v", err)
+	}
+	latestSchema := resolvedSchema(t, artifacts.CLI.Commands[1].InputSchema)
+	validSemanticLatest := cloneJSONMap(t, validSemantic)
+	delete(validSemanticLatest, "query")
+	if err := latestSchema.Validate(&validSemanticLatest); err != nil {
+		t.Fatalf("valid semantic latest schema input failed: %v", err)
+	}
 	validDomainSearch := cloneJSONMap(t, validSearch)
 	validDomainSearch["scope"] = map[string]any{"domains": []any{"docs.example.com"}}
 	if err := searchSchema.Validate(&validDomainSearch); err != nil {
@@ -158,6 +185,13 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 		},
 		"blank domain": func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{" "}} },
 		"continuation": func(value map[string]any) { value["continuation"] = "provider-cursor" },
+		"semantic without profile": func(value map[string]any) {
+			value["similarity_grouping"] = "semantic"
+		},
+		"semantic blank profile": func(value map[string]any) {
+			value["similarity_grouping"], value["semantic_profile_id"] = "semantic", " "
+		},
+		"off with profile": func(value map[string]any) { value["semantic_profile_id"] = "semantic_local" },
 		"empty preferred": func(value map[string]any) {
 			value["route_policy"] = map[string]any{"mode": "prefer", "aggregate": false, "allow_fallback": true}
 		},
@@ -192,6 +226,11 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 		},
 		"fetch without target": func(value map[string]any) {
 			value["operation"] = "fetch"
+			delete(value, "query")
+		},
+		"fetch semantic": func(value map[string]any) {
+			value["operation"], value["target"] = "fetch", "octo/repository"
+			value["similarity_grouping"], value["semantic_profile_id"] = "semantic", "semantic_local"
 			delete(value, "query")
 		},
 	} {
@@ -261,6 +300,15 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 
 	itemSchema := resolvedSchema(t, artifacts.Schemas.Item)
 	item := contractExample(t, "../../shape/contract.md", 5)
+	for name, score := range map[string]float64{"above one": 1.01, "below minus one": -1.01} {
+		t.Run("item similarity score "+name, func(t *testing.T) {
+			value := cloneJSONMap(t, item)
+			value["similarity"].(map[string]any)["score"] = score
+			if err := itemSchema.Validate(&value); err == nil {
+				t.Fatalf("item schema accepted similarity score %v", score)
+			}
+		})
+	}
 	for name, observations := range map[string]any{"null": nil, "empty": []any{}} {
 		t.Run("item observations "+name, func(t *testing.T) {
 			value := cloneJSONMap(t, item)
@@ -351,7 +399,31 @@ func TestFrozenContractFieldsAreProjected(t *testing.T) {
 		}
 	}
 	assertProperties(t, artifacts.Schemas.Item, "id", "url", "external_url", "title", "content", "summary", "image", "banner_image", "published_at", "modified_at", "authors", "tags", "language", "attachments", "metrics", "observations", "identity", "similarity")
+	itemProperties := schemaObject(t, artifacts.Schemas.Item)["properties"].(map[string]any)
+	similarityProperties := itemProperties["similarity"].(map[string]any)["properties"].(map[string]any)
+	for _, name := range []string{"group_id", "strategy", "score"} {
+		if _, ok := similarityProperties[name]; !ok {
+			t.Errorf("similarity schema misses property %s", name)
+		}
+	}
+	assertProperties(t, artifacts.Schemas.SemanticProfile, "id", "endpoint_profile_id", "credential_id", "model", "dimension", "threshold", "index_revision", "enabled", "revision")
+	assertProperties(t, artifacts.Schemas.SemanticProfileInput, "id", "endpoint_profile_id", "credential_id", "model", "dimension", "threshold", "index_revision", "enabled", "expected_revision")
+	semanticProperties := schemaObject(t, artifacts.Schemas.SemanticProfile)["properties"].(map[string]any)
+	semanticList := schemaObject(t, artifacts.Schemas.SemanticProfileList)
+	if semanticList["type"] != "array" || semanticList["items"].(map[string]any)["properties"] == nil {
+		t.Fatalf("semantic profile list schema = %v", semanticList)
+	}
+	for _, forbidden := range []string{"value", "value_masked", "cookie", "authorization", "headers", "vector", "proxy_endpoint"} {
+		if _, ok := semanticProperties[forbidden]; ok {
+			t.Errorf("semantic profile schema exposes %s", forbidden)
+		}
+	}
 	assertProperties(t, artifacts.Schemas.Run, "id", "kind", "resource", "status", "request_id", "idempotency_key", "created_at", "started_at", "finished_at", "claimed_by", "lease_expires_at", "attempt", "progress", "result", "last_error", "revision")
+	viewOperation := schemaObject(t, artifacts.Schemas.View)["properties"].(map[string]any)["operation"].(map[string]any)
+	if _, ok := viewOperation["allOf"]; !ok {
+		t.Fatal("View Operation schema misses semantic cross-field constraints")
+	}
+	assertProperties(t, artifacts.Schemas.PruneResult, "dry_run", "runs", "probe_health", "tombstones", "embeddings")
 	assertProperties(t, artifacts.Schemas.Coverage, "source", "channel_id", "route_template_id", "scope", "from", "to", "examined", "returned", "exhaustive", "truncated", "limitations")
 	assertProperties(t, artifacts.Schemas.Error, "code", "message", "source", "provider", "channel_id", "route_template_id", "retryable", "retry_after_ms", "details")
 	assertProperties(t, artifacts.Schemas.BrowserBridge, "id", "browser", "connected", "profile_label", "granted_origins", "last_seen_at", "last_error")
@@ -359,8 +431,16 @@ func TestFrozenContractFieldsAreProjected(t *testing.T) {
 	assertProperties(t, artifacts.Schemas.BrowserRevokeRequest, "permission_origin_pattern")
 	assertProperties(t, artifacts.Schemas.BrowserRevokeResponse, "request_id", "status")
 	errorProperties := schemaObject(t, artifacts.Schemas.Error)["properties"].(map[string]any)
-	if got := errorProperties["code"].(map[string]any)["enum"].([]any); len(got) != 13 {
-		t.Fatalf("error code enum = %v, want 13 stable codes", got)
+	got := errorProperties["code"].(map[string]any)["enum"].([]any)
+	if len(got) != 14 {
+		t.Fatalf("error code enum = %v, want 14 stable codes", got)
+	}
+	foundSimilarityUnavailable := false
+	for _, code := range got {
+		foundSimilarityUnavailable = foundSimilarityUnavailable || code == string(core.ErrorSimilarityUnavailable)
+	}
+	if !foundSimilarityUnavailable {
+		t.Fatalf("error code enum misses %s: %v", core.ErrorSimilarityUnavailable, got)
 	}
 }
 
@@ -402,6 +482,8 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 		"/v1/browser-bridges/{id}/permissions/revoke":       {"post"},
 		"/v1/endpoint-profiles":                             {"get", "post"},
 		"/v1/endpoint-profiles/{id}":                        {"get", "put", "delete"},
+		"/v1/semantic-profiles":                             {"get", "post"},
+		"/v1/semantic-profiles/{id}":                        {"get", "put", "delete"},
 		"/v1/egress-profiles":                               {"get", "post"},
 		"/v1/egress-profiles/{id}":                          {"get", "put", "delete"},
 		"/v1/credentials":                                   {"get", "post"},
@@ -443,7 +525,7 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 	if hasParameter(channelCreate, "Idempotency-Key") {
 		t.Fatal("configuration create incorrectly requires Idempotency-Key")
 	}
-	for _, path := range []string{"/v1/endpoint-profiles", "/v1/egress-profiles", "/v1/credentials", "/v1/collections"} {
+	for _, path := range []string{"/v1/endpoint-profiles", "/v1/semantic-profiles", "/v1/egress-profiles", "/v1/credentials", "/v1/collections"} {
 		operation := artifacts.OpenAPI.Paths[path]["post"].(map[string]any)
 		if _, exists := requestSchema(operation)["properties"].(map[string]any)["expected_revision"]; exists {
 			t.Errorf("%s body schema exposes expected_revision", path)
@@ -460,6 +542,18 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 	if pattern := ifMatch["schema"].(map[string]any)["pattern"]; pattern != `^"[1-9][0-9]*"$` {
 		t.Fatalf("If-Match pattern = %v", pattern)
 	}
+	for _, method := range []string{"put", "delete"} {
+		operation := artifacts.OpenAPI.Paths["/v1/semantic-profiles/{id}"][method].(map[string]any)
+		if !hasParameter(operation, "If-Match") {
+			t.Errorf("SemanticProfile %s misses If-Match", method)
+		}
+	}
+	semanticInput := requestSchema(artifacts.OpenAPI.Paths["/v1/semantic-profiles"]["post"].(map[string]any))["properties"].(map[string]any)
+	for _, forbidden := range []string{"expected_revision", "value", "value_masked", "cookie", "authorization", "headers", "vector", "proxy_endpoint"} {
+		if _, ok := semanticInput[forbidden]; ok {
+			t.Errorf("Dashboard SemanticProfile input exposes %s", forbidden)
+		}
+	}
 	for _, path := range []string{"/v1/runs", "/v1/views/{id}/refresh", "/v1/channels/{id}/probe"} {
 		post := artifacts.OpenAPI.Paths[path]["post"].(map[string]any)
 		if !hasParameter(post, "Idempotency-Key") {
@@ -473,6 +567,21 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 	nestedOperation := runInput["operation"].(map[string]any)
 	if _, ok := nestedOperation["allOf"]; !ok {
 		t.Fatal("Run input nested Operation misses cross-field constraints")
+	}
+	nestedRaw, err := json.Marshal(nestedOperation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidNested := map[string]any{
+		"schema_version": core.SchemaVersion, "operation": "search", "query": "agent search", "scope": map[string]any{"sources": []any{"github"}},
+		"route_policy": map[string]any{"mode": "auto", "aggregate": false, "allow_fallback": true}, "limit": float64(20),
+		"time_range": map[string]any{}, "identity_dedupe": "exact", "similarity_grouping": "semantic", "deadline_ms": float64(30000),
+	}
+	if err := resolvedSchema(t, nestedRaw).Validate(&invalidNested); err == nil {
+		t.Fatal("Run input nested Operation accepts semantic grouping without profile")
+	}
+	if artifacts.OpenAPI.Info["version"] == "" || artifacts.OpenAPI.Info["version"] == "0.1.0" {
+		t.Fatalf("OpenAPI build version is empty or hard-coded: %q", artifacts.OpenAPI.Info["version"])
 	}
 	probeResponses := artifacts.OpenAPI.Paths["/v1/channels/{id}/probe"]["post"].(map[string]any)["responses"].(map[string]any)
 	if _, ok := probeResponses["501"]; !ok {
@@ -535,6 +644,15 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 	if preflightResponse.Code != http.StatusNoContent || !strings.Contains(preflightResponse.Header().Get("Access-Control-Allow-Methods"), http.MethodPut) {
 		t.Fatalf("preflight response = %d, methods=%q", preflightResponse.Code, preflightResponse.Header().Get("Access-Control-Allow-Methods"))
 	}
+	semanticPreflight := httptest.NewRequest(http.MethodOptions, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", nil)
+	semanticPreflight.Header.Set("Origin", "http://localhost:5173")
+	semanticPreflight.Header.Set("Access-Control-Request-Method", http.MethodDelete)
+	semanticPreflight.Header.Set("Access-Control-Request-Headers", "if-match")
+	semanticPreflightResponse := httptest.NewRecorder()
+	handler.ServeHTTP(semanticPreflightResponse, semanticPreflight)
+	if semanticPreflightResponse.Code != http.StatusNoContent || !strings.Contains(semanticPreflightResponse.Header().Get("Access-Control-Allow-Methods"), http.MethodDelete) {
+		t.Fatalf("SemanticProfile preflight = %d, methods=%q", semanticPreflightResponse.Code, semanticPreflightResponse.Header().Get("Access-Control-Allow-Methods"))
+	}
 	browserPreflight := httptest.NewRequest(http.MethodOptions, "http://127.0.0.1:8080/v1/browser-bridges/chrome_default/permissions/revoke", nil)
 	browserPreflight.Header.Set("Origin", "http://localhost:5173")
 	browserPreflight.Header.Set("Access-Control-Request-Method", http.MethodPost)
@@ -577,6 +695,12 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusPreconditionRequired || problemCode(t, response) != "if_match_required" {
 		t.Fatalf("revoke without If-Match = %d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusPreconditionRequired || problemCode(t, response) != "if_match_required" {
+		t.Fatalf("SemanticProfile delete without If-Match = %d", response.Code)
 	}
 
 	// Dashboard 的本机信任边界与 body 上限必须在业务 Service 之前失败，
@@ -624,6 +748,130 @@ func TestDashboardHTTPOriginCORSAndRevisionBoundaries(t *testing.T) {
 		if _, err := NewDashboardHTTPHandler(dependencies); err == nil {
 			t.Errorf("accepted invalid DevOrigin %q", origin)
 		}
+	}
+}
+
+func TestSemanticProfileDashboardCRUDUsesManagementState(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "omnihub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	catalog, err := registry.Load(ctx, store, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &management.Service{Store: store, Catalog: catalog}
+	if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{
+		ID: "egress_direct", Mode: core.EgressModeDirect, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{
+		ID: "egress_environment", Mode: core.EgressModeEnvironment, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	load := func(ctx context.Context) (*registry.Catalog, error) { return registry.Load(ctx, store, "") }
+	dependencies := dashboardTestDependencies("")
+	dependencies.LoadCatalog = load
+	dependencies.Management = service
+	dependencies.Subscription = &subscription.Service{Store: store, LoadCatalog: load, Execute: func(context.Context, *registry.Catalog, core.Operation) (core.Envelope, error) {
+		return core.Envelope{}, nil
+	}, InstanceID: "semantic_dashboard_test"}
+	handler, err := NewDashboardHTTPHandler(dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 用户内容不能经远程明文 HTTP 或环境代理离开本机；拒绝发生在配置
+	// 写入前，因而不会留下一个运行时才失败的 Endpoint。
+	for _, body := range []string{
+		`{"id":"embedding_remote_http","provider":"embedding","base_url":"http://192.0.2.1:11434","egress_profile_id":"egress_direct"}`,
+		`{"id":"embedding_loopback_proxy","provider":"embedding","base_url":"http://127.0.0.1:11434","egress_profile_id":"egress_environment"}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/endpoint-profiles", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("unsafe embedding Endpoint response = %d: %s", response.Code, response.Body.String())
+		}
+	}
+
+	// embedding Endpoint 也通过 Dashboard 的通用 Endpoint 分派创建，避免
+	// SemanticProfile handler 依赖另一套影子配置。
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/endpoint-profiles", strings.NewReader(`{
+		"id":"embedding_local","provider":"embedding","base_url":"http://127.0.0.1:11434","egress_profile_id":"egress_direct"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create embedding Endpoint = %d, ETag=%q: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	profileBody := `{
+		"id":"semantic_local","endpoint_profile_id":"embedding_local","model":"embeddinggemma",
+		"dimension":768,"threshold":0.88,"index_revision":1,"enabled":true
+	}`
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/v1/semantic-profiles", strings.NewReader(profileBody))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || response.Header().Get("ETag") != `"1"` {
+		t.Fatalf("create SemanticProfile = %d, ETag=%q: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "value") || strings.Contains(response.Body.String(), "cookie") || strings.Contains(response.Body.String(), "vector") {
+		t.Fatalf("SemanticProfile response leaks credential, Cookie, or vector state: %s", response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/semantic-profiles", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	var profiles []core.SemanticProfile
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &profiles) != nil || len(profiles) != 1 || profiles[0].ID != "semantic_local" {
+		t.Fatalf("list SemanticProfiles = %d: %s", response.Code, response.Body.String())
+	}
+
+	updatedBody := strings.Replace(profileBody, `"threshold":0.88`, `"threshold":0.9`, 1)
+	request = httptest.NewRequest(http.MethodPut, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", strings.NewReader(updatedBody))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `"1"`)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("ETag") != `"2"` {
+		t.Fatalf("replace SemanticProfile = %d, ETag=%q: %s", response.Code, response.Header().Get("ETag"), response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPut, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", strings.NewReader(updatedBody))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `"1"`)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || problemCode(t, response) != "revision_conflict" {
+		t.Fatalf("stale SemanticProfile replace = %d: %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", nil)
+	request.Header.Set("If-Match", `"2"`)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("delete SemanticProfile = %d: %s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || problemCode(t, response) != "resource_not_found" {
+		t.Fatalf("deleted SemanticProfile read = %d: %s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/semantic-profiles/semantic_local/extra", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || problemCode(t, response) != "resource_not_found" {
+		t.Fatalf("invalid SemanticProfile path = %d: %s", response.Code, response.Body.String())
 	}
 }
 
@@ -891,7 +1139,7 @@ func browserDashboardCatalog(t *testing.T, trusted, templateEnabled, channelEnab
 	overlay := core.TemplateOverlay{RouteTemplateID: template.RouteTemplateID, Enabled: templateEnabled, Trusted: trusted, Revision: 1}
 	catalog, err := registry.NewCatalog(
 		[]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{template}, []core.Channel{channel},
-		nil, nil, nil, nil, []core.TemplateOverlay{overlay},
+		nil, nil, nil, nil, nil, []core.TemplateOverlay{overlay},
 	)
 	if err != nil {
 		t.Fatal(err)

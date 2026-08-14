@@ -145,4 +145,5 @@ type PruneResult struct {
 	Runs        int64 `json:"runs"`
 	ProbeHealth int64 `json:"probe_health"`
 	Tombstones  int64 `json:"tombstones"`
+	Embeddings  int64 `json:"embeddings"`
 }

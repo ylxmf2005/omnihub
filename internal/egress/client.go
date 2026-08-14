@@ -129,6 +129,22 @@ func ValidateCredential(profile core.EgressProfile, credential *core.Credential)
 	return err
 }
 
+// ValidateHTTPSOrDirectLoopback 保护会发送用户内容的请求：远程目标必须使用
+// HTTPS，明文 HTTP 只允许字面 loopback IP 经显式 direct 出口访问。
+func ValidateHTTPSOrDirectLoopback(target *url.URL, profile core.EgressProfile) error {
+	if target == nil {
+		return ErrUntrustedTransport
+	}
+	if target.Scheme == "https" {
+		return nil
+	}
+	address := net.ParseIP(target.Hostname())
+	if target.Scheme != "http" || address == nil || !address.IsLoopback() || profile.Mode != core.EgressModeDirect {
+		return ErrUntrustedTransport
+	}
+	return nil
+}
+
 func containsControl(value string) bool {
 	return strings.IndexFunc(value, unicode.IsControl) >= 0
 }

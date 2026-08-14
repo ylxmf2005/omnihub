@@ -1,174 +1,207 @@
-# Test Report：Stage D Chrome Cookie Backend
+# Test Report：Stage E Semantic Grouping 与 0.1.x 发布候选
 
 ## 总体结论
 
-- 状态：`passed`
-- 能否交付：`yes`
-- 核心依据：TC-D01—D08 均有直接执行证据。严格 Native Messaging、单活/取消/重连、当前用户 Unix IPC、Windows SID named-pipe 编译合同、trusted scope、nil-value Cookie Credential、Query mock consumer 零泄漏、Dashboard Browser API/CORS、实时 blocked readiness、Chrome manifest 与同一 binary 直接 argv 启动均通过；最终全量 test/race/vet/diff、20 次 Browser 取消竞态、20 次 disabled readiness 与 xurl 单核压力重放、Schema 生成和三平台构建全部 exit 0。
-- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-d-chrome-bridge`，HEAD `55286d9138d4af679737d65d39040b54d3b6d516` 加未提交 Stage D diff；最终 `cmd/internal/go.mod/go.sum` 内容指纹 `3ca3b48f890c42c70c565cf8f987449ee690d1c8652560e3c8a663bd2c9decdc`。
-- 当前参考对象：真实 E2E 后只更新阶段证据文档，没有改变生产代码或测试；下列二进制身份仍对应上述源码指纹。
+- 状态：`executing`
+- 能否交付：`not-yet`
+- 核心依据：SemanticProfile、可信 embedding、SQLite cache、100 Item exact grouping、全部公共出口、既有来源回归、live/conditional 来源与 Skill forward-test 已成立；尚需从 clean commit 构建并验收 archive、验证三平台 GitHub Actions、完成最终独立 Review 和冻结对象质量闸。
+- 被测对象：`/private/tmp/omnihub-stage-a` 的 `feature/stage-e-semantic-release`，Stage D `a8ef7f3` 加当前 Stage E diff。
 
 ## 被测环境
 
-- 环境与路由：macOS arm64、Go 1.26.4；自动化使用 in-memory pipe、临时 Unix socket、`httptest`/loopback HTTP 与 SQLite；最终真实 E2E 只监听 `127.0.0.1:18974`，Native Host 只写隔离 HOME/runtime。
-- 身份与资源：当前本机用户；固定假 Extension ID `abcdefghijklmnopabcdefghijklmnop`、假 origin/Profile/Cookie；未连接用户 Chrome，未读取真实 Cookie、API Key 或外部平台。
-- 观察面：Go test/race/vet/diff、Native frame、CLI JSON/exit、manifest/mode、Unix socket、HTTP status/body/header、OpenAPI/JSON Schema、Envelope/readiness、SQLite readback、三平台 file/hash与清理回读。
-- 执行时间：2026-08-15（Asia/Shanghai）；最终 Native hello ack 为 `2026-08-14T17:35:54.13765Z` UTC，Dashboard smoke 响应为 `2026-08-14T17:37:36Z—17:37:37Z` UTC。
+- 环境与路由：macOS arm64、Go 1.26.4；`/private/tmp` 隔离 Go cache、SQLite/config/cache/runtime；loopback Feed/embedding/REST/MCP fixture；公开网络只访问 V2EX、linux.do、GitHub 与 NodeSeek 候选。
+- 身份与资源：当前本机用户；Tavily/X/RSSHub/embedding/Chrome 使用固定假凭据或 fixture，不读取用户真实 API Key、Cookie、浏览器数据或 Shell secret。
+- 观察面：Go test/race/vet、CLI JSON/JSONL、REST、MCP stdio、SQLite、Run/Snapshot/View、RSS/Atom/JSON Feed、公开上游响应、Skill 隔离 Agent、进程/端口/临时目录回读。
+- 执行时间：2026-08-15（Asia/Shanghai），执行中。
 
 ## 证据完整度
 
 | 证据等级或范围 | 用例 | 可以复核的内容 | 缺口 |
 | --- | --- | --- | --- |
-| 最终 native CLI + loopback Dashboard | D05、D07、D08 | 隔离安装、0600 manifest、单一 origin、Chrome argv 直启 hello ack、offline Bridge、readiness、dev/evil CORS、OpenAPI | 未连接真实 Chrome Extension |
-| 真实 Host/Query/SQLite/HTTP 自动化 | D01—D06 | framing、strict JSON、scope、取消/迟到响应、单活/reconnect、Credential、Cookie 泄漏、Dashboard错误、blocked readiness | Windows pipe在本机未运行 |
-| 最终质量闸与交叉构建 | D01—D08 | 全量 test/race/vet/diff、20次竞态重放、darwin/linux/windows build和格式/hash | 交叉构建不证明Linux/Windows实机ACL/registry行为 |
-| 独立冷审与修后重测 | D02、D03、D06 | 两项P2根因、最窄修复、全量受影响回归 | 审核不替代真实Windows实机测试 |
+| 最终源码自动化与聚焦缺陷重放 | E01—E05、E07、E10 | Core/Store/Management/Adapter/Transport、安全边界、cache、分组、race/vet | 冻结 commit 后还需最后重跑 |
+| 真实 binary + loopback 消费者 | E02、E06 | CLI/REST/MCP/View/Run/Snapshot/三 Feed 与 cache 复用 | 不代表第三方 embedding SLA |
+| 公开网络 smoke | E07 | V2EX、linux.do、GitHub 成功；NodeSeek 分层失败事实 | Tavily/X 无真实凭据，按 fixture 边界验收 |
+| 隔离 Agent forward-test | E08 | 固定 OmniHub 调用、失败不换工具、成功引用与 coverage 披露 | 不审计任意 Agent 的所有未来回答 |
+| 发布脚本与 CI 静态/本地入口 | E09 | clean-tree gate、许可/归档/checksum设计、native smoke workflow | archive、Actions 与 go install 尚待 clean commit |
 
 ## 覆盖台账
 
 | 用例 ID | 场景 | 优先级 | 状态 | 执行记录 | 最强证据 |
 | --- | --- | --- | --- | --- | --- |
-| TC-D01 | Native Messaging 严格协议与生命周期 | P1 | passed | [TC-D01](#tc-d01--native-messaging-严格协议与请求生命周期--passed) | Browser Host 自动化 + 20次取消重放 |
-| TC-D02 | 当前用户 IPC、单活与跨平台合同 | P1 | passed | [TC-D02](#tc-d02--当前用户-ipc单活与跨平台合同--passed) | Unix socket回读 + Windows build + 冷审修复 |
-| TC-D03 | trusted Template、Credential 与 scope | P1 | passed | [TC-D03](#tc-d03--trusted-routetemplatecredential-与-scope-一致性--passed) | Registry/Management/Authorization回归 |
-| TC-D04 | Query mock consumer 与 Cookie 零输出 | P1 | passed | [TC-D04](#tc-d04--query-mock-consumer-与-cookie-零输出--passed) | `TestStageDBrowserCookie*` |
-| TC-D05 | Dashboard Browser API、错误与 CORS | P1 | passed | [TC-D05](#tc-d05--dashboard-browser-api错误与-cors--passed) | HTTP自动化 + loopback smoke |
-| TC-D06 | 实时 readiness 与旧 Snapshot 分离 | P1 | passed | [TC-D06](#tc-d06--实时-readiness-与旧-snapshot-分离--passed) | Browser readiness integration |
-| TC-D07 | Native Host 安装与真实 CLI 启动链 | P1 | passed | [TC-D07](#tc-d07--native-host-安装与真实-cli-启动链--passed) | 最终 binary manifest + frame ack |
-| TC-D08 | 全量回归、Schema 与发布构建 | P1 | passed | [TC-D08](#tc-d08--全量回归schema-与发布构建--passed) | 全量 gate + 三平台 hash |
+| TC-E01 | SemanticProfile 管理与零上游 preflight | P1 | passed | [TC-E01](#tc-e01--semanticprofile-管理与零上游-preflight--passed) | 现有 Core/Management/SQLite/Transport 回归 |
+| TC-E02 | OpenAI-compatible wire、输入与 Egress | P1 | passed | [TC-E02](#tc-e02--openai-compatible-wire输入与-egress--passed) | loopback 原始请求与明文缺陷重放 |
+| TC-E03 | SQLite v4 cache、cohort、BLOB、retention | P1 | passed | [TC-E03](#tc-e03--sqlite-v4-cachecohortblobretention--passed) | `internal/store/sqlite/store_test.go` |
+| TC-E04 | exact cosine 与确定性 leader grouping | P1 | passed | [TC-E04](#tc-e04--exact-cosine-与确定性-leader-grouping--passed) | Stage E transport 回归、100 Item p95 |
+| TC-E05 | provider/cache 失败保留结果 | P1 | passed | [TC-E05](#tc-e05--providercache-失败保留结果--passed) | partial Envelope/Run/Snapshot 回读 |
+| TC-E06 | CLI/REST/MCP/JSONL/View/Feed 投影 | P1 | passed | [TC-E06](#tc-e06--clirestmcpjsonlviewfeed-投影--passed) | 真实 binary 公共出口 E2E |
+| TC-E07 | 全来源与既有功能矩阵 | P1 | passed | [TC-E07](#tc-e07--全来源与既有功能矩阵--passed) | 全量 test + live/fixture/conditional 矩阵 |
+| TC-E08 | README、Skill、示例与许可 | P1 | passed | [TC-E08](#tc-e08--readmeskill示例与许可--passed) | Skill byte-compare 与隔离 Agent forward-test |
+| TC-E09 | archive、checksum 与全新安装 | P1 | partial | [TC-E09](#tc-e09--archivechecksum-与全新安装--partial) | `scripts/release.sh`、CI workflow |
+| TC-E10 | 最终质量闸、性能与独立 Review | P1 | partial | [TC-E10](#tc-e10--最终质量闸性能与独立-review--partial) | pre-freeze test/race/vet/p95/冷审 |
 
 ## 逐用例执行记录
 
-### TC-D01 — Native Messaging 严格协议与请求生命周期 — passed
+### TC-E01 — SemanticProfile 管理与零上游 preflight — passed
 
-- 背景与风险：Host 是浏览器数据进入 OmniHub 的唯一入口，畸形 frame、错配响应或取消卡死会破坏整个 Bridge。
-- 实际前置条件：内存 pipe、临时 runtime、固定 hello/read/revoke/permission 消息和假 Cookie。
-- 预期：4-byte little-endian、strict JSON、1 MiB上限；request ID严格；取消释放 pending，迟到响应不杀 Host，后续请求成功。
-- 实际动作：1) 重放 read/revoke/permission成功路径；2) 发送 oversized、未知字段、重复字段、错 request ID和越权结果；3) 取消 pending 后立即发第二请求，再发送第一请求迟到响应；4) 在最终 diff 连续重放取消用例20次。
-- 实际响应与观察：`TestBrowserHostRoundTripPermissionAndRevoke`、`RejectsMissingCookiesAndExpandedScope`、`StrictFramingAndOfflineClient`、`RejectMismatchedRequestID`全部通过；取消用例20次终态 `ok`，没有 deadlock、Host退出或 race。
-- 终态回读：每个 fixture stop 后 Host 在2秒内退出；后续 Status仍可用；最终全仓 race通过。
-- 清理与清理回读：pipe关闭，临时 socket由test cleanup删除。
-- 证据：`internal/adapter/binding_test.go`；`go test ./internal/adapter -run '^TestBrowserHostCancellationDoesNotBlockNextRequest$' -count=20` exit0。
-- 证据边界：不证明独立 Extension Service Worker 的 backoff UI。
+- 背景与风险：错误 Profile、Endpoint、Credential 或 Egress 不能在内容检索付费后才暴露。
+- 实际前置条件：fresh SQLite v4、管理 CLI/Dashboard、enabled/disabled/missing Profile 与引用 View。
+- 预期：Search/Latest semantic 组合严格；CRUD/CAS/引用保护成立；配置错误请求数为零。
+- 实际动作：执行 Core 参数表、Management apply/list/get/disable/delete、Dashboard POST/PUT/DELETE/ETag、Store 原子引用检查及真实 CLI apply/list/disable。
+- 实际响应与观察：`off+profile`、`semantic-profile missing`、Fetch semantic、revision 冲突、被 View 引用删除均在上游前拒绝；REST 非法路径为 `resource_not_found`；CLI 跨进程回读 revision 正确。
+- 终态回读：RoutingCatalog 与 SQLite 保存同一 SemanticProfile，删除保护在 Store 事务内复核。
+- 清理与清理回读：测试 SQLite 关闭并由临时目录删除。
+- 证据：`internal/core/model_test.go`、`internal/store/sqlite/store_test.go`、`internal/transport/schema_test.go`、`internal/transport/examples_test.go`。
+- 证据边界：不证明某个真实模型可用。
 
-### TC-D02 — 当前用户 IPC、单活与跨平台合同 — passed
+### TC-E02 — OpenAI-compatible wire、输入与 Egress — passed
 
-- 背景与风险：Bridge不能监听通用TCP或把平台故障误报成另一个Profile。
-- 实际前置条件：macOS当前用户、临时 runtime、第二 Host/stale socket；Windows amd64 build target。
-- 预期：目录0700、socket0600、单Profile、stale可恢复；Windows pipe只允许当前SID，非冲突错误保留根因。
-- 实际动作：1) 建立Host并stat socket；2) 启动第二Profile；3) 关闭Host并制造stale socket后重连；4) 冷审Windows ListenPipe错误；5) 修复后构建Windows amd64并重跑全量测试。
-- 实际响应与观察：Unix socket mode为0600，Host退出后socket不存在；第二Profile返回`bridge_already_active`，stale重连成功。冷审首次发现所有ListenPipe错误被误分类；修后只对 `ERROR_ALREADY_EXISTS/PIPE_BUSY/ACCESS_DENIED` 映射冲突，ACL/资源错误保留wrapped根因，Windows构建成功。
-- 终态回读：最终CLI直启后`chrome.sock removed`；没有listener或socket遗留。
-- 清理与清理回读：runtime目录随隔离E2E删除并确认不存在。
-- 证据：`TestBrowserHostSingleActiveStaleSocketAndReconnect`、`internal/browser/endpoint_windows.go`、Windows PE32+ build。
-- 证据边界：Windows SID ACL和HKCU manifest未在Windows实机运行。
+- 背景与风险：embedding 会发送标题/摘要，不能经明文远程网络、隐式代理、redirect 或 fallback。
+- 实际前置条件：loopback `/v1/embeddings` fixture、direct Egress、假 Bearer 与错误响应。
+- 预期：固定 batch wire；8 KiB UTF-8 recipe；远程 HTTPS；HTTP 仅 literal loopback+direct；无 secret/input 泄漏。
+- 实际动作：捕获 POST path/header/body；重放 count/index/dimension、NaN/Inf、零范数、额外 JSON、HTTP/断线；安全冷审后重放远程 HTTP 与 loopback+environment。
+- 实际响应与观察：只发送 `title + summary`，summary 缺失才回退正文，显式空 summary 不回退；redirect 禁止；管理 API 拒绝两种不安全 HTTP 配置，运行 preflight 也拒绝遗留远程 HTTP。
+- 终态回读：失败向量未写 cache；Error 只有 Profile/Endpoint/model/Egress ID 与脱敏原因。
+- 清理与清理回读：fixture 停止，无 listener。
+- 证据：`internal/semantic/service.go` 与 `TestStageESemanticGroupingContracts`；安全冷审 P2 修复前后重放。
+- 证据边界：loopback fixture不代表云端服务可用性或费用。
 
-### TC-D03 — trusted RouteTemplate、Credential 与 scope 一致性 — passed
+### TC-E03 — SQLite v4 cache、cohort、BLOB、retention — passed
 
-- 背景与风险：Catalog若接受运行层拒绝的scope，渠道会“配置成功但永远不可用”；放宽则会扩大Cookie读取面。
-- 实际前置条件：Registry、memory SQLite、trusted/untrusted Templates与nil-value Credential。
-- 预期：Browser、scope URL和allowed domain为一个精确HTTPS host；只有trusted+enabled模板可生成descriptor；chrome_cookie不保存value。
-- 实际动作：1) 测试正确、Firefox、wildcard、外域、父域和token夹带browser字段；2) 生成AuthorizationDescriptor；3) 创建/读取/list chrome_cookie Credential并尝试写值；4) Query前统计CookieReader调用。
-- 实际响应与观察：冷审首先发现Catalog允许`.example.com`而Browser拒绝；修后Catalog在加载期拒绝父域，新增回归通过。trusted模板descriptor成功，untrusted/disabled/non-cookie失败且读Cookie次数0；SQLite中的Credential value为null，带值创建返回配置错误。
-- 终态回读：管理列表只返回`has_value=false`；无secret写入Store。
-- 清理与清理回读：memory Store关闭，无外部状态。
-- 证据：`TestBrowserAuthorizationComesFromEnabledTrustedCatalog`、Stage D registry descriptor cases、Credential contract tests。
-- 证据边界：不实现远程Bundle自动信任或父域Cookie。
+- 背景与风险：模型或配方混算、坏 BLOB 与隐式删除会污染结果或用户数据。
+- 实际前置条件：fresh DB、v3→v4、future schema、可注入坏 BLOB 的既有 Store 测试。
+- 预期：cohort 全字段隔离；finite/non-zero vector；30 天 explicit prune；migration 只向前。
+- 实际动作：put/get/touch/reopen、Endpoint revision/model/dimension/index revision miss、坏长度/NaN/Inf/零范数、dry-run/apply prune、future schema gate。
+- 实际响应与观察：little-endian float32 roundtrip 成立；坏向量 fail-closed；schema 常量统一为 4；dry-run 不写，apply 只删过期孤立 cache。
+- 终态回读：其他 Run/Probe/tombstone/当前 Snapshot 不受 embedding prune 影响。
+- 清理与清理回读：SQLite/WAL/SHM 随临时目录删除。
+- 证据：`internal/store/sqlite/store_test.go` 全包与 race。
+- 证据边界：不证明跨 Snapshot ANN。
 
-### TC-D04 — Query mock consumer 与 Cookie 零输出 — passed
+### TC-E04 — exact cosine 与确定性 leader grouping — passed
 
-- 背景与风险：Stage D只需证明安全边界；mock不能把Cookie反射成结果或持久化材料。
-- 实际前置条件：fake CookieReader、明确BrowserCookieExecutor、单Browser及Feed+Browser aggregate。
-- 预期：成功值只供当前consumer；返回后清空；offline/permission/missing/scope映射稳定；任何JSON可观察反射都fail-closed且脱敏。
-- 实际动作：1) 执行成功、四类失败及无consumer/untrusted路径；2) 分别把secret放入Item、Coverage、Error、nested details、Limitation、ProviderState；3) 序列化Envelope与consumer request；4) 执行Feed+Browser aggregate。
-- 实际响应与观察：成功Envelope complete且`Auth.Used=true`；consumer返回后Cookie value为空。六类反射均成为一个脱敏`protocol_error`，序列化不含两个假Cookie值；offline aggregate保留Feed Item并为partial；无consumer和untrusted均零读取。
-- 终态回读：SQLite/HTTP/Run/Error/fixture可观察对象未出现secret；chrome_cookie value仍为null。
-- 清理与清理回读：fixture引用释放，测试Store关闭。
-- 证据：`TestStageDBrowserCookieQueryContracts`、`TestStageDBrowserCookieAggregateAndCredentialContracts`。
-- 证据边界：Go runtime不承诺字符串的密码学擦除；本项证明不持久化、不输出和释放可达引用。
+- 背景与风险：语义分组不能删除、重排或把相似度写成身份事实。
+- 实际前置条件：固定人工向量、threshold 边界、cache miss/hit、100 Item 最大窗口。
+- 预期：选择分数最高且最早的代表；稳定 group/score/strategy；全部 Item 保留。
+- 实际动作：运行相等向量、A/B leader、tie、best representative、profile/index revision；再对 100 个互不合并向量 warm cache 并连续执行 30 次。
+- 实际响应与观察：threshold=1 相等向量合组；tie 选择最早代表；index revision 改变 group/cache cohort；100 Item/100 group 全保留，embedding 请求总数 1，cached exact grouping p95=`1.918375ms`。
+- 终态回读：Item ID、URL、Observation 与排序不变。
+- 清理与清理回读：fixture 与 DB 删除。
+- 证据：`TestStageESemanticGroupingContracts`。
+- 证据边界：小窗口 p95 只支持当前“不引入 sqlite-vec”决定，不是容量 SLA。
 
-### TC-D05 — Dashboard Browser API、错误与 CORS — passed
+### TC-E05 — provider/cache 失败保留结果 — passed
 
-- 背景与风险：Dashboard必须能观察离线并管理授权，但不能自行保存permission或Cookie。
-- 实际前置条件：fake live/offline Client、可信Catalog、最终loopback server `127.0.0.1:18974`。
-- 预期：offline bridge 200；descriptor/revoke按404/409/400合同；任意origin零调用；CORS只允许一个显式loopback dev Origin。
-- 实际动作：1) 自动化重放bridge/descriptor/revoke完整正负矩阵；2) 对最终server GET bridge/readiness/OpenAPI；3) 分别带允许与evil Origin请求Browser route。
-- 实际响应与观察：真实bridge为200、`connected:false`、`last_error.code=browser_unavailable`；readiness为200且空channels/groups。允许Origin为200并返回精确ACAO/Vary，evil Origin为403 `untrusted_request`。自动化中未知Channel=404、disabled/untrusted=409、revoke缺失/null/空/未知字段=400，错误Bridge=404，离线/缺权限=409；任意origin没有触达Client。
-- 终态回读：OpenAPI 3.1.0含三条Browser route，无Cookie value字段；负向请求没有写SQLite。
-- 清理与清理回读：server 收到 `SIGTERM` 后 exit143；`lsof -iTCP:18974 -sTCP:LISTEN` exit1/no listener。
-- 证据：`TestBrowserDashboardRoutesUseTrustedCatalogAndLiveBridge`、`TestDashboardHTTPOriginCORSAndRevisionBoundaries`、最终curl smoke。
-- 证据边界：不证明Dashboard前端交互。
+- 背景与风险：embedding 故障不能吞掉已经检索成功的内容。
+- 实际前置条件：一个 cache hit、一个 miss、503/invalid response/坏 cache。
+- 预期：有效项可分组，失败项保持 off；所有 Item 保留；Envelope/Run partial。
+- 实际动作：warm 单项 cache 后组合 hit+miss；重放 Provider HTTP/协议/向量错误并重复确认失败不缓存。
+- 实际响应与观察：所有 Item 保留；只产生一个 `similarity_unavailable` 汇总失败数；没有 Endpoint URL、输入、向量或 Credential 泄漏。
+- 终态回读：真实 View refresh 的 Run/Snapshot 保留两条 Item 和 partial 终态。
+- 清理与清理回读：临时状态删除。
+- 证据：Stage E transport 与 SQLite 回归、真实 binary View E2E。
+- 证据边界：没有自动切换模型或云端，符合合同。
 
-### TC-D06 — 实时 readiness 与旧 Snapshot 分离 — passed
+### TC-E06 — CLI/REST/MCP/JSONL/View/Feed 投影 — passed
 
-- 背景与风险：近期成功Probe不能覆盖Chrome当前已离线或permission被撤销。
-- 实际前置条件：ready Channel、`LastSuccessfulProbeAt`、历史`ready_dependent` group以及三种Bridge状态。
-- 预期：offline/permission缺失始终blocked并移除失真group；connected+granted不主动提升；旧Snapshot仍可stale分发。
-- 实际动作：对每种Bridge状态叠加`WithBrowserBridge`；回读Channel checks/action/RouteGroups；在全量Stage C回归中重放stale Snapshot。
-- 实际响应与观察：offline产生failed `browser_bridge`和`start_chrome_bridge`；permission缺失产生failed `browser_permission`和`grant_browser_permission`；两者即使有近期成功Probe仍为blocked且历史group被移除。connected+granted仅追加passed checks，原degraded保持不变；disabled Channel或disabled Template在叠加Bridge前后保持原`disabled_by_user`/`template_disabled`事实，20次重放一致。
-- 终态回读：Stage C stale Snapshot/readiness回归保持绿色，Channel当前能力与View旧数据没有合并成一个状态。
+- 背景与风险：Agent 与 Subscription 必须看到同一 Operation 事实。
+- 实际前置条件：真实临时 binary、loopback Feed+embedding、SQLite、`serve` 与 MCP stdio。
+- 预期：同两条 Item、group/score/provenance/coverage；Feed 不删除同组条目；cache 跨入口复用。
+- 实际动作：CLI JSONL、REST `/v1/search`、MCP initialize/tools/call；创建 View、refresh、轮询 Run；读取 result/snapshot/items 与 JSON/RSS/Atom Feed。
+- 实际响应与观察：JSONL 顺序为 `start→execution→item×2→end`；三查询入口语义等价；Run=`partial`、attempt=1、1/1 Channel；三种 Feed 均保留 Alpha/Beta URL。最终 embedding 请求仍为 1，Feed 请求按真实执行增长。
+- 终态回读：Snapshot/items 保留相同 semantic group/score；stale/SWR 由 fixture freshness 事实触发，没有改写 semantic。
+- 清理与清理回读：fixture、serve、MCP 均退出；两个端口无 listener；临时目录不存在。
+- 证据：真实 Run `run_f6194f602e8bf0dbf240a2cc15a266d6` 与执行记录。
+- 证据边界：Feed 格式不投影 score，但没有删除 Item；MCP SDK 把请求版本协商为其支持的 `2025-11-25`，Tool/Envelope 语义正常。
+
+### TC-E07 — 全来源与既有功能矩阵 — passed
+
+- 背景与风险：Stage E 横切 Core、Store 与所有出口，不能破坏 Stage A—D。
+- 实际前置条件：全仓 fixture、公开无凭据来源、隔离 SQLite/cache。
+- 预期：每个宣称来源至少有对应能力成功与关键失败证据；条件性来源不冒充 live。
+- 实际动作与观察：
+
+  | 来源/能力 | 证据 | 终态 |
+  | --- | --- | --- |
+  | Direct Feed parser/search/latest | RSS/Atom/JSON Feed/HTML discovery 自动化；V2EX Atom 与 linux.do RSS live | live verified；limit 导致 truthful `partial/truncated` |
+  | RSSHub latest/probe/auth/fallback | access-key、redirect、cache/revision、分层 Probe fixture | fixture verified；不安装或选择公共实例 |
+  | GitHub Repository search/fetch | fixture + 匿名 live | search request `req_605fc074…` partial/first page；fetch `req_4c782a8a…` complete |
+  | Tavily search/domain/error | official request/response、credential、429/upstream/redaction fixture | fixture verified；无真实 Key |
+  | X/xurl recent search/error | 固定 argv、隔离 HOME、stdin token、timeout/exit/output fixture | fixture verified；无真实 X quota |
+  | NodeSeek Feed | `https://www.nodeseek.com/rss.xml` direct layered live Probe | DNS/TCP passed；TLS failed；HTTP/parse not_run，保持 conditional |
+  | Egress/Probe | direct/environment/http_proxy/socks5、DNS 模式、407、TLS/HTTP/parse fixture | 四模式与 fail-closed verified |
+  | Chrome Cookie Backend | framing/IPC/scope/permission/disconnect/mock consumer | backend verified；Extension/真实来源未交付 |
+  | OPML/View/Run/Feed/Dashboard | 全仓自动化 + Stage E binary E2E | verified |
+
+- 终态回读：NodeSeek Run `run_26fb6a85b65f3314a0ba4e68f9eb7d2e` 保存分层 report；公开 smoke 没有写外部状态。
+- 清理与清理回读：公开请求无外部写入；临时本地数据待最终统一清理。
+- 证据：`go test ./...`、公开 CLI 输出与来源矩阵。
+- 证据边界：fixture 不等于 live-ready；NodeSeek 的 DNS 结果不做未经证实的“污染”推断。
+
+### TC-E08 — README、Skill、示例与许可 — passed
+
+- 背景与风险：Agent 不能把 candidate、truncated 或 fixture 写成已读正文和全量事实。
+- 实际前置条件：当前 README、内嵌 Skill、隔离 Agent 仅获得 Skill 路径与运行配置。
+- 预期：Skill 使用固定入口、完整消费终态、只引用实际 URL；文档准确标注边界。
+- 实际动作：`omnihub skill` 与 `SKILL.md` byte-compare；Skill quick validator；隔离 Agent 执行真实 GitHub 搜索，首轮网络受限、第二轮只为同一 OmniHub 命令开放公开网络。
+- 实际响应与观察：首轮 Agent 返回 failed、不把空 Items 当无结果、没有换工具；第二轮只引用 OmniHub 返回的两个 GitHub URL，逐项披露 Source/Provider/metadata verification，并披露 partial、first-page、truncated 与匿名配额。
+- 终态回读：Skill 内容与 binary 内嵌版本一致；README 不宣称 Chrome Extension、Tavily/X live 或 NodeSeek ready。
+- 清理与清理回读：forward-test 没有创建外部状态。
+- 证据：`skills/omnihub/SKILL.md`、forward-test 最终回答、README 来源矩阵。
+- 证据边界：OmniHub 只能约束自己的输出与 Skill，不能审计任意 Agent 的自由文本。
+
+### TC-E09 — archive、checksum 与全新安装 — partial
+
+- 背景与风险：dirty 工作树上的交叉 build 不能证明用户能安装发布物。
+- 实际前置条件：release 脚本与 CI workflow 已实现，但 Stage E 尚未冻结 commit。
+- 预期：clean commit 构建三 archive、第三方许可、checksum；fresh 解包运行 version/schema/doctor；`go install @commit/tag`；三平台原生 CI。
+- 实际动作：`sh -n scripts/release.sh`；审查 clean-tree/tag/commit/许可/归档/checksum gate；本机 native binary version/schema/doctor。
+- 实际响应与观察：脚本语法与静态审查通过，dirty tree gate 按设计尚不允许正式执行；CI 已包含 macOS/Ubuntu/Windows test/vet/native build+smoke，但尚未 push 取得 Actions 结果。
+- 终态回读：当前没有可声明为发布候选的 `dist/`。
 - 清理与清理回读：none。
-- 证据：`TestStageDBrowserCookieAggregateAndCredentialContracts`、全量transport回归。
-- 证据边界：无真实Cookie Provider，因此不声称Browser Channel已Probe ready。
+- 证据：`.github/workflows/ci.yml`、`scripts/release.sh`。
+- 证据边界：未通过前不能发布、tag 或把交叉构建冒充实机。
 
-### TC-D07 — Native Host 安装与真实 CLI 启动链 — passed
+### TC-E10 — 最终质量闸、性能与独立 Review — partial
 
-- 背景与风险：manifest只能写executable path，Chrome不会自动补`chrome-host run`。
-- 实际前置条件：最终darwin/arm64 binary、隔离HOME/runtime、固定Extension ID和一帧hello。
-- 预期：0600 manifest、精确单origin；以Chrome argv直接启动同一binary得到ack，不落到usage。
-- 实际动作：1) 运行`chrome-host install --extension-id abc...nop`；2) stat/读取manifest；3) 用Node生成length-prefixed hello并以`chrome-extension://abc...nop/` argv启动binary；4) 解码ack并检查socket清理。
-- 实际响应与观察：install exit0；manifest path位于隔离HOME，mode600，path指向最终binary，allowed_origins只有一个精确值。直接启动exit0，ack为protocol1.0/result、相同request ID、connected true、Profile `Final CLI E2E`、`granted_origins:[]`。
-- 终态回读：进程退出后`runtime/chrome.sock`不存在；未写用户真实Chrome目录。
-- 清理与清理回读：隔离目录和frame已删除并回读不存在。
-- 证据：最终CLI stdout/manifest/frame回读，binary SHA见D08。
-- 证据边界：不证明真实Chrome/Extension握手，只证明Chrome采用的启动形态和Native协议入口。
-
-### TC-D08 — 全量回归、Schema 与发布构建 — passed
-
-- 背景与风险：Stage D横切平台、Query、Registry、Dashboard与CLI，必须在完整diff上证明没有破坏既有来源/功能。
-- 实际前置条件：最终源码指纹`3ca3b48...9decdc`、所有Stage A—D自动化与三平台target。
-- 预期：test/race/vet/diff、Schema和build全绿；没有新增test文件；三平台格式正确。
-- 实际动作：1) 以`git ls-files -co --exclude-standard -- cmd internal go.mod go.sum | sort | xargs shasum -a 256 | shasum -a 256`固定源码身份；2) `go test ./... -count=1`与`go test -race ./... -count=1`；3) Browser cancel、disabled readiness 与xurl timeout单核压力各count20；4) `go vet ./...`和`git diff --check`分别执行；5) `omnihub schema`并校验三条Browser path；6) 构建并file/hash三平台；7) 执行D05/D07真实smoke。
-- 实际响应与观察：全部最终质量闸exit0；Schema为OpenAPI3.1.0、34 paths、30 schemas。只有既有三个test文件被修改，没有新增`*_test.go`。构建结果：
-  - darwin/arm64 Mach-O，SHA-256 `13b8156c090876f9ff62da3dc6c711937ed8e0b9799f2286c9639712676e93fa`
-  - linux/amd64 static ELF，SHA-256 `eb23408eb706e317663ede4fc4d906f2733a4e371f02ccab5466d047663249a3`
-  - windows/amd64 PE32+，SHA-256 `d36c01165fe9a2de441d5b1ff5fef60422ab87653028bae6161e89f5e927dca6`
-- 终态回读：所有E2E进程停止、端口无listener；构建物和临时目录删除并逐项`test ! -e`通过。
-- 清理与清理回读：见“清理证明”。
-- 证据：最终命令终态、`internal/adapter/binding_test.go`、`internal/transport/examples_test.go`、`internal/transport/schema_test.go`。
-- 证据边界：Linux/Windows未实机运行；Chrome Extension客户端与真实来源仍明确范围外。
+- 背景与风险：必须在冻结对象上证明组合正确并接受独立证伪。
+- 实际前置条件：当前仍是 Stage E dirty diff。
+- 预期：test/race/vet/gofmt/diff/schema、p95、独立合同/安全/Ponytail/release Review 全部通过。
+- 实际动作：多轮全量普通/race/vet/gofmt/diff；100 Item p95；合同、安全与 Ponytail 冷审；修复重复校验、REST 错误路径、明文 embedding 与 CLI Probe 可见性。
+- 实际响应与观察：允许 loopback 的全量普通/race/vet 通过；p95 `1.918375ms`；当前合同冷审无 finding。安全 P2 已修并聚焦重测；Ponytail 确认 SQLite BLOB+Go cosine 是当前最小方案。
+- 终态回读：最终 Stage E `review/review.md` 尚未生成，冻结 commit 后全量闸尚未执行。
+- 清理与清理回读：没有常驻测试进程；Go cache 与当前 smoke 目录留待最终统一清理。
+- 证据：命令输出、合同/安全/Ponytail 审查反馈。
+- 证据边界：pre-freeze 绿色不能批准最终发布对象。
 
 ## 失败、未完成与重测范围
 
-- Failed：none；最终diff未观察到违反Stage D承诺的产品终态。
-- Partial：none。
+- Failed：none。NodeSeek TLS failure 是条件性来源的预期真实状态，不是 OmniHub 产品失败。
+- Partial：TC-E09、TC-E10；缺 clean commit archive/fresh install/go install、Actions 与最终 Review。
 - Blocked：none。
-- Skipped：真实Chrome Extension、用户真实Cookie、真实Cookie Provider、Windows/Linux实机、Dashboard前端属于已冻结范围外；因此不得宣称这些能力已端到端可用。
+- Skipped：真实 Tavily/X quota、Chrome Extension/真实 Cookie Provider、Windows ACL 实机；均不在当前 preview gate，不能据此宣称 live-ready。
 - Flaky / 历史红色：
-  - 沙箱内全量test曾因禁止`httptest`绑定`[::1]:0`失败；获准loopback环境的相同最终命令普通/race均通过，判定为环境限制。
-  - 独立冷审首次报两项P2：Windows ListenPipe错误误分类、Catalog/Browser父域scope漂移；均修根因并在最终diff全量重测。
-  - Browser Client 的不可取消`sync.Mutex`与disabled Channel/Template被实时Bridge错误覆盖分别在后续冷审中确认；均修到共享根因，disabled聚焦测试首次漏加`reflect` import导致编译失败，补import后同一用例连续20次通过。
-  - 最终普通全量测试首次在xurl timeout子例读取`calls.log`时失败；独立重放证明500ms共享Operation deadline可能在auth/search脚本启动前合法到期，产品已正确返回timeout，错误在测试强制假定search已启动。测试改为先观察完整search HOME/CWD事实再取消；第一次只等到search argv即取消，又真实暴露日志尚未写完，收紧同步点后正常30次、`-cpu=1` 20次及最终全量/race均通过。
-  - 首次Schema shell断言误把实际顶层key `schemas`写成`json_schema`而exit1；纠正测试harness后同一binary返回OpenAPI3.1.0/34 paths/30 schemas，非产品失败。
-  - 三平台build输出Go module stat-cache写入沙箱拒绝warning，但三个命令exit0且产物file/hash完整；未将warning冒充失败或静默隐藏。
+  - 默认 Go cache 被 sandbox 拒绝；切到具名 `/private/tmp` cache 后继续。
+  - sandbox 内 `httptest` 监听 `[::1]:0` 被拒绝；同源码在允许 loopback 环境普通/race 全绿。
+  - 第一次 GitHub fetch 使用了 Search 才有的 `limit/time_range`，strict decoder 正确以 unknown field/exit 3 拒绝；按 README FetchInput 重放 complete，属于测试输入错误。
+  - Skill forward-test 首轮因隔离 Agent 网络权限返回 `network_error`；开放的仍是同一 OmniHub 命令，第二轮成功且未换 Provider。
+  - NodeSeek 首次 Probe timeout，第二次 DNS/TCP 成功、TLS handshake failed；两次都保留为网络现实。
 
 ## 清理证明
 
-- 最终Dashboard进程已停止，`lsof`回读`127.0.0.1:18974`无listener。
-- `/private/tmp/omnihub-stage-d-e2e.wMMRPo`与`/private/tmp/omnihub-stage-d-final.rzRwPu`（含SQLite、manifest、frame状态和三个临时跨平台binary）已显式删除；逐项`test ! -e`为exit0。
-- 没有安装到用户Chrome、读取真实Cookie、修改系统代理或创建外部资源；临时manifest和SQLite随隔离目录删除，不能恢复也不需要保留。
+- Stage E 公共出口 fixture、MCP、serve 进程均退出；端口无 listener；其临时目录已删除。
+- 当前仍保留 `/private/tmp/omnihub-stage-e-gocache`、`/private/tmp/omnihub-stage-e-bin`、`/private/tmp/omnihub-stage-e-smoke` 与 forward-test symlink，供冻结前重放；最终交付前必须精确删除并回读。
+- 未读取或写入真实 Credential、Chrome Cookie、外部账号或第三方资源。
 
 ## 证据与重放入口
 
 - TestPlan：`test/test-plan.md`
-- Native Host/IPC/installer：`internal/browser/`、`internal/adapter/binding_test.go`
-- Query/Credential/readiness：`internal/query/executor.go`、`internal/transport/examples_test.go`
-- Dashboard/OpenAPI/CORS：`internal/transport/dashboard.go`、`internal/transport/schema_test.go`
-- 公共合同：`shape/contract.md`、`shape/requirements.md`
-- 构建与真实E2E：本报告D05/D07/D08的固定输入、响应、hash与清理回读。
+- Stage E 自动化：`internal/transport/examples_test.go`、`internal/transport/schema_test.go`、`internal/store/sqlite/store_test.go`、`internal/core/model_test.go`
+- 实现：`internal/semantic/service.go`、`internal/query/executor.go`、`internal/store/sqlite/store.go`
+- 发布：`.github/workflows/ci.yml`、`scripts/release.sh`
+- 文档与 Agent：`README.md`、`skills/omnihub/SKILL.md`
 
 ## 当前环境交接
 
-- 仍在运行或保留的临时状态：none；所有E2E进程、manifest、SQLite、socket、frame和构建物已清理。
-- 剩余风险：Windows SID ACL/HKCU安装没有实机证据；Extension客户端缺席，因此Browser Cookie必须继续标为“backend contract verified / companion required”，不报告任何来源ready。
-- 下一位与下一步：最终独立Review已`approve`；提交并push Stage D后从`plan.md`进入Stage E。
+- 仍在运行或保留的临时状态：没有进程；只保留上列具名临时文件/目录。
+- 剩余风险：三平台 native CI、archive/fresh-install、go install 和最终独立 Review 尚未形成。
+- 下一位与下一步：冻结 Stage E commit 并 push；在该 commit 上完成 TC-E09/E10，随后更新本报告为最终裁决。

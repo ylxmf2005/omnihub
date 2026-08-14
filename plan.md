@@ -1,6 +1,6 @@
 # OmniHub Implementation Plan
 
-状态：`Stage D completed；下一入口 Stage E`
+状态：`Stage E implementation completed；release validation executing`
 
 已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
@@ -126,6 +126,8 @@
 - 发布 OPML/Bundle、Egress、RSSHub、GitHub、Tavily、xurl、Chrome Host、SemanticProfile 示例；补扩展指南、SQLite/未来 MySQL 不变量、安装/卸载和 readiness 说明。
 - 生成 macOS/Linux/Windows 单二进制、archives 与 checksums；在全新目录重放 doctor 和来源×功能矩阵，完成独立 Review 与发布说明。
 - 首发按 `0.1.x` preview 准备并支持 `go install`；包管理器、平台签名与任意 Agent 最终文本审计不进入 v1，引用保证止于 OmniHub Item/Observation 与 Skill 约束。`serve` 保持前台 loopback 进程，普通卸载保留用户数据。
+
+当前证据：SemanticProfile/SQLite v4 cache/OpenAI-compatible wire/exact cosine、CLI/REST/MCP/JSONL/View/Feed、版本/Skill/Chrome uninstall 与 release/CI 入口已实现；全量普通/race/vet、真实 binary 公共出口 E2E、V2EX/linux.do/GitHub live smoke、NodeSeek layered conditional Probe、Skill forward-test 与 100 Item p95 已通过。剩余 gate 为 clean commit archive/fresh install、`go install`、三平台 Actions 与最终独立 Review。
 
 完成证据：全来源/功能测试矩阵通过；test/race/vet/schema/OpenAPI/MCP/Skill/Feed/Chrome/Egress/semantic E2E 与三平台构建通过；README 不把 Feed window/Tavily/conditional Source 写成平台全量搜索或 runtime ready。
 

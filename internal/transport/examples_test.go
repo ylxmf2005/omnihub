@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -16,8 +17,11 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -31,6 +35,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/router"
+	"github.com/ylxmf2005/omnihub/internal/semantic"
 	sqlitestore "github.com/ylxmf2005/omnihub/internal/store/sqlite"
 	"github.com/ylxmf2005/omnihub/internal/subscription"
 )
@@ -171,7 +176,7 @@ func TestContractEnvelopeSelectionCanBeProducedByRouter(t *testing.T) {
 	for _, profile := range egressByID {
 		egressProfiles = append(egressProfiles, profile)
 	}
-	catalog, err := registry.NewCatalog(sources, providers, templates, channels, nil, egressProfiles, credentials, nil, nil)
+	catalog, err := registry.NewCatalog(sources, providers, templates, channels, nil, egressProfiles, credentials, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,10 +222,10 @@ func TestStage1RegistryContracts(t *testing.T) {
 		{ID: "a", Source: "source", RouteTemplateID: "template", FallbackChannelIDs: []string{"b"}, Enabled: true},
 		{ID: "b", Source: "source", RouteTemplateID: "template", FallbackChannelIDs: []string{"a"}, Enabled: true},
 	}
-	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{cycleTemplate}, cycle, nil, nil, nil, nil, nil); !errors.Is(err, registry.ErrInvalidCatalog) {
+	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{cycleTemplate}, cycle, nil, nil, nil, nil, nil, nil); !errors.Is(err, registry.ErrInvalidCatalog) {
 		t.Fatalf("NewCatalog(fallback cycle) error = %v", err)
 	}
-	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, nil, []core.Channel{{ID: "dangling", Source: "source", RouteTemplateID: "removed", Enabled: true}}, nil, nil, nil, nil, []core.TemplateOverlay{{RouteTemplateID: "removed", Enabled: false, Revision: 1}}); err != nil {
+	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, nil, []core.Channel{{ID: "dangling", Source: "source", RouteTemplateID: "removed", Enabled: true}}, nil, nil, nil, nil, nil, []core.TemplateOverlay{{RouteTemplateID: "removed", Enabled: false, Revision: 1}}); err != nil {
 		t.Fatalf("NewCatalog() rejected upgrade-preserved dangling references: %v", err)
 	}
 
@@ -289,7 +294,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 			{ID: "highest", Source: "source", RouteTemplateID: "api-template", EgressProfileID: "egress-direct", CredentialID: "credential", Priority: math.MaxInt, FallbackChannelIDs: []string{"lowest"}, Enabled: true},
 		}, nil,
 		[]core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}},
-		[]core.Credential{{ID: "credential", Provider: "api", AuthKind: "token", Value: &secret, Enabled: true}}, nil, nil,
+		[]core.Credential{{ID: "credential", Provider: "api", AuthKind: "token", Value: &secret, Enabled: true}}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +350,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 		[]core.Source{{ID: "source", Origin: "imported", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
 		[]core.RouteTemplate{cookieTemplate}, []core.Channel{{ID: "cookie", Source: "source", RouteTemplateID: "cookie-template", EgressProfileID: "egress-direct", CredentialID: "cookie-credential", Enabled: true}},
 		nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}},
-		[]core.Credential{{ID: "cookie-credential", Provider: "provider", AuthKind: "chrome_cookie", Enabled: true}}, nil, nil,
+		[]core.Credential{{ID: "cookie-credential", Provider: "provider", AuthKind: "chrome_cookie", Enabled: true}}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +393,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 			_, err := registry.NewCatalog(
 				[]core.Source{{ID: "source", Enabled: true}},
 				[]core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
-				[]core.RouteTemplate{template}, nil, nil, nil, nil, nil, nil,
+				[]core.RouteTemplate{template}, nil, nil, nil, nil, nil,
+				nil, nil,
 			)
 			if !errors.Is(err, registry.ErrInvalidCatalog) {
 				t.Fatalf("NewCatalog(invalid browser descriptor) error = %v", err)
@@ -397,7 +405,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	endpointTemplate := core.RouteTemplate{RouteTemplateID: "endpoint-required", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "provider", Capabilities: []string{"latest"}, EndpointRequired: true}
 	endpointCatalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
-		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{ID: "endpointless", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID, Enabled: true}}, nil, nil, nil, nil, nil,
+		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{ID: "endpointless", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID, Enabled: true}}, nil, nil, nil, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -424,7 +433,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 			{ID: "disabled", Provider: "provider", AuthKind: "api_key", Enabled: false},
 			{ID: "empty", Provider: "provider", AuthKind: "api_key", Enabled: true},
 			{ID: "blank", Provider: "provider", AuthKind: "api_key", Value: &blankCredentialValue, Enabled: true},
-		}, nil, nil,
+		}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -471,7 +481,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 			{ID: "proxy-format", Provider: "egress", AuthKind: "basic", Value: &proxyInvalid, Enabled: true},
 			{ID: "proxy-kind", Provider: "egress", AuthKind: "token", Value: &proxyValid, Enabled: true},
 			{ID: "proxy-provider", Provider: "proxy", AuthKind: "basic", Value: &proxyValid, Enabled: true},
-		}, nil, nil,
+		}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -528,7 +539,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 		[]core.EgressProfile{
 			{ID: "channel-egress", Mode: core.EgressModeDirect, Enabled: true},
 			{ID: "endpoint-egress", Mode: core.EgressModeDirect, Enabled: true},
-		}, nil, nil, nil,
+		}, nil, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -547,7 +559,8 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 		[]core.RouteTemplate{optionalAuthTemplate}, []core.Channel{
 			{ID: "primary", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", FallbackChannelIDs: []string{"unconfigured-fallback"}, Priority: 100, Enabled: true},
 			{ID: "unconfigured-fallback", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, Priority: 50, Enabled: true},
-		}, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil, nil,
+		}, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -796,7 +809,8 @@ func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog
 			RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
 			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search", "latest"},
 		}},
-		channels, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil, nil,
+		channels, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -848,7 +862,8 @@ func stageDBrowserCatalog(t *testing.T, trusted bool) *registry.Catalog {
 			ID: "browser-channel", Source: "browser-source", RouteTemplateID: "browser-cookie", EgressProfileID: "direct",
 			CredentialID: "browser-credential", Priority: 100, Enabled: true,
 		}}, nil, []core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
-		[]core.Credential{{ID: "browser-credential", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true}}, nil, overlays,
+		[]core.Credential{{ID: "browser-credential", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true}}, nil,
+		nil, overlays,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -902,7 +917,8 @@ func stageBQueryCatalog(t *testing.T) *registry.Catalog {
 			{ID: "github-credential", Provider: "github-api", AuthKind: "token", Value: &githubToken, Enabled: true},
 			{ID: "tavily-credential", Provider: "tavily", AuthKind: "api_key", Value: &tavilyKey, Enabled: true},
 			{ID: "xurl-credential", Provider: "xurl", AuthKind: "app_only", Value: &xToken, Enabled: true},
-		}, nil, nil,
+		}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1010,7 +1026,8 @@ func TestStageBDoctorReportsBuiltinProviderDependencies(t *testing.T) {
 			{ID: "github-token", Provider: "github-api", AuthKind: "token", Value: &githubToken, Enabled: true},
 			{ID: "tavily-key", Provider: "tavily", AuthKind: "api_key", Value: &tavilyKey, Enabled: true},
 			{ID: "xurl-token", Provider: "xurl", AuthKind: "app_only", Value: &xToken, Enabled: true},
-		}, nil, nil,
+		}, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1248,6 +1265,7 @@ func TestStageDBrowserCookieAggregateAndCredentialContracts(t *testing.T) {
 			{ID: "feed-channel", Source: "feed-source", RouteTemplateID: "feed", EgressProfileID: "direct", Priority: 90, Enabled: true},
 		}, nil, []core.EgressProfile{{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}},
 		[]core.Credential{{ID: "browser-credential", Provider: "browser-fixture", AuthKind: "chrome_cookie", Enabled: true}}, nil,
+		nil,
 		[]core.TemplateOverlay{{RouteTemplateID: "browser-cookie", Enabled: true, Trusted: true, Revision: 1}},
 	)
 	if err != nil {
@@ -1717,7 +1735,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 			[]core.RouteTemplate{{
 				RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
 				Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"latest"},
-			}}, []core.Channel{{ID: "legacy", Source: "source", RouteTemplateID: "fixture-feed-window", Enabled: true}}, nil, nil, nil, nil, nil,
+			}}, []core.Channel{{ID: "legacy", Source: "source", RouteTemplateID: "fixture-feed-window", Enabled: true}}, nil, nil, nil, nil,
+			nil, nil,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1743,7 +1762,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 				ID: "egress-proxy", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-basic", Enabled: true,
 			}}, []core.Credential{{
 				ID: "proxy-basic", Provider: "egress", AuthKind: "basic", Value: &secret, Enabled: true,
-			}}, nil, nil,
+			}}, nil,
+			nil, nil,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -2075,7 +2095,8 @@ func TestStage3RSSHubQueryAndFallbackContracts(t *testing.T) {
 		[]core.EgressProfile{
 			{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true},
 			{ID: "egress-environment", Mode: core.EgressModeEnvironment, Enabled: true},
-		}, nil, nil, nil,
+		}, nil, nil,
+		nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3363,4 +3384,436 @@ func TestStageCDashboardSubscriptionAndHealthContracts(t *testing.T) {
 	if err != nil || len(filtered.Envelope.Items) != 1 || filtered.Envelope.Items[0].Identity.ClusterID != identity || len(filtered.Envelope.Items[0].Observations) != 1 || filtered.Envelope.Items[0].Observations[0].ChannelID != secondary.ID {
 		t.Fatalf("tombstone filtered Snapshot = %#v, %v", filtered, err)
 	}
+}
+
+func stageESemanticProfile() core.SemanticProfile {
+	return core.SemanticProfile{
+		ID: "semantic-fixture", EndpointProfileID: "embedding-endpoint", Model: "fixture-embedding",
+		Dimension: 2, Threshold: 1, IndexRevision: 1, Enabled: true, Revision: 1,
+	}
+}
+
+func stageESemanticCatalog(t *testing.T, baseURL string, profile core.SemanticProfile) *registry.Catalog {
+	t.Helper()
+	catalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "semantic-source", Enabled: true}},
+		[]core.Provider{
+			{ID: "fixture-feed", Capabilities: []string{"search"}, Enabled: true},
+			{ID: "embedding", Capabilities: []string{"embedding"}, Enabled: true},
+		},
+		[]core.RouteTemplate{{
+			RouteTemplateID: "semantic-feed", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"semantic-source"}},
+			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search"},
+		}},
+		[]core.Channel{{
+			ID: "semantic-channel", Source: "semantic-source", RouteTemplateID: "semantic-feed",
+			EgressProfileID: "semantic-direct", Priority: 100, Enabled: true,
+		}},
+		[]core.EndpointProfile{{
+			ID: "embedding-endpoint", Provider: "embedding", BaseURL: baseURL,
+			EgressProfileID: "semantic-direct", Enabled: true, Revision: 1,
+		}},
+		[]core.EgressProfile{{ID: "semantic-direct", Mode: core.EgressModeDirect, Enabled: true, Revision: 1}},
+		nil, []core.SemanticProfile{profile}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func stageESearchInput(profileID string) core.SearchInput {
+	return core.SearchInput{
+		SchemaVersion: core.SchemaVersion, Query: "body", Scope: core.Scope{Channels: []string{"semantic-channel"}},
+		RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto}, Limit: 10, IdentityDedupe: core.IdentityExact,
+		SimilarityGrouping: core.SimilaritySemantic, SemanticProfileID: &profileID, DeadlineMS: 30_000,
+	}
+}
+
+func stageESemanticItem(id, title string, summary *string, body string, rank int) core.Item {
+	itemURL := "https://example.com/semantic/" + id
+	return core.Item{
+		URL: itemURL, Title: title, Summary: summary,
+		Content: core.Content{Role: core.ContentSnippet, Text: &body, SourceSupplied: true},
+		Observations: []core.Observation{{
+			OriginalURL: itemURL, CanonicalURL: itemURL, Rank: &rank, Verification: core.VerificationMetadata,
+		}},
+	}
+}
+
+func stageEExecute(t *testing.T, store *sqlitestore.Store, catalog *registry.Catalog, input core.SearchInput, items []core.Item) core.Envelope {
+	t.Helper()
+	fixed := time.Date(2026, 8, 15, 16, 0, 0, 0, time.UTC)
+	feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+		"semantic-channel": successfulFeedResult(items...),
+	}}
+	envelope, err := (queryservice.Service{
+		Feed: feed, Semantic: semantic.Service{Store: store, Now: func() time.Time { return fixed }},
+		Now: func() time.Time { return fixed },
+	}).Execute(context.Background(), catalog, input.OperationRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func stageEStore(t *testing.T) *sqlitestore.Store {
+	t.Helper()
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "semantic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// TestStageESemanticGroupingContracts 从真实 Query 入口贯穿可信 direct Egress、
+// OpenAI-compatible HTTP、SQLite cache、leader grouping 与公共出口投影。
+func TestStageESemanticGroupingContracts(t *testing.T) {
+	t.Run("cleartext embedding is direct loopback only", func(t *testing.T) {
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		catalog := stageESemanticCatalog(t, "http://192.0.2.1:8080", profile)
+		err := (semantic.Service{Store: store}).Preflight(catalog, stageESearchInput(profile.ID).OperationRequest())
+		if !errors.Is(err, semantic.ErrUnavailable) {
+			t.Fatalf("remote HTTP embedding Preflight() error = %v, want ErrUnavailable", err)
+		}
+	})
+
+	t.Run("recipe cache cohort deterministic grouping and projections", func(t *testing.T) {
+		var requests atomic.Int64
+		var captureMu sync.Mutex
+		var captured struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			requests.Add(1)
+			var payload struct {
+				Model string   `json:"model"`
+				Input []string `json:"input"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode embedding request: %v", err)
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			captureMu.Lock()
+			captured = payload
+			captureMu.Unlock()
+			data := make([]map[string]any, len(payload.Input))
+			for index := range payload.Input {
+				data[index] = map[string]any{"index": index, "embedding": []float64{1, 0}}
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": data, "model": payload.Model})
+		}))
+		defer server.Close()
+
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		catalog := stageESemanticCatalog(t, server.URL, profile)
+		input := stageESearchInput(profile.ID)
+		summary := "summary\rbody"
+		emptySummary := ""
+		fallbackBody := "must-not-be-sent"
+		longTitle := strings.Repeat("界", 3000)
+		items := []core.Item{
+			stageESemanticItem("a", "  Alpha\r\nTitle  ", &summary, "unused body", 1),
+			stageESemanticItem("b", longTitle, nil, "tail body", 2),
+			stageESemanticItem("c", "Explicit", &emptySummary, fallbackBody+" body", 3),
+		}
+		first := stageEExecute(t, store, catalog, input, items)
+		second := stageEExecute(t, store, catalog, input, items)
+		if requests.Load() != 1 {
+			t.Fatalf("embedding requests after cache hit = %d, want 1", requests.Load())
+		}
+		if first.Status != core.StatusComplete || len(first.Items) != len(items) || len(second.Items) != len(items) {
+			t.Fatalf("semantic Envelopes = %#v / %#v", first, second)
+		}
+		for index := range first.Items {
+			if first.Items[index].Similarity.GroupID == nil || first.Items[index].Similarity.Score == nil || *first.Items[index].Similarity.Score != 1 || first.Items[index].Similarity.Strategy != "semantic:"+profile.ID+":"+profile.Model {
+				t.Fatalf("item %d similarity = %#v", index, first.Items[index].Similarity)
+			}
+			if !reflect.DeepEqual(first.Items[index].Similarity, second.Items[index].Similarity) {
+				t.Fatalf("item %d grouping changed across cache hit: %#v / %#v", index, first.Items[index].Similarity, second.Items[index].Similarity)
+			}
+		}
+		if *first.Items[0].Similarity.GroupID != *first.Items[1].Similarity.GroupID || *first.Items[0].Similarity.GroupID != *first.Items[2].Similarity.GroupID {
+			t.Fatalf("threshold=1 boundary did not group equal vectors: %#v", first.Items)
+		}
+
+		captureMu.Lock()
+		requestPayload := captured
+		captureMu.Unlock()
+		if requestPayload.Model != profile.Model || len(requestPayload.Input) != 3 || requestPayload.Input[0] != "Alpha\nTitle\n\nsummary\nbody" || requestPayload.Input[2] != "Explicit\n\n" {
+			t.Fatalf("embedding recipe payload = %#v", requestPayload)
+		}
+		if len(requestPayload.Input[1]) > 8192 || !utf8.ValidString(requestPayload.Input[1]) || strings.Contains(strings.Join(requestPayload.Input, "\n"), fallbackBody) {
+			t.Fatalf("embedding truncation/fallback payload = %#v", requestPayload.Input)
+		}
+
+		// Profile revision 与 threshold 只改变 grouping，不能浪费同 cohort cache。
+		profile.Revision++
+		profile.Threshold = 0.9
+		third := stageEExecute(t, store, stageESemanticCatalog(t, server.URL, profile), input, items)
+		if requests.Load() != 1 || len(third.Items) != len(items) || *third.Items[0].Similarity.GroupID != *first.Items[0].Similarity.GroupID {
+			t.Fatalf("profile-only revision missed cache: requests=%d Envelope=%#v", requests.Load(), third)
+		}
+		// 输入配方/index revision 属于 cache cohort，必须触发一次新 batch。
+		profile.Revision++
+		profile.IndexRevision++
+		fourth := stageEExecute(t, store, stageESemanticCatalog(t, server.URL, profile), input, items)
+		if requests.Load() != 2 || *fourth.Items[0].Similarity.GroupID == *first.Items[0].Similarity.GroupID {
+			t.Fatalf("index revision did not isolate cache/group: requests=%d Envelope=%#v", requests.Load(), fourth)
+		}
+
+		// REST、MCP 与 JSONL 只投影同一 Envelope，不能丢 semantic score/group。
+		execute := ExecuteFunc(func(context.Context, core.Operation) (core.Envelope, error) { return first, nil })
+		handler, err := NewHTTPHandler(execute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(input)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, operationHTTPRequest(http.MethodPost, "/v1/search", body))
+		var httpEnvelope core.Envelope
+		if recorder.Code != http.StatusOK || json.Unmarshal(recorder.Body.Bytes(), &httpEnvelope) != nil {
+			t.Fatalf("semantic REST response = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		assertJSONEquivalent(t, httpEnvelope, first)
+		mcpResult := callMCPQuery(t, execute, input)
+		structured, err := json.Marshal(mcpResult.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var mcpEnvelope core.Envelope
+		if err := json.Unmarshal(structured, &mcpEnvelope); err != nil {
+			t.Fatal(err)
+		}
+		assertJSONEquivalent(t, mcpEnvelope, first)
+		var jsonl bytes.Buffer
+		if err := WriteJSONL(&jsonl, first); err != nil {
+			t.Fatal(err)
+		}
+		jsonlEnvelope, _ := decodeJSONLEnvelope(t, jsonl.Bytes())
+		assertJSONEquivalent(t, jsonlEnvelope, first)
+	})
+
+	t.Run("leader grouping chooses best and earliest representative", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			var payload struct {
+				Input []string `json:"input"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&payload)
+			vectors := [][]float64{{1, 0}, {0, 1}, {1, 1}, {0.1, 1}}
+			data := make([]map[string]any, len(payload.Input))
+			for index := range payload.Input {
+				data[index] = map[string]any{"index": index, "embedding": vectors[index]}
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": data})
+		}))
+		defer server.Close()
+
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		profile.Threshold = 0.7
+		items := []core.Item{
+			stageESemanticItem("leader-a", "Leader A", nil, "body", 1),
+			stageESemanticItem("leader-b", "Leader B", nil, "body", 2),
+			stageESemanticItem("tie", "Tie", nil, "body", 3),
+			stageESemanticItem("best-b", "Best B", nil, "body", 4),
+		}
+		envelope := stageEExecute(t, store, stageESemanticCatalog(t, server.URL, profile), stageESearchInput(profile.ID), items)
+		if len(envelope.Items) != 4 {
+			t.Fatalf("leader grouping dropped items: %#v", envelope.Items)
+		}
+		groups := make([]string, len(envelope.Items))
+		for index := range envelope.Items {
+			if envelope.Items[index].Similarity.GroupID == nil {
+				t.Fatalf("item %d has no semantic group", index)
+			}
+			groups[index] = *envelope.Items[index].Similarity.GroupID
+		}
+		if groups[0] == groups[1] || groups[2] != groups[0] || groups[3] != groups[1] {
+			t.Fatalf("leader groups = %v, want A/B separate, tie->A, best->B", groups)
+		}
+	})
+
+	t.Run("max result window remains exact without a vector index", func(t *testing.T) {
+		var requests atomic.Int64
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			requests.Add(1)
+			var payload struct {
+				Input []string `json:"input"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&payload)
+			data := make([]map[string]any, len(payload.Input))
+			for index := range payload.Input {
+				angle := float64(index) * 0.05
+				data[index] = map[string]any{"index": index, "embedding": []float64{math.Cos(angle), math.Sin(angle)}}
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": data})
+		}))
+		defer server.Close()
+
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		profile.Threshold = 0.9999
+		catalog := stageESemanticCatalog(t, server.URL, profile)
+		input := stageESearchInput(profile.ID)
+		input.Limit = 100
+		items := make([]core.Item, input.Limit)
+		for index := range items {
+			items[index] = stageESemanticItem(fmt.Sprintf("max-%03d", index), fmt.Sprintf("Max %03d", index), nil, "body", index+1)
+		}
+		warm := stageEExecute(t, store, catalog, input, items)
+		groups := make(map[string]bool, len(warm.Items))
+		for _, item := range warm.Items {
+			if item.Similarity.GroupID == nil {
+				t.Fatalf("max-window item has no semantic group: %#v", item.Similarity)
+			}
+			groups[*item.Similarity.GroupID] = true
+		}
+		if len(warm.Items) != input.Limit || len(groups) != input.Limit || requests.Load() != 1 {
+			t.Fatalf("max-window warm result: items=%d groups=%d requests=%d", len(warm.Items), len(groups), requests.Load())
+		}
+
+		// 只记录当前 MVP 上限的实测 p95，不把共享 CI 的瞬时性能写成
+		// 脆弱断言；规模或延迟达到文档阈值时再评估 sqlite-vec。
+		durations := make([]time.Duration, 30)
+		for index := range durations {
+			started := time.Now()
+			envelope := stageEExecute(t, store, catalog, input, items)
+			durations[index] = time.Since(started)
+			if len(envelope.Items) != input.Limit {
+				t.Fatalf("max-window cache run %d returned %d items", index, len(envelope.Items))
+			}
+		}
+		slices.Sort(durations)
+		p95 := durations[(len(durations)*95-1)/100]
+		if requests.Load() != 1 {
+			t.Fatalf("max-window cache issued %d embedding requests, want 1", requests.Load())
+		}
+		t.Logf("100-item cached exact grouping p95=%s", p95)
+	})
+
+	t.Run("provider failure keeps cached grouping and every item", func(t *testing.T) {
+		var requests atomic.Int64
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			requests.Add(1)
+			var payload struct {
+				Input []string `json:"input"`
+			}
+			_ = json.NewDecoder(request.Body).Decode(&payload)
+			if len(payload.Input) == 1 && strings.HasPrefix(payload.Input[0], "Miss") {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []map[string]any{{"index": 0, "embedding": []float64{1, 0}}}})
+		}))
+		defer server.Close()
+
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		catalog := stageESemanticCatalog(t, server.URL, profile)
+		input := stageESearchInput(profile.ID)
+		cached := stageESemanticItem("cached", "Cached", nil, "cached body", 1)
+		_ = stageEExecute(t, store, catalog, input, []core.Item{cached})
+		miss := stageESemanticItem("miss", "Miss", nil, "private miss body", 2)
+		envelope := stageEExecute(t, store, catalog, input, []core.Item{cached, miss})
+		if requests.Load() != 2 || envelope.Status != core.StatusPartial || len(envelope.Items) != 2 || len(envelope.Errors) != 1 {
+			t.Fatalf("partial semantic Envelope = %#v requests=%d", envelope, requests.Load())
+		}
+		if envelope.Items[0].Similarity.Strategy != "semantic:"+profile.ID+":"+profile.Model || envelope.Items[1].Similarity.Strategy != string(core.SimilarityOff) {
+			t.Fatalf("cache hit/miss similarities = %#v / %#v", envelope.Items[0].Similarity, envelope.Items[1].Similarity)
+		}
+		problem := envelope.Errors[0]
+		if problem.Code != core.ErrorSimilarityUnavailable || problem.Details["failed_items"] != 1 || problem.Details["proxied"] != false {
+			t.Fatalf("similarity problem = %#v", problem)
+		}
+		encoded, _ := json.Marshal(problem)
+		if bytes.Contains(encoded, []byte(server.URL)) || bytes.Contains(encoded, []byte("private miss body")) {
+			t.Fatalf("similarity problem leaked endpoint/input: %s", encoded)
+		}
+	})
+
+	t.Run("empty input and invalid provider responses fail closed", func(t *testing.T) {
+		t.Run("empty input", func(t *testing.T) {
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+			defer server.Close()
+			store := stageEStore(t)
+			profile := stageESemanticProfile()
+			catalog := stageESemanticCatalog(t, server.URL, profile)
+			operation := stageESearchInput(profile.ID).OperationRequest()
+			grouper := semantic.Service{Store: store}
+			if err := grouper.Preflight(catalog, operation); err != nil {
+				t.Fatal(err)
+			}
+			items, problem := grouper.Group(context.Background(), catalog, operation, []core.Item{{Similarity: core.Similarity{Strategy: string(core.SimilarityOff)}}})
+			if requests.Load() != 0 || len(items) != 1 || problem == nil || problem.Code != core.ErrorSimilarityUnavailable || items[0].Similarity.Strategy != string(core.SimilarityOff) {
+				t.Fatalf("empty input grouping = %#v problem=%#v requests=%d", items, problem, requests.Load())
+			}
+		})
+
+		cases := []struct {
+			name  string
+			body  string
+			items int
+		}{
+			{name: "count", body: `{"data":[]}`, items: 1},
+			{name: "dimension", body: `{"data":[{"index":0,"embedding":[1]}]}`, items: 1},
+			{name: "nan", body: `{"data":[{"index":0,"embedding":[NaN,0]}]}`, items: 1},
+			{name: "infinity", body: `{"data":[{"index":0,"embedding":[1e400,0]}]}`, items: 1},
+			{name: "zero norm", body: `{"data":[{"index":0,"embedding":[0,0]}]}`, items: 1},
+			{name: "missing index", body: `{"data":[{"embedding":[1,0]}]}`, items: 1},
+			{name: "duplicate index", body: `{"data":[{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`, items: 2},
+			{name: "extra JSON", body: `{"data":[{"index":0,"embedding":[1,0]}]} {}`, items: 1},
+		}
+		for _, test := range cases {
+			t.Run(test.name, func(t *testing.T) {
+				var requests atomic.Int64
+				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+					requests.Add(1)
+					_, _ = writer.Write([]byte(test.body))
+				}))
+				defer server.Close()
+				store := stageEStore(t)
+				profile := stageESemanticProfile()
+				items := make([]core.Item, test.items)
+				for index := range items {
+					items[index] = stageESemanticItem(fmt.Sprintf("invalid-%d", index), fmt.Sprintf("Invalid %d", index), nil, "body", index+1)
+				}
+				catalog := stageESemanticCatalog(t, server.URL, profile)
+				input := stageESearchInput(profile.ID)
+				envelope := stageEExecute(t, store, catalog, input, items)
+				if envelope.Status != core.StatusPartial || len(envelope.Items) != len(items) || len(envelope.Errors) != 1 {
+					t.Fatalf("invalid response Envelope = %#v", envelope)
+				}
+				for _, item := range envelope.Items {
+					if item.Similarity.Strategy != string(core.SimilarityOff) {
+						t.Fatalf("invalid response grouped item: %#v", item.Similarity)
+					}
+				}
+				_ = stageEExecute(t, store, catalog, input, items)
+				if requests.Load() != 2 {
+					t.Fatalf("invalid response was cached: requests=%d, want 2", requests.Load())
+				}
+			})
+		}
+	})
+
+	t.Run("preflight stops content upstream", func(t *testing.T) {
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		profile.Enabled = false
+		catalog := stageESemanticCatalog(t, "http://127.0.0.1:1", profile)
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"semantic-channel": successfulFeedResult(stageESemanticItem("never", "Never", nil, "body", 1)),
+		}}
+		_, err := (queryservice.Service{Feed: feed, Semantic: semantic.Service{Store: store}}).Execute(context.Background(), catalog, stageESearchInput(profile.ID).OperationRequest())
+		if !errors.Is(err, semantic.ErrUnavailable) || len(feed.calls) != 0 {
+			t.Fatalf("semantic preflight error/calls = %v / %v", err, feed.calls)
+		}
+	})
 }

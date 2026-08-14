@@ -60,6 +60,23 @@ GitHub fetch 示例：
 }
 ```
 
+需要语义分组时显式引用已启用的 SemanticProfile；该功能只分组，不删除、折叠或重排 Item：
+
+```json
+{
+  "schema_version": "1.0",
+  "query": "local-first agent search",
+  "scope": {"sources": ["github"]},
+  "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
+  "limit": 20,
+  "time_range": {},
+  "identity_dedupe": "exact",
+  "similarity_grouping": "semantic",
+  "semantic_profile_id": "semantic_local",
+  "deadline_ms": 30000
+}
+```
+
 ## 解释结果
 
 1. 先读顶层 `status`：
@@ -69,7 +86,8 @@ GitHub fetch 示例：
 2. 逐项检查 `executions`，确认实际使用的 Channel、Provider、RouteTemplate、Endpoint 与 Egress。
 3. 读取每条 `coverage` 的 `scope`、`truncated` 与 `limitations`。Feed window、GitHub 首页、X recent window 和 Tavily candidate 都不是全量搜索。
 4. 读取 `errors`；遇到配置、凭据或依赖问题时运行 doctor，不自行切换未知代理、公共实例或第三方 Provider。
-5. JSONL 必须消费到 `type=end`；只看中间 Item 会遗漏最终 coverage、error 与 status。
+5. semantic 请求仍处理返回的全部 Item，不得只保留组代表；逐项报告 `item.similarity.group_id`、`score`、`strategy` 与 provenance。出现 `similarity_unavailable` 时保留并引用未分组 Item，同时披露顶层 `partial`；不得把分组失败解释成检索失败或删除 Item。
+6. JSONL 必须消费到 `type=end`；只看中间 Item 会遗漏最终 coverage、error 与 status。
 
 ## 引用规则
 
@@ -78,6 +96,6 @@ GitHub fetch 示例：
 - 优先使用 canonical URL，并保留与该 Item 对应的 Source/Provider；不得根据标题拼接或补写链接。
 - `verification=candidate` 只证明搜索 Provider 返回了候选摘要，不代表已读取或验证正文。
 - `content.role=snippet|summary` 不得改写成“原文明确表示”；只有 `body` 才是上游提供的对象正文。
-- 最终答复列出实际引用，并简短披露影响结论的 partial、truncated 与主要 limitation。
+- 最终答复列出全部采用的 Item 及其实际引用和 provenance，并简短披露影响结论的 partial、truncated、semantic group/score 与主要 limitation。
 
 OmniHub 保证其输出中的来源链路可检查；它不审计 Agent 在最终自然语言中另行生成的链接。

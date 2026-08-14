@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,36 @@ func TestOperationValidation(t *testing.T) {
 			value.RoutePolicy.Only = []RouteSelector{{Kind: SelectorProvider, ID: "github-api"}}
 			value.RoutePolicy.Exclude = []RouteSelector{{Kind: SelectorChannel, ID: "github-legacy"}}
 		})},
+		{name: "semantic search", operation: replace(base, func(value *Operation) {
+			profileID := "semantic_local"
+			value.SimilarityGrouping = SimilaritySemantic
+			value.SemanticProfileID = &profileID
+		})},
+		{name: "semantic latest", operation: replace(base, func(value *Operation) {
+			profileID := "semantic_local"
+			value.Operation = OperationLatest
+			value.Query = nil
+			value.SimilarityGrouping = SimilaritySemantic
+			value.SemanticProfileID = &profileID
+		})},
+		{name: "semantic without profile", operation: replace(base, func(value *Operation) { value.SimilarityGrouping = SimilaritySemantic }), wantError: true},
+		{name: "semantic whitespace profile", operation: replace(base, func(value *Operation) {
+			profileID := " semantic_local "
+			value.SimilarityGrouping = SimilaritySemantic
+			value.SemanticProfileID = &profileID
+		}), wantError: true},
+		{name: "off with semantic profile", operation: replace(base, func(value *Operation) {
+			profileID := "semantic_local"
+			value.SemanticProfileID = &profileID
+		}), wantError: true},
+		{name: "semantic fetch", operation: replace(base, func(value *Operation) {
+			profileID := "semantic_local"
+			value.Operation = OperationFetch
+			value.Query = nil
+			value.Target = &target
+			value.SimilarityGrouping = SimilaritySemantic
+			value.SemanticProfileID = &profileID
+		}), wantError: true},
 	}
 
 	for _, test := range cases {
@@ -81,6 +112,107 @@ func TestOperationValidation(t *testing.T) {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestOperationInputsPreserveSemanticProfile(t *testing.T) {
+	profileID := "semantic_local"
+	search := SearchInput{SemanticProfileID: &profileID}.OperationRequest()
+	latest := LatestInput{SemanticProfileID: &profileID}.OperationRequest()
+	if search.SemanticProfileID == nil || *search.SemanticProfileID != profileID || latest.SemanticProfileID == nil || *latest.SemanticProfileID != profileID {
+		t.Fatalf("OperationRequest() lost semantic profile: search=%#v latest=%#v", search.SemanticProfileID, latest.SemanticProfileID)
+	}
+	if fetch := (FetchInput{}).OperationRequest(); fetch.SemanticProfileID != nil || fetch.SimilarityGrouping != SimilarityOff {
+		t.Fatalf("Fetch OperationRequest() semantic fields = %#v, %q", fetch.SemanticProfileID, fetch.SimilarityGrouping)
+	}
+}
+
+func TestEnvelopeSemanticSimilarityValidation(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 10, 0, 0, 0, time.UTC)
+	profileID, groupID, score := "semantic_local", "group_1", 0.9
+	operation := validSearchOperation()
+	operation.SimilarityGrouping = SimilaritySemantic
+	operation.SemanticProfileID = &profileID
+	item := Item{
+		ID: "item_1", URL: "https://example.com/1",
+		Observations: []Observation{{Source: "example", Provider: "fixture", ChannelID: "channel_primary", RouteTemplateID: "fixture", OriginalURL: "https://example.com/1", RetrievedAt: started, Verification: VerificationCandidate}},
+		Similarity:   Similarity{GroupID: &groupID, Strategy: "semantic:semantic_local:embedding-model", Score: &score},
+	}
+	envelope, err := BuildEnvelope(EnvelopeInput{
+		RequestID: "req_123e4567-e89b-42d3-a456-426614174000", Request: operation,
+		RequiredChannelIDs: []string{"channel_primary"},
+		Executions:         []Execution{{ChannelID: "channel_primary", Selection: SelectionPrimary, Status: ExecutionCompleted, StartedAt: started, Egress: &ExecutionEgress{ProfileID: "direct", Mode: EgressModeDirect}}},
+		Items:              []Item{item, {ID: "item_without_embedding", URL: "https://example.com/2", Observations: item.Observations, Similarity: Similarity{Strategy: string(SimilarityOff)}}},
+		StartedAt:          started, FinishedAt: started.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := envelope.Validate(); err != nil {
+		t.Fatalf("semantic Envelope.Validate() error = %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Envelope)
+	}{
+		{name: "semantic item under off operation", mutate: func(value *Envelope) { value.Request = validSearchOperation() }},
+		{name: "missing group", mutate: func(value *Envelope) { value.Items[0].Similarity.GroupID = nil }},
+		{name: "missing score", mutate: func(value *Envelope) { value.Items[0].Similarity.Score = nil }},
+		{name: "non finite score", mutate: func(value *Envelope) { invalid := math.NaN(); value.Items[0].Similarity.Score = &invalid }},
+		{name: "score outside cosine range", mutate: func(value *Envelope) { invalid := 1.01; value.Items[0].Similarity.Score = &invalid }},
+		{name: "wrong profile strategy", mutate: func(value *Envelope) { value.Items[0].Similarity.Strategy = "semantic:other:embedding-model" }},
+		{name: "off item with score", mutate: func(value *Envelope) { invalid := 0.5; value.Items[1].Similarity.Score = &invalid }},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			value := envelope
+			value.Items = append([]Item(nil), envelope.Items...)
+			test.mutate(&value)
+			if err := value.Validate(); !errors.Is(err, ErrInvalidEnvelope) {
+				t.Fatalf("Envelope.Validate() error = %v, want ErrInvalidEnvelope", err)
+			}
+		})
+	}
+}
+
+func TestSemanticProfileValidation(t *testing.T) {
+	base := SemanticProfile{ID: "semantic_local", EndpointProfileID: "embedding_local", Model: "embedding-model", Dimension: 768, Threshold: 0.88, IndexRevision: 1, Enabled: true, Revision: 1}
+	cases := []struct {
+		name      string
+		profile   SemanticProfile
+		wantError bool
+	}{
+		{name: "valid", profile: base},
+		{name: "credential", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.CredentialID = "embedding_token" })},
+		{name: "id surrounding whitespace", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.ID = " semantic_local " }), wantError: true},
+		{name: "endpoint surrounding whitespace", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.EndpointProfileID = " embedding_local " }), wantError: true},
+		{name: "credential surrounding whitespace", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.CredentialID = " embedding_token " }), wantError: true},
+		{name: "model surrounding whitespace", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Model = " model " }), wantError: true},
+		{name: "model control", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Model = "model\n" }), wantError: true},
+		{name: "model too long", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Model = strings.Repeat("m", 257) }), wantError: true},
+		{name: "dimension zero", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Dimension = 0 }), wantError: true},
+		{name: "dimension too large", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Dimension = 16385 }), wantError: true},
+		{name: "threshold zero", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Threshold = 0 }), wantError: true},
+		{name: "threshold NaN", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Threshold = math.NaN() }), wantError: true},
+		{name: "threshold infinite", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Threshold = math.Inf(1) }), wantError: true},
+		{name: "threshold too large", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Threshold = 1.01 }), wantError: true},
+		{name: "index revision zero", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.IndexRevision = 0 }), wantError: true},
+		{name: "resource revision zero", profile: replaceSemanticProfile(base, func(value *SemanticProfile) { value.Revision = 0 }), wantError: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.profile.Validate()
+			if test.wantError && !errors.Is(err, ErrInvalidRoutingCatalog) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidRoutingCatalog", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+	if !validErrorCode(ErrorSimilarityUnavailable) {
+		t.Fatal("similarity_unavailable must be a persistent Envelope error code")
 	}
 }
 
@@ -391,4 +523,9 @@ func validSearchOperation() Operation {
 func replace(operation Operation, mutate func(*Operation)) Operation {
 	mutate(&operation)
 	return operation
+}
+
+func replaceSemanticProfile(profile SemanticProfile, mutate func(*SemanticProfile)) SemanticProfile {
+	mutate(&profile)
+	return profile
 }

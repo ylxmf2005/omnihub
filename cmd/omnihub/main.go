@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -26,17 +27,24 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/router"
+	"github.com/ylxmf2005/omnihub/internal/semantic"
 	"github.com/ylxmf2005/omnihub/internal/store/sqlite"
 	"github.com/ylxmf2005/omnihub/internal/subscription"
 	"github.com/ylxmf2005/omnihub/internal/transport"
+	omnihubskill "github.com/ylxmf2005/omnihub/skills/omnihub"
 )
 
 const usage = `usage:
+  omnihub version
+  omnihub skill
   omnihub schema
   omnihub paths
   omnihub sources
   omnihub providers
   omnihub route-templates
+  omnihub semantic-profiles
+  omnihub semantic-profiles apply < semantic-profile.json
+  omnihub semantic-profiles disable ID --revision N
   omnihub egress-profiles
   omnihub egress-profiles apply < egress-profile.json
   omnihub egress-profiles disable ID --revision N
@@ -67,11 +75,16 @@ const usage = `usage:
   omnihub maintenance prune [--apply]
   omnihub chrome-host run
   omnihub chrome-host install --extension-id ID
+  omnihub chrome-host uninstall
   omnihub mcp
   omnihub serve [--listen 127.0.0.1:8787] [--dev-origin ORIGIN]
 
 plan only selects declared channels; it never executes an upstream request.
 `
+
+// releaseVersion、releaseCommit 与 releaseDate 由发布 archive 使用
+// -ldflags -X 注入；go install 则优先使用 Go build info 的真实版本事实。
+var releaseVersion, releaseCommit, releaseDate string
 
 const (
 	exitInternal  = 1
@@ -81,14 +94,15 @@ const (
 )
 
 type catalogOutput struct {
-	SchemaVersion  string                       `json:"schema_version"`
-	Sources        *[]core.Source               `json:"sources,omitempty"`
-	Providers      *[]core.Provider             `json:"providers,omitempty"`
-	RouteTemplates *[]core.RouteTemplate        `json:"route_templates,omitempty"`
-	EgressProfiles *[]core.EgressProfileSummary `json:"egress_profiles,omitempty"`
-	Endpoints      *[]core.EndpointProfile      `json:"endpoints,omitempty"`
-	Credentials    *[]core.CredentialSummary    `json:"credentials,omitempty"`
-	Channels       *[]core.Channel              `json:"channels,omitempty"`
+	SchemaVersion    string                       `json:"schema_version"`
+	Sources          *[]core.Source               `json:"sources,omitempty"`
+	Providers        *[]core.Provider             `json:"providers,omitempty"`
+	RouteTemplates   *[]core.RouteTemplate        `json:"route_templates,omitempty"`
+	EgressProfiles   *[]core.EgressProfileSummary `json:"egress_profiles,omitempty"`
+	Endpoints        *[]core.EndpointProfile      `json:"endpoints,omitempty"`
+	SemanticProfiles *[]core.SemanticProfile      `json:"semantic_profiles,omitempty"`
+	Credentials      *[]core.CredentialSummary    `json:"credentials,omitempty"`
+	Channels         *[]core.Channel              `json:"channels,omitempty"`
 }
 
 type routePlanOutput struct {
@@ -105,11 +119,25 @@ type rssHubEndpointProbeOutput struct {
 	Probe             adapter.RSSHubEndpointProbe `json:"probe"`
 }
 
+type channelProbeOutput struct {
+	SchemaVersion string                   `json:"schema_version"`
+	Run           core.Run                 `json:"run"`
+	Probe         *core.ChannelProbeRecord `json:"probe,omitempty"`
+}
+
+type versionOutput struct {
+	Version  string `json:"version"`
+	Commit   string `json:"commit"`
+	Date     string `json:"date"`
+	Modified bool   `json:"modified"`
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	transport.SetBuildVersion(buildVersion().Version)
 	// Chrome 直接启动 manifest 中的同一二进制时，会把调用方 Extension
 	// origin 作为首个参数；Native Host 不能依赖 wrapper script 才能工作。
 	if len(args) > 0 && strings.HasPrefix(args[0], "chrome-extension://") {
@@ -123,6 +151,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var value any
 	resultExitCode := 0
 	switch args[0] {
+	case "version":
+		if len(args) != 1 {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		value = buildVersion()
+
+	case "skill":
+		if len(args) != 1 {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		if _, err := io.WriteString(stdout, omnihubskill.Markdown); err != nil {
+			fmt.Fprintf(stderr, "omnihub: write skill: %v\n", err)
+			return exitInternal
+		}
+		return 0
+
 	case "schema":
 		if len(args) != 1 {
 			fmt.Fprint(stderr, usage)
@@ -188,6 +234,72 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		defer closeCatalog()
 		templates := catalog.RouteTemplates()
 		value = catalogOutput{SchemaVersion: core.SchemaVersion, RouteTemplates: &templates}
+
+	case "semantic-profiles":
+		if len(args) == 1 {
+			service, closeService, err := openReadManagementService(context.Background())
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: open semantic profile reader: %v\n", err)
+				return exitConfig
+			}
+			defer closeService()
+			profiles, listErr := service.ListSemanticProfiles(context.Background())
+			if listErr != nil {
+				fmt.Fprintf(stderr, "omnihub: list semantic profiles: %v\n", listErr)
+				return managementExitCode(listErr)
+			}
+			value = catalogOutput{SchemaVersion: core.SchemaVersion, SemanticProfiles: &profiles}
+			break
+		}
+		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		switch args[1] {
+		case "apply":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplySemanticProfileInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode semantic profile: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			profile, applyErr := service.ApplySemanticProfile(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply semantic profile: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = profile
+		case "disable":
+			if len(args) < 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			expectedRevision, parseErr := revisionFlag("semantic-profiles disable", args[3:], stderr)
+			if parseErr != nil {
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			profile, disableErr := service.DisableSemanticProfile(context.Background(), args[2], expectedRevision)
+			if disableErr != nil {
+				fmt.Fprintf(stderr, "omnihub: disable semantic profile: %v\n", disableErr)
+				return managementExitCode(disableErr)
+			}
+			value = profile
+		}
 
 	case "egress-profiles":
 		if len(args) == 1 {
@@ -677,9 +789,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "omnihub: create refresh worker identity: %v\n", err)
 			return exitInternal
 		}
-		service := subscription.Service{
-			Store: store, LoadCatalog: load, Execute: executeCatalogOperation, InstanceID: instanceID,
+		execute := func(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+			return executeCatalogOperationWithStore(ctx, catalog, store, operation)
 		}
+		service := subscription.Service{Store: store, LoadCatalog: load, Execute: execute, InstanceID: instanceID}
 		run, _, err := service.CreateViewRefreshRun(context.Background(), args[1], idempotencyKey)
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: create refresh run: %v\n", err)
@@ -732,7 +845,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		now := time.Now().UTC()
 		result, err := store.Prune(context.Background(), repository.Prune{
 			DryRun: !apply, RunFinishedBefore: now.Add(-30 * 24 * time.Hour),
-			ProbeCheckedBefore: now.Add(-30 * 24 * time.Hour),
+			ProbeCheckedBefore:    now.Add(-30 * 24 * time.Hour),
+			EmbeddingUnusedBefore: now.Add(-30 * 24 * time.Hour),
 			// Tombstone 在创建时已经固化 180 天 expires_at，清理当前已到期记录即可。
 			TombstoneExpiresBefore: now,
 		})
@@ -785,6 +899,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				return exitConfig
 			}
 			value = result
+		case "uninstall":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			result, err := browser.UninstallHost()
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: uninstall Chrome native host: %v\n", err)
+				return exitConfig
+			}
+			value = result
 		default:
 			fmt.Fprint(stderr, usage)
 			return exitParameter
@@ -828,16 +953,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitInternal
 		}
 		browserClient := browser.NewClient(paths.RuntimeDir)
+		executeCatalog := func(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+			return executeCatalogOperationWithStore(ctx, catalog, store, operation)
+		}
 		execute := func(ctx context.Context, operation core.Operation) (core.Envelope, error) {
 			current, loadErr := load(ctx)
 			if loadErr != nil {
 				return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, loadErr)
 			}
-			return executeCatalogOperation(ctx, current, operation)
+			return executeCatalog(ctx, current, operation)
 		}
 		managementService := &management.Service{Store: store, Catalog: catalog}
 		subscriptionService := &subscription.Service{
-			Store: store, LoadCatalog: load, Execute: executeCatalogOperation, InstanceID: instanceID,
+			Store: store, LoadCatalog: load, Execute: executeCatalog, InstanceID: instanceID,
 		}
 		readinessReport := func(ctx context.Context) (readiness.Report, error) {
 			current, loadErr := load(ctx)
@@ -889,7 +1017,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		handler, err := transport.NewDashboardHTTPHandler(transport.DashboardHTTPDependencies{
 			Execute: execute, LoadCatalog: load, Management: managementService, Subscription: subscriptionService,
 			Readiness: readinessReport, Probe: probe, Browser: browserClient,
-			Version: "0.1.0", InstanceID: instanceID, DevOrigin: devOrigin,
+			Version: buildVersion().Version, InstanceID: instanceID, DevOrigin: devOrigin,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: construct Dashboard HTTP server: %v\n", err)
@@ -945,27 +1073,33 @@ func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, st
 		return core.Envelope{}, "", exitParameter
 	}
 
-	catalog, closeCatalog, err := loadCatalog(context.Background())
-	if err != nil {
-		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
-		return core.Envelope{}, "", exitConfig
-	}
-	defer closeCatalog()
-	if transient != nil {
-		catalog, err = catalog.WithEgressProfile(transient.egress)
-		if err != nil {
-			fmt.Fprintf(stderr, "omnihub: configure direct feed egress: %v\n", err)
+	var envelope core.Envelope
+	if operation.SimilarityGrouping == core.SimilaritySemantic {
+		// semantic 需要复用一个可写 Store 完成 cache read/write；普通查询继续
+		// 走无数据库优先路径，一次性 --feed-url 始终固定为 off。
+		envelope, err = executeOperation(context.Background(), operation)
+	} else {
+		catalog, closeCatalog, loadErr := loadCatalog(context.Background())
+		if loadErr != nil {
+			fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", loadErr)
 			return core.Envelope{}, "", exitConfig
 		}
-		catalog, err = catalog.WithSourceAndChannel(transient.source, transient.channel)
-		if err != nil {
-			fmt.Fprintf(stderr, "omnihub: configure direct feed: %v\n", err)
-			return core.Envelope{}, "", exitConfig
+		defer closeCatalog()
+		if transient != nil {
+			catalog, err = catalog.WithEgressProfile(transient.egress)
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: configure direct feed egress: %v\n", err)
+				return core.Envelope{}, "", exitConfig
+			}
+			catalog, err = catalog.WithSourceAndChannel(transient.source, transient.channel)
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: configure direct feed: %v\n", err)
+				return core.Envelope{}, "", exitConfig
+			}
+			outputFormat = transient.format
 		}
-		outputFormat = transient.format
+		envelope, err = executeCatalogOperation(context.Background(), catalog, operation)
 	}
-
-	envelope, err := executeCatalogOperation(context.Background(), catalog, operation)
 	if err != nil {
 		if errors.Is(err, router.ErrNoRoute) {
 			fmt.Fprintf(stderr, "omnihub: execute %s: %v\n", kind, err)
@@ -987,6 +1121,32 @@ func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, st
 }
 
 func executeOperation(ctx context.Context, operation core.Operation) (core.Envelope, error) {
+	if operation.SimilarityGrouping == core.SimilaritySemantic {
+		paths, err := resolveCLIPaths()
+		if err != nil {
+			return core.Envelope{}, fmt.Errorf("%w: resolve paths: %v", transport.ErrExecutionConfiguration, err)
+		}
+		info, err := os.Stat(paths.Database)
+		if errors.Is(err, os.ErrNotExist) {
+			return core.Envelope{}, fmt.Errorf("%w: semantic grouping requires an existing configured database", transport.ErrExecutionConfiguration)
+		}
+		if err != nil {
+			return core.Envelope{}, fmt.Errorf("%w: inspect database: %v", transport.ErrExecutionConfiguration, err)
+		}
+		if info.IsDir() {
+			return core.Envelope{}, fmt.Errorf("%w: database path is a directory", transport.ErrExecutionConfiguration)
+		}
+		store, err := sqlite.Open(ctx, paths.Database)
+		if err != nil {
+			return core.Envelope{}, fmt.Errorf("%w: open semantic store: %v", transport.ErrExecutionConfiguration, err)
+		}
+		defer store.Close()
+		catalog, err := registry.Load(ctx, store, filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename))
+		if err != nil {
+			return core.Envelope{}, fmt.Errorf("%w: load semantic catalog: %v", transport.ErrExecutionConfiguration, err)
+		}
+		return executeCatalogOperationWithStore(ctx, catalog, store, operation)
+	}
 	catalog, closeCatalog, err := loadCatalog(ctx)
 	if err != nil {
 		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
@@ -996,6 +1156,10 @@ func executeOperation(ctx context.Context, operation core.Operation) (core.Envel
 }
 
 func executeCatalogOperation(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+	return executeCatalogOperationWithStore(ctx, catalog, nil, operation)
+}
+
+func executeCatalogOperationWithStore(ctx context.Context, catalog *registry.Catalog, store repository.Store, operation core.Operation) (core.Envelope, error) {
 	paths, err := resolveCLIPaths()
 	if err != nil {
 		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
@@ -1005,7 +1169,17 @@ func executeCatalogOperation(ctx context.Context, catalog *registry.Catalog, ope
 		Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}, GitHub: adapter.GitHubAdapter{},
 		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, CookieReader: browser.NewClient(paths.RuntimeDir),
 	}
-	return service.Execute(ctx, catalog, operation)
+	if operation.SimilarityGrouping == core.SimilaritySemantic {
+		if store == nil {
+			return core.Envelope{}, fmt.Errorf("%w: semantic grouping requires a writable store", transport.ErrExecutionConfiguration)
+		}
+		service.Semantic = semantic.Service{Store: store}
+	}
+	envelope, err := service.Execute(ctx, catalog, operation)
+	if errors.Is(err, semantic.ErrUnavailable) {
+		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
+	}
+	return envelope, err
 }
 
 func loopbackListenAddress(address string) bool {
@@ -1096,7 +1270,16 @@ func runChannelProbe(channelID, idempotencyKey string, stderr io.Writer) (any, i
 			code = exitConfig
 		}
 	}
-	return run, code
+	output := channelProbeOutput{SchemaVersion: core.SchemaVersion, Run: run}
+	records, listErr := store.ListProbeHealth(context.Background(), repository.ProbeHealthFilter{ChannelID: strings.TrimSpace(channelID), Limit: 1})
+	if listErr != nil {
+		fmt.Fprintf(stderr, "omnihub: read channel Probe report: %v\n", listErr)
+		return nil, exitInternal
+	}
+	if len(records) > 0 {
+		output.Probe = &records[0]
+	}
+	return output, code
 }
 
 type transientDirectFeed struct {
@@ -1294,13 +1477,13 @@ func loadCatalog(ctx context.Context) (*registry.Catalog, func(), error) {
 
 func openCatalogStore(ctx context.Context, databasePath string) (*sqlite.Store, error) {
 	// Registry/Doctor/Plan 是读取入口。只接受已经完成当前 migration 的
-	// SQLite v3，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
+	// SQLite v4，并以 mode=ro 打开；初始化与升级由后续写入命令负责。
 	version, err := sqlite.SchemaVersion(ctx, databasePath)
 	if err != nil {
 		return nil, err
 	}
-	if version != 3 {
-		return nil, fmt.Errorf("SQLite schema version %d requires initialization or migration to version 3", version)
+	if version != sqlite.CurrentSchemaVersion {
+		return nil, fmt.Errorf("SQLite schema version %d requires initialization or migration to version %d", version, sqlite.CurrentSchemaVersion)
 	}
 	return sqlite.OpenReadOnly(ctx, databasePath)
 }
@@ -1357,7 +1540,7 @@ func openReadManagementService(ctx context.Context) (management.Service, func(),
 }
 
 func managementExitCode(err error) int {
-	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidEgress) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) || errors.Is(err, management.ErrInvalidProviderConfig) {
+	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidEgress) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) || errors.Is(err, management.ErrInvalidProviderConfig) || errors.Is(err, management.ErrInvalidSemantic) {
 		return exitParameter
 	}
 	return exitConfig
@@ -1393,6 +1576,43 @@ func resolveCLIPaths() (config.Paths, error) {
 		paths.RuntimeDir = value
 	}
 	return paths, nil
+}
+
+func buildVersion() versionOutput {
+	result := versionOutput{
+		Version: strings.TrimSpace(releaseVersion),
+		Commit:  strings.TrimSpace(releaseCommit),
+		Date:    strings.TrimSpace(releaseDate),
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if result.Version == "" {
+			result.Version = strings.TrimSpace(info.Main.Version)
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if result.Commit == "" {
+					result.Commit = strings.TrimSpace(setting.Value)
+				}
+			case "vcs.time":
+				if result.Date == "" {
+					result.Date = strings.TrimSpace(setting.Value)
+				}
+			case "vcs.modified":
+				result.Modified = setting.Value == "true"
+			}
+		}
+	}
+	if result.Version == "" {
+		result.Version = "(devel)"
+	}
+	if result.Commit == "" {
+		result.Commit = "unknown"
+	}
+	if result.Date == "" {
+		result.Date = "unknown"
+	}
+	return result
 }
 
 func runChromeHost(stdin io.Reader, stdout, stderr io.Writer) int {

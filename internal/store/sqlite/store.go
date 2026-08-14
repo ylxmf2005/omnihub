@@ -3,18 +3,24 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 	_ "modernc.org/sqlite"
 )
+
+// CurrentSchemaVersion 是写入 migration 与只读入口共同接受的唯一版本真相。
+const CurrentSchemaVersion = 4
 
 type Store struct {
 	db    *sql.DB
@@ -135,8 +141,8 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	if version > 3 {
-		return fmt.Errorf("SQLite schema version %d is newer than supported version 3", version)
+	if version > CurrentSchemaVersion {
+		return fmt.Errorf("SQLite schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
 	if _, err := store.db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
 		return fmt.Errorf("configure SQLite: %w", err)
@@ -155,6 +161,12 @@ func (store *Store) initialize(ctx context.Context) error {
 	}
 	if version == 2 {
 		if err := store.migrateV3(ctx); err != nil {
+			return err
+		}
+		version = 3
+	}
+	if version == 3 {
+		if err := store.migrateV4(ctx); err != nil {
 			return err
 		}
 	}
@@ -290,6 +302,25 @@ func (store *Store) migrateV3(ctx context.Context) error {
 	})
 }
 
+func (store *Store) migrateV4(ctx context.Context) error {
+	return store.runMigration(ctx, CurrentSchemaVersion, []string{
+		`CREATE TABLE embedding_cache (
+			input_hash TEXT NOT NULL,
+			endpoint_profile_id TEXT NOT NULL,
+			endpoint_revision INTEGER NOT NULL CHECK(endpoint_revision > 0),
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			dimension INTEGER NOT NULL CHECK(dimension > 0),
+			index_revision INTEGER NOT NULL CHECK(index_revision > 0),
+			vector BLOB NOT NULL,
+			created_at_ns INTEGER NOT NULL,
+			last_used_at_ns INTEGER NOT NULL,
+			PRIMARY KEY(input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision)
+		)`,
+		`CREATE INDEX embedding_cache_by_last_used ON embedding_cache(last_used_at_ns)`,
+	})
+}
+
 func (store *Store) runMigration(ctx context.Context, version int, statements []string) error {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -314,12 +345,13 @@ func (store *Store) runMigration(ctx context.Context, version int, statements []
 // routingCatalogPayload 只保存用户可编辑的 Registry 资源。聚合 revision 由表列独立维护，
 // builtin/imported 声明、Provider、RouteTemplate 和 Credential 不会混入可编辑 JSON。
 type routingCatalogPayload struct {
-	Sources        []core.Source          `json:"sources"`
-	Endpoints      []core.EndpointProfile `json:"endpoints"`
-	EgressProfiles []core.EgressProfile   `json:"egress_profiles,omitempty"`
-	Channels       []core.Channel         `json:"channels"`
-	Collections    []core.Collection      `json:"collections"`
-	Overlays       []core.TemplateOverlay `json:"overlays"`
+	Sources          []core.Source          `json:"sources"`
+	Endpoints        []core.EndpointProfile `json:"endpoints"`
+	EgressProfiles   []core.EgressProfile   `json:"egress_profiles,omitempty"`
+	SemanticProfiles []core.SemanticProfile `json:"semantic_profiles,omitempty"`
+	Channels         []core.Channel         `json:"channels"`
+	Collections      []core.Collection      `json:"collections"`
+	Overlays         []core.TemplateOverlay `json:"overlays"`
 }
 
 func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.SaveRoutingCatalog) (core.RoutingCatalog, error) {
@@ -330,12 +362,13 @@ func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.Sav
 		return core.RoutingCatalog{}, err
 	}
 	payload, err := json.Marshal(routingCatalogPayload{
-		Sources:        input.Catalog.Sources,
-		Endpoints:      input.Catalog.Endpoints,
-		EgressProfiles: input.Catalog.EgressProfiles,
-		Channels:       input.Catalog.Channels,
-		Collections:    input.Catalog.Collections,
-		Overlays:       input.Catalog.Overlays,
+		Sources:          input.Catalog.Sources,
+		Endpoints:        input.Catalog.Endpoints,
+		EgressProfiles:   input.Catalog.EgressProfiles,
+		SemanticProfiles: input.Catalog.SemanticProfiles,
+		Channels:         input.Catalog.Channels,
+		Collections:      input.Catalog.Collections,
+		Overlays:         input.Catalog.Overlays,
 	})
 	if err != nil {
 		return core.RoutingCatalog{}, fmt.Errorf("encode routing catalog: %w", err)
@@ -409,31 +442,37 @@ func scanRoutingCatalog(row rowScanner) (core.RoutingCatalog, error) {
 		return core.RoutingCatalog{}, fmt.Errorf("decode routing catalog: %w", err)
 	}
 	return core.RoutingCatalog{
-		Revision:       revision,
-		Sources:        payload.Sources,
-		Endpoints:      payload.Endpoints,
-		EgressProfiles: payload.EgressProfiles,
-		Channels:       payload.Channels,
-		Collections:    payload.Collections,
-		Overlays:       payload.Overlays,
+		Revision:         revision,
+		Sources:          payload.Sources,
+		Endpoints:        payload.Endpoints,
+		EgressProfiles:   payload.EgressProfiles,
+		SemanticProfiles: payload.SemanticProfiles,
+		Channels:         payload.Channels,
+		Collections:      payload.Collections,
+		Overlays:         payload.Overlays,
 	}, nil
 }
 
 type viewReferenceIndex struct {
-	channels    map[string]bool
-	collections map[string]bool
+	channels         map[string]bool
+	collections      map[string]bool
+	semanticProfiles map[string]bool
 }
 
 func newViewReferenceIndex(catalog core.RoutingCatalog) viewReferenceIndex {
 	index := viewReferenceIndex{
-		channels:    make(map[string]bool, len(catalog.Channels)),
-		collections: make(map[string]bool, len(catalog.Collections)),
+		channels:         make(map[string]bool, len(catalog.Channels)),
+		collections:      make(map[string]bool, len(catalog.Collections)),
+		semanticProfiles: make(map[string]bool, len(catalog.SemanticProfiles)),
 	}
 	for _, channel := range catalog.Channels {
 		index.channels[channel.ID] = true
 	}
 	for _, collection := range catalog.Collections {
 		index.collections[collection.ID] = true
+	}
+	for _, profile := range catalog.SemanticProfiles {
+		index.semanticProfiles[profile.ID] = true
 	}
 	return index
 }
@@ -445,6 +484,9 @@ func (index viewReferenceIndex) contains(operation core.Operation) bool {
 		}
 	}
 	if operation.Scope.Collection != nil && !index.collections[*operation.Scope.Collection] {
+		return false
+	}
+	if operation.SemanticProfileID != nil && !index.semanticProfiles[*operation.SemanticProfileID] {
 		return false
 	}
 	for _, selectors := range [][]core.RouteSelector{operation.RoutePolicy.Prefer, operation.RoutePolicy.Only} {
@@ -1414,7 +1456,7 @@ func (store *Store) DeleteCredential(ctx context.Context, input repository.Delet
 	if input.ExpectedRoutingRevision == 0 {
 		emptyPayload, err := json.Marshal(routingCatalogPayload{
 			Sources: []core.Source{}, Endpoints: []core.EndpointProfile{}, EgressProfiles: []core.EgressProfile{},
-			Channels: []core.Channel{}, Collections: []core.Collection{}, Overlays: []core.TemplateOverlay{},
+			SemanticProfiles: []core.SemanticProfile{}, Channels: []core.Channel{}, Collections: []core.Collection{}, Overlays: []core.TemplateOverlay{},
 		})
 		if err != nil {
 			rollback()
@@ -1517,6 +1559,164 @@ func nullableString(value *string) any {
 	return *value
 }
 
+func (store *Store) GetEmbeddings(ctx context.Context, keys []repository.EmbeddingCacheKey, usedAt time.Time) (map[repository.EmbeddingCacheKey]repository.EmbeddingCacheEntry, error) {
+	entries := make(map[repository.EmbeddingCacheKey]repository.EmbeddingCacheEntry, len(keys))
+	if len(keys) == 0 {
+		return entries, nil
+	}
+	if usedAt.IsZero() {
+		return nil, fmt.Errorf("%w: used_at is required", repository.ErrInvalidEmbeddingCache)
+	}
+	for _, key := range keys {
+		if !validEmbeddingCacheKey(key) {
+			return nil, fmt.Errorf("%w: cache key is invalid", repository.ErrInvalidEmbeddingCache)
+		}
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin embedding cache read: %w", err)
+	}
+	rollback := func() { _ = tx.Rollback() }
+	for _, key := range keys {
+		var encoded []byte
+		var createdAt, lastUsedAt int64
+		err := tx.QueryRowContext(ctx, `SELECT vector, created_at_ns, last_used_at_ns FROM embedding_cache
+			WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ? AND provider = ?
+			AND model = ? AND dimension = ? AND index_revision = ?`, embeddingKeyArgs(key)...).Scan(&encoded, &createdAt, &lastUsedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			rollback()
+			return nil, fmt.Errorf("read embedding cache: %w", err)
+		}
+		vector, err := decodeEmbeddingVector(encoded, key.Dimension)
+		if err != nil {
+			rollback()
+			return nil, fmt.Errorf("decode embedding cache for %q: %w", key.InputHash, err)
+		}
+		entry := repository.EmbeddingCacheEntry{
+			Key: key, Vector: vector, CreatedAt: timeFromValue(createdAt), LastUsedAt: timeFromValue(lastUsedAt),
+		}
+		if !validEmbeddingCacheTimes(entry.CreatedAt, entry.LastUsedAt) {
+			rollback()
+			return nil, fmt.Errorf("%w: cached timestamps for %q are invalid", repository.ErrInvalidEmbeddingCache, key.InputHash)
+		}
+		if usedAt.After(entry.LastUsedAt) {
+			if _, err := tx.ExecContext(ctx, `UPDATE embedding_cache SET last_used_at_ns = ?
+				WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ? AND provider = ?
+				AND model = ? AND dimension = ? AND index_revision = ?`, append([]any{timeValue(usedAt)}, embeddingKeyArgs(key)...)...); err != nil {
+				rollback()
+				return nil, fmt.Errorf("touch embedding cache: %w", err)
+			}
+			entry.LastUsedAt = usedAt.UTC()
+		}
+		entries[key] = entry
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit embedding cache read: %w", err)
+	}
+	return entries, nil
+}
+
+func (store *Store) PutEmbeddings(ctx context.Context, entries []repository.EmbeddingCacheEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	type encodedEntry struct {
+		entry  repository.EmbeddingCacheEntry
+		vector []byte
+	}
+	encoded := make([]encodedEntry, len(entries))
+	for index, entry := range entries {
+		if !validEmbeddingCacheKey(entry.Key) || !validEmbeddingCacheTimes(entry.CreatedAt, entry.LastUsedAt) {
+			return fmt.Errorf("%w: cache entry is invalid", repository.ErrInvalidEmbeddingCache)
+		}
+		vector, err := encodeEmbeddingVector(entry.Vector, entry.Key.Dimension)
+		if err != nil {
+			return err
+		}
+		encoded[index] = encodedEntry{entry: entry, vector: vector}
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin embedding cache write: %w", err)
+	}
+	rollback := func() { _ = tx.Rollback() }
+	for _, value := range encoded {
+		args := append(embeddingKeyArgs(value.entry.Key), value.vector, timeValue(value.entry.CreatedAt), timeValue(value.entry.LastUsedAt))
+		if _, err := tx.ExecContext(ctx, `INSERT INTO embedding_cache(
+			input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision,
+			vector, created_at_ns, last_used_at_ns
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision)
+		DO UPDATE SET vector = excluded.vector, created_at_ns = excluded.created_at_ns,
+			last_used_at_ns = excluded.last_used_at_ns`, args...); err != nil {
+			rollback()
+			return fmt.Errorf("write embedding cache: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit embedding cache write: %w", err)
+	}
+	return nil
+}
+
+func validEmbeddingCacheKey(key repository.EmbeddingCacheKey) bool {
+	return key.InputHash != "" && key.InputHash == strings.TrimSpace(key.InputHash) &&
+		key.EndpointProfileID != "" && key.EndpointProfileID == strings.TrimSpace(key.EndpointProfileID) && key.EndpointRevision > 0 &&
+		key.Provider != "" && key.Provider == strings.TrimSpace(key.Provider) &&
+		key.Model != "" && key.Model == strings.TrimSpace(key.Model) &&
+		key.Dimension > 0 && key.IndexRevision > 0
+}
+
+func validEmbeddingCacheTimes(createdAt, lastUsedAt time.Time) bool {
+	return !createdAt.IsZero() && !lastUsedAt.IsZero() && !lastUsedAt.Before(createdAt)
+}
+
+func embeddingKeyArgs(key repository.EmbeddingCacheKey) []any {
+	return []any{key.InputHash, key.EndpointProfileID, key.EndpointRevision, key.Provider, key.Model, key.Dimension, key.IndexRevision}
+}
+
+func encodeEmbeddingVector(vector []float32, dimension int) ([]byte, error) {
+	if len(vector) != dimension || !validEmbeddingVector(vector) {
+		return nil, fmt.Errorf("%w: vector dimension, components or norm are invalid", repository.ErrInvalidEmbeddingCache)
+	}
+	encoded := make([]byte, len(vector)*4)
+	for index, component := range vector {
+		binary.LittleEndian.PutUint32(encoded[index*4:], math.Float32bits(component))
+	}
+	return encoded, nil
+}
+
+func decodeEmbeddingVector(encoded []byte, dimension int) ([]float32, error) {
+	if dimension <= 0 || dimension > int(^uint(0)>>1)/4 || len(encoded) != dimension*4 {
+		return nil, fmt.Errorf("%w: vector BLOB length does not match dimension", repository.ErrInvalidEmbeddingCache)
+	}
+	vector := make([]float32, dimension)
+	for index := range vector {
+		vector[index] = math.Float32frombits(binary.LittleEndian.Uint32(encoded[index*4:]))
+	}
+	if !validEmbeddingVector(vector) {
+		return nil, fmt.Errorf("%w: vector components or norm are invalid", repository.ErrInvalidEmbeddingCache)
+	}
+	return vector, nil
+}
+
+func validEmbeddingVector(vector []float32) bool {
+	var norm float64
+	for _, component := range vector {
+		value := float64(component)
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+		norm += value * value
+	}
+	return norm > 0
+}
+
 func (store *Store) Prune(ctx context.Context, input repository.Prune) (core.PruneResult, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1547,6 +1747,13 @@ func (store *Store) Prune(ctx context.Context, input repository.Prune) (core.Pru
 			return core.PruneResult{}, fmt.Errorf("count expired identity tombstones: %w", err)
 		}
 	}
+	if !input.EmbeddingUnusedBefore.IsZero() {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM embedding_cache WHERE last_used_at_ns < ?`,
+			timeValue(input.EmbeddingUnusedBefore)).Scan(&result.Embeddings); err != nil {
+			rollback()
+			return core.PruneResult{}, fmt.Errorf("count unused embeddings: %w", err)
+		}
+	}
 	if input.DryRun {
 		rollback()
 		return result, nil
@@ -1572,6 +1779,12 @@ func (store *Store) Prune(ctx context.Context, input repository.Prune) (core.Pru
 		if _, err := tx.ExecContext(ctx, `DELETE FROM identity_tombstones WHERE expires_at_ns <= ?`, timeValue(input.TombstoneExpiresBefore)); err != nil {
 			rollback()
 			return core.PruneResult{}, fmt.Errorf("prune expired identity tombstones: %w", err)
+		}
+	}
+	if result.Embeddings > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM embedding_cache WHERE last_used_at_ns < ?`, timeValue(input.EmbeddingUnusedBefore)); err != nil {
+			rollback()
+			return core.PruneResult{}, fmt.Errorf("prune unused embeddings: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

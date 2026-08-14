@@ -59,6 +59,9 @@ type Schemas struct {
 	RouteTemplate         json.RawMessage `json:"route_template"`
 	Channel               json.RawMessage `json:"channel"`
 	EndpointProfile       json.RawMessage `json:"endpoint_profile"`
+	SemanticProfileInput  json.RawMessage `json:"semantic_profile_input"`
+	SemanticProfileList   json.RawMessage `json:"semantic_profile_list"`
+	SemanticProfile       json.RawMessage `json:"semantic_profile"`
 	EgressSummary         json.RawMessage `json:"egress_profile_summary"`
 	Collection            json.RawMessage `json:"collection"`
 	View                  json.RawMessage `json:"view"`
@@ -75,6 +78,7 @@ type Schemas struct {
 	Managed               json.RawMessage `json:"managed_resource"`
 	Bundle                json.RawMessage `json:"bundle"`
 	AdapterResult         json.RawMessage `json:"adapter_result"`
+	PruneResult           json.RawMessage `json:"prune_result"`
 }
 
 type Artifacts struct {
@@ -82,6 +86,16 @@ type Artifacts struct {
 	CLI     CommandManifest `json:"cli"`
 	OpenAPI OpenAPIDocument `json:"openapi"`
 	MCP     MCPManifest     `json:"mcp"`
+}
+
+var buildVersion = "(devel)"
+
+// SetBuildVersion 必须在构造 Schema、HTTP 或 MCP surface 前调用；CLI 用
+// 同一份 Go build identity 驱动所有对外版本字段。
+func SetBuildVersion(version string) {
+	if version = strings.TrimSpace(version); version != "" {
+		buildVersion = version
+	}
 }
 
 func Generate() (Artifacts, error) {
@@ -109,7 +123,9 @@ func generateArtifacts(includeDashboard bool) (Artifacts, error) {
 		&schemas.Run: reflect.TypeFor[core.Run](), &schemas.RouteTemplate: reflect.TypeFor[core.RouteTemplate](),
 		&schemas.DashboardSummary: reflect.TypeFor[DashboardSummary](), &schemas.Readiness: reflect.TypeFor[readiness.Report](),
 		&schemas.Source: reflect.TypeFor[core.Source](), &schemas.EndpointProfile: reflect.TypeFor[core.EndpointProfile](),
-		&schemas.EgressSummary: reflect.TypeFor[core.EgressProfileSummary](), &schemas.Collection: reflect.TypeFor[core.Collection](),
+		&schemas.SemanticProfileInput: reflect.TypeFor[management.ApplySemanticProfileInput](), &schemas.SemanticProfileList: reflect.TypeFor[[]core.SemanticProfile](),
+		&schemas.SemanticProfile: reflect.TypeFor[core.SemanticProfile](),
+		&schemas.EgressSummary:   reflect.TypeFor[core.EgressProfileSummary](), &schemas.Collection: reflect.TypeFor[core.Collection](),
 		&schemas.View: reflect.TypeFor[core.View](), &schemas.ViewDetail: reflect.TypeFor[subscription.ViewDetail](),
 		&schemas.ViewSnapshot: reflect.TypeFor[ViewSnapshotResponse](), &schemas.ViewItems: reflect.TypeFor[ViewItemsResponse](),
 		&schemas.Channel: reflect.TypeFor[core.Channel](), &schemas.CredentialInput: reflect.TypeFor[core.CredentialInput](),
@@ -118,6 +134,7 @@ func generateArtifacts(includeDashboard bool) (Artifacts, error) {
 		&schemas.BrowserRevokeRequest: reflect.TypeFor[browser.RevokePermissionRequest](), &schemas.BrowserRevokeResponse: reflect.TypeFor[browser.RevokePermissionResponse](),
 		&schemas.Managed: reflect.TypeFor[core.ManagedResource](),
 		&schemas.Bundle:  reflect.TypeFor[core.Bundle](), &schemas.AdapterResult: reflect.TypeFor[core.AdapterResult](),
+		&schemas.PruneResult: reflect.TypeFor[core.PruneResult](),
 	} {
 		generated, generateErr := schemaFor(typ)
 		if generateErr != nil {
@@ -157,7 +174,7 @@ func generateArtifacts(includeDashboard bool) (Artifacts, error) {
 		CLI:     CommandManifest{SchemaVersion: core.SchemaVersion, Commands: commands},
 		OpenAPI: OpenAPIDocument{
 			OpenAPI: "3.1.0",
-			Info:    map[string]string{"title": "OmniHub API", "version": "0.1.0"},
+			Info:    map[string]string{"title": "OmniHub API", "version": buildVersion},
 			Paths:   paths,
 		},
 		MCP: MCPManifest{Tools: tools},
@@ -191,8 +208,10 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 		"channels": reflect.TypeFor[[]core.Channel](), "channel": reflect.TypeFor[core.Channel](),
 		"channel_input": reflect.TypeFor[management.ApplyChannelInput](),
 		"endpoints":     reflect.TypeFor[[]core.EndpointProfile](), "endpoint": reflect.TypeFor[core.EndpointProfile](),
-		"endpoint_input":  reflect.TypeFor[management.ApplyEndpointInput](),
-		"egress_profiles": reflect.TypeFor[[]core.EgressProfileSummary](), "egress_profile": reflect.TypeFor[core.EgressProfileSummary](),
+		"endpoint_input":    reflect.TypeFor[management.ApplyEndpointInput](),
+		"semantic_profiles": reflect.TypeFor[[]core.SemanticProfile](), "semantic_profile": reflect.TypeFor[core.SemanticProfile](),
+		"semantic_profile_input": reflect.TypeFor[management.ApplySemanticProfileInput](),
+		"egress_profiles":        reflect.TypeFor[[]core.EgressProfileSummary](), "egress_profile": reflect.TypeFor[core.EgressProfileSummary](),
 		"egress_input": reflect.TypeFor[management.ApplyEgressProfileInput](),
 		"credentials":  reflect.TypeFor[[]core.CredentialSummary](), "credential_summary": reflect.TypeFor[core.CredentialSummary](),
 		"credential_detail": reflect.TypeFor[core.CredentialDetail](), "credential_input": reflect.TypeFor[management.ApplyCredentialInput](),
@@ -233,6 +252,7 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 	}{
 		{"Channel", "/v1/channels", "/v1/channels/{id}", schemas["channel_input"], schemas["channels"], schemas["channel"], schemas["channel"]},
 		{"EndpointProfile", "/v1/endpoint-profiles", "/v1/endpoint-profiles/{id}", schemas["endpoint_input"], schemas["endpoints"], schemas["endpoint"], schemas["endpoint"]},
+		{"SemanticProfile", "/v1/semantic-profiles", "/v1/semantic-profiles/{id}", schemas["semantic_profile_input"], schemas["semantic_profiles"], schemas["semantic_profile"], schemas["semantic_profile"]},
 		{"EgressProfile", "/v1/egress-profiles", "/v1/egress-profiles/{id}", schemas["egress_input"], schemas["egress_profiles"], schemas["egress_profile"], schemas["egress_profile"]},
 		{"Credential", "/v1/credentials", "/v1/credentials/{id}", schemas["credential_input"], schemas["credentials"], schemas["credential_detail"], schemas["credential_summary"]},
 		{"Collection", "/v1/collections", "/v1/collections/{id}", schemas["collection_input"], schemas["collections"], schemas["collection"], schemas["collection"]},
@@ -507,7 +527,15 @@ func schemaFor(typ reflect.Type) (json.RawMessage, error) {
 }
 
 func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
-	if schema == nil || schema.Type != "object" {
+	if schema == nil {
+		return
+	}
+	if typ == reflect.TypeFor[[]core.SemanticProfile]() {
+		applySemanticProfileConstraints(schema.Items, true)
+		requireArray(schema, false)
+		return
+	}
+	if schema.Type != "object" {
 		return
 	}
 	if property := schema.Properties["schema_version"]; property != nil {
@@ -533,6 +561,12 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 		minimum, maximum := 1.0, 120000.0
 		property.Minimum, property.Maximum = &minimum, &maximum
 	}
+	if property := schema.Properties["semantic_profile_id"]; property != nil {
+		minimum := 1
+		property.MinLength = &minimum
+		property.Pattern = `.*\S.*`
+	}
+	applySimilarityGroupingConstraints(schema)
 	if scope := schema.Properties["scope"]; scope != nil {
 		applyScopeConstraints(scope)
 	}
@@ -562,6 +596,13 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 	}
 	if typ == reflect.TypeFor[core.Item]() {
 		requireArray(schema.Properties["observations"], true)
+		applySimilarityScoreConstraints(schema.Properties["similarity"])
+	}
+	if items := schema.Properties["items"]; items != nil && items.Items != nil {
+		applySimilarityScoreConstraints(items.Items.Properties["similarity"])
+	}
+	if typ == reflect.TypeFor[core.SemanticProfile]() || typ == reflect.TypeFor[management.ApplySemanticProfileInput]() {
+		applySemanticProfileConstraints(schema, typ == reflect.TypeFor[core.SemanticProfile]())
 	}
 	if typ == reflect.TypeFor[CreateRunInput]() {
 		if kind := schema.Properties["kind"]; kind != nil {
@@ -575,6 +616,79 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 			minimum := 1
 			origin.MinLength = &minimum
 		}
+	}
+}
+
+func applySimilarityScoreConstraints(similarity *jsonschema.Schema) {
+	if similarity == nil {
+		return
+	}
+	if score := similarity.Properties["score"]; score != nil {
+		minimum, maximum := -1.0, 1.0
+		score.Minimum, score.Maximum = &minimum, &maximum
+	}
+}
+
+func applySimilarityGroupingConstraints(schema *jsonschema.Schema) {
+	if schema.Properties["similarity_grouping"] == nil || schema.Properties["semantic_profile_id"] == nil {
+		return
+	}
+	semantic := any(string(core.SimilaritySemantic))
+	minimum := 1
+	schema.AllOf = append(schema.AllOf, &jsonschema.Schema{
+		If: &jsonschema.Schema{
+			Required:   []string{"similarity_grouping"},
+			Properties: map[string]*jsonschema.Schema{"similarity_grouping": {Const: &semantic}},
+		},
+		Then: &jsonschema.Schema{
+			Required: []string{"semantic_profile_id"},
+			Properties: map[string]*jsonschema.Schema{
+				"semantic_profile_id": {Type: "string", MinLength: &minimum, Pattern: `.*\S.*`},
+			},
+		},
+		Else: &jsonschema.Schema{Properties: map[string]*jsonschema.Schema{
+			"semantic_profile_id": {Types: []string{"null"}},
+		}},
+	})
+}
+
+func applySemanticProfileConstraints(schema *jsonschema.Schema, persisted bool) {
+	if schema == nil {
+		return
+	}
+	for _, name := range []string{"id", "endpoint_profile_id", "model"} {
+		if property := schema.Properties[name]; property != nil {
+			minimum := 1
+			property.MinLength = &minimum
+			property.Pattern = `.*\S.*`
+		}
+	}
+	if model := schema.Properties["model"]; model != nil {
+		maximum := 256
+		model.MaxLength = &maximum
+	}
+	if dimension := schema.Properties["dimension"]; dimension != nil {
+		minimum, maximum := 1.0, 16384.0
+		dimension.Minimum, dimension.Maximum = &minimum, &maximum
+	}
+	if threshold := schema.Properties["threshold"]; threshold != nil {
+		minimum, maximum := 0.0, 1.0
+		threshold.ExclusiveMinimum, threshold.Maximum = &minimum, &maximum
+	}
+	if revision := schema.Properties["index_revision"]; revision != nil {
+		minimum := 1.0
+		revision.Minimum = &minimum
+	}
+	if persisted {
+		if revision := schema.Properties["revision"]; revision != nil {
+			minimum := 1.0
+			revision.Minimum = &minimum
+		}
+		return
+	}
+	if revision := schema.Properties["expected_revision"]; revision != nil {
+		minimum := 0.0
+		revision.Minimum = &minimum
 	}
 }
 
@@ -644,6 +758,11 @@ func applyOperationKindConstraints(schema *jsonschema.Schema) {
 		if operation.required != "" {
 			then.Required = []string{operation.required}
 			then.Properties[operation.required] = &jsonschema.Schema{Type: "string"}
+		}
+		if operation.kind == core.OperationFetch {
+			off := any(string(core.SimilarityOff))
+			then.Properties["similarity_grouping"] = &jsonschema.Schema{Const: &off}
+			then.Properties["semantic_profile_id"] = &jsonschema.Schema{Types: []string{"null"}}
 		}
 		for _, name := range operation.nullOnly {
 			then.Properties[name] = &jsonschema.Schema{Types: []string{"null"}}
@@ -741,7 +860,7 @@ func schemaOptions() *jsonschema.ForOptions {
 		reflect.TypeFor[core.RouteMode]():          enumSchema(string(core.RouteAuto), string(core.RoutePrefer), string(core.RouteOnly), string(core.RouteExclude)),
 		reflect.TypeFor[core.SelectorKind]():       enumSchema(string(core.SelectorChannel), string(core.SelectorProvider)),
 		reflect.TypeFor[core.IdentityDedupe]():     enumSchema(string(core.IdentityNone), string(core.IdentityExact)),
-		reflect.TypeFor[core.SimilarityGrouping](): enumSchema(string(core.SimilarityOff)),
+		reflect.TypeFor[core.SimilarityGrouping](): enumSchema(string(core.SimilarityOff), string(core.SimilaritySemantic)),
 		reflect.TypeFor[core.Status]():             enumSchema(string(core.StatusComplete), string(core.StatusPartial), string(core.StatusFailed)),
 		reflect.TypeFor[core.ContentRole]():        enumSchema(string(core.ContentSnippet), string(core.ContentSummary), string(core.ContentBody)),
 		reflect.TypeFor[core.ExecutionStatus]():    enumSchema(string(core.ExecutionCompleted), string(core.ExecutionFailed), string(core.ExecutionSkipped)),
@@ -750,7 +869,7 @@ func schemaOptions() *jsonschema.ForOptions {
 		reflect.TypeFor[core.ErrorCode](): enumSchema(
 			string(core.ErrorParameter), string(core.ErrorConfig), string(core.ErrorAuth), string(core.ErrorRateLimit), string(core.ErrorTimeout),
 			string(core.ErrorNetwork), string(core.ErrorUpstream), string(core.ErrorProtocol), string(core.ErrorParse), string(core.ErrorInternal),
-			string(core.ErrorBrowserUnavailable), string(core.ErrorBrowserPermission), string(core.ErrorCookieMissing),
+			string(core.ErrorBrowserUnavailable), string(core.ErrorBrowserPermission), string(core.ErrorCookieMissing), string(core.ErrorSimilarityUnavailable),
 		),
 		reflect.TypeFor[core.Verification]():      enumSchema(string(core.VerificationCandidate), string(core.VerificationMetadata), string(core.VerificationBody)),
 		reflect.TypeFor[core.RunStatus]():         enumSchema(string(core.RunQueued), string(core.RunRunning), string(core.RunComplete), string(core.RunPartial), string(core.RunFailed), string(core.RunCancelled)),

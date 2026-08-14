@@ -262,7 +262,7 @@ func serveOperation(writer http.ResponseWriter, request *http.Request, kind core
 }
 
 func newMCPServer(execute ExecuteFunc, artifacts Artifacts) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{Name: "omnihub", Version: "0.1.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "omnihub", Version: artifacts.OpenAPI.Info["version"]}, nil)
 	operations := []core.OperationKind{core.OperationSearch, core.OperationLatest, core.OperationFetch}
 	for index, kind := range operations {
 		spec := artifacts.MCP.Tools[index]

@@ -53,7 +53,7 @@ func BuiltinCatalog() *Catalog {
 		{RouteTemplateID: "tavily-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"tavily-discovery"}}, Provider: "tavily", Adapter: "tavily", Capabilities: []string{"search"}, ContentLevel: "snippet", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "unsupported"}, Auth: core.AuthDescriptor{Kind: "api_key", Required: true}, EndpointRequired: true, ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"search_depth": map[string]any{"type": "string", "enum": []any{"basic", "advanced"}}, "exclude_domains": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 20}}}, Cost: "metered", Trust: "official_api", Limitations: []string{"web_index_coverage_unknown", "candidate_results_only", "tavily_max_20"}},
 		{RouteTemplateID: "x-xurl-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "xurl", Capabilities: []string{"search"}, ContentLevel: "body", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "recent_window"}, Auth: core.AuthDescriptor{Kind: "app_only", Required: true}, Cost: "metered", Trust: "local_executable", Limitations: []string{"x_recent_search_window", "xurl_shortcut_no_continuation"}},
 	}
-	catalog, err := NewCatalog(sources, providers, templates, nil, nil, nil, nil, nil, nil)
+	catalog, err := NewCatalog(sources, providers, templates, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -83,7 +83,7 @@ func BuiltinFixture() *Catalog {
 		{ID: "cred_tavily", Provider: "tavily", AuthKind: "api_key", Label: "Tavily fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
 		{ID: "cred_x", Provider: "xurl", AuthKind: "app_only", Label: "X fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
 	}
-	catalog, err := NewCatalog(builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(), channels, endpoints, egressProfiles, credentials, nil, nil)
+	catalog, err := NewCatalog(builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(), channels, endpoints, egressProfiles, credentials, nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}

@@ -19,18 +19,19 @@ var (
 )
 
 type Catalog struct {
-	sources        map[string]core.Source
-	providers      map[string]core.Provider
-	routeTemplates map[string]core.RouteTemplate
-	channels       map[string]core.Channel
-	endpoints      map[string]core.EndpointProfile
-	egressProfiles map[string]core.EgressProfile
-	credentials    map[string]core.Credential
-	collections    map[string]core.Collection
-	overlays       map[string]core.TemplateOverlay
+	sources          map[string]core.Source
+	providers        map[string]core.Provider
+	routeTemplates   map[string]core.RouteTemplate
+	channels         map[string]core.Channel
+	endpoints        map[string]core.EndpointProfile
+	egressProfiles   map[string]core.EgressProfile
+	credentials      map[string]core.Credential
+	semanticProfiles map[string]core.SemanticProfile
+	collections      map[string]core.Collection
+	overlays         map[string]core.TemplateOverlay
 }
 
-func NewCatalog(sources []core.Source, providers []core.Provider, templates []core.RouteTemplate, channels []core.Channel, endpoints []core.EndpointProfile, egressProfiles []core.EgressProfile, credentials []core.Credential, collections []core.Collection, overlays []core.TemplateOverlay) (*Catalog, error) {
+func NewCatalog(sources []core.Source, providers []core.Provider, templates []core.RouteTemplate, channels []core.Channel, endpoints []core.EndpointProfile, egressProfiles []core.EgressProfile, credentials []core.Credential, semanticProfiles []core.SemanticProfile, collections []core.Collection, overlays []core.TemplateOverlay) (*Catalog, error) {
 	sourceIndex, err := index("source", sources, func(value core.Source) string { return value.ID }, cloneSource)
 	if err != nil {
 		return nil, err
@@ -59,6 +60,10 @@ func NewCatalog(sources []core.Source, providers []core.Provider, templates []co
 	if err != nil {
 		return nil, err
 	}
+	semanticProfileIndex, err := index("semantic profile", semanticProfiles, func(value core.SemanticProfile) string { return value.ID }, cloneSemanticProfile)
+	if err != nil {
+		return nil, err
+	}
 	collectionIndex, err := index("collection", collections, func(value core.Collection) string { return value.ID }, cloneCollection)
 	if err != nil {
 		return nil, err
@@ -70,7 +75,7 @@ func NewCatalog(sources []core.Source, providers []core.Provider, templates []co
 
 	catalog := &Catalog{
 		sources: sourceIndex, providers: providerIndex, routeTemplates: templateIndex,
-		channels: channelIndex, endpoints: endpointIndex, egressProfiles: egressProfileIndex, credentials: credentialIndex,
+		channels: channelIndex, endpoints: endpointIndex, egressProfiles: egressProfileIndex, credentials: credentialIndex, semanticProfiles: semanticProfileIndex,
 		collections: collectionIndex, overlays: overlayIndex,
 	}
 	if err := catalog.Validate(); err != nil {
@@ -118,6 +123,20 @@ func (catalog *Catalog) Validate() error {
 	for id, credential := range catalog.credentials {
 		if credential.ID != id {
 			return fmt.Errorf("%w: credential id is inconsistent", ErrInvalidCatalog)
+		}
+	}
+	for id, profile := range catalog.semanticProfiles {
+		if profile.ID != id {
+			return fmt.Errorf("%w: semantic profile id is inconsistent", ErrInvalidCatalog)
+		}
+		if err := profile.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidCatalog, err)
+		}
+		if endpoint, ok := catalog.endpoints[profile.EndpointProfileID]; ok && endpoint.Provider != "embedding" {
+			return fmt.Errorf("%w: semantic profile %s has an incompatible endpoint", ErrInvalidCatalog, id)
+		}
+		if credential, ok := catalog.credentials[profile.CredentialID]; profile.CredentialID != "" && ok && (credential.Provider != "embedding" || credential.AuthKind != "bearer") {
+			return fmt.Errorf("%w: semantic profile %s has an incompatible credential", ErrInvalidCatalog, id)
 		}
 	}
 	for id, overlay := range catalog.overlays {
@@ -309,7 +328,7 @@ func (catalog *Catalog) Copy() *Catalog {
 		sources: cloneIndex(catalog.sources, cloneSource), providers: cloneIndex(catalog.providers, cloneProvider),
 		routeTemplates: cloneIndex(catalog.routeTemplates, cloneRouteTemplate), channels: cloneIndex(catalog.channels, cloneChannel),
 		endpoints: cloneIndex(catalog.endpoints, cloneEndpoint), egressProfiles: cloneIndex(catalog.egressProfiles, cloneEgressProfile), credentials: cloneIndex(catalog.credentials, cloneCredential),
-		collections: cloneIndex(catalog.collections, cloneCollection), overlays: cloneIndex(catalog.overlays, cloneOverlay),
+		semanticProfiles: cloneIndex(catalog.semanticProfiles, cloneSemanticProfile), collections: cloneIndex(catalog.collections, cloneCollection), overlays: cloneIndex(catalog.overlays, cloneOverlay),
 	}
 }
 
@@ -349,6 +368,10 @@ func (catalog *Catalog) EgressProfiles() []core.EgressProfile {
 	return sortedValues(catalog.egressProfiles, func(value core.EgressProfile) string { return value.ID }, cloneEgressProfile)
 }
 
+func (catalog *Catalog) SemanticProfiles() []core.SemanticProfile {
+	return sortedValues(catalog.semanticProfiles, func(value core.SemanticProfile) string { return value.ID }, cloneSemanticProfile)
+}
+
 func (catalog *Catalog) Channel(id string) (core.Channel, bool) {
 	value, ok := catalog.channels[id]
 	return cloneChannel(value), ok
@@ -372,6 +395,11 @@ func (catalog *Catalog) EgressProfile(id string) (core.EgressProfile, bool) {
 func (catalog *Catalog) Credential(id string) (core.Credential, bool) {
 	value, ok := catalog.credentials[id]
 	return cloneCredential(value), ok
+}
+
+func (catalog *Catalog) SemanticProfile(id string) (core.SemanticProfile, bool) {
+	value, ok := catalog.semanticProfiles[id]
+	return cloneSemanticProfile(value), ok
 }
 
 func (catalog *Catalog) Collection(id string) (core.Collection, bool) {
@@ -536,6 +564,8 @@ func cloneCredential(value core.Credential) core.Credential {
 	}
 	return value
 }
+
+func cloneSemanticProfile(value core.SemanticProfile) core.SemanticProfile { return value }
 
 func cloneCollection(value core.Collection) core.Collection {
 	value.ChannelIDs = slices.Clone(value.ChannelIDs)

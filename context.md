@@ -26,7 +26,7 @@
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
 - 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。2026-08-15 复核确认当前 `modernc.org/sqlite v1.56.0` 已内置无 CGO 的 `sqlite-vec v0.1.9`，旧有“三平台 pure-Go 无法接入”前提失效；但它在当前仍是 exact scan，并会为单次最多 100 个结果增加 pre-v1 虚拟表、shadow table 与全局自动注册面，收益不足。MVP 因而继续以 little-endian `float32` BLOB 缓存 embedding 并在 Go 内做精确余弦比较；达到单 cohort 约 10,000 条、p95 超过 150ms 或出现跨 Snapshot KNN 需求时，优先 spike `modernc.org/sqlite/vec`。Embedding 只实现 OpenAI-compatible wire contract，本地 Ollama 通过 `/v1/embeddings` 接入；输入固定为 title + summary，无 summary 时回退 content.text，并在 UTF-8 8 KiB 处截断。OmniHub 不自动安装、下载或启动模型，也不从本地回退云端。
-- 实施状态：Shape 与 Grill 已收口；Stage 0—C 已提交并推送。Stage D 已在 `feature/stage-d-chrome-bridge` 完成 Chrome Native Host、当前用户IPC、可信授权描述、按执行Cookie安全合同、Dashboard Browser API与实时readiness；全量test/race/vet、真实隔离CLI/loopback E2E、三平台构建和独立Review已闭合，等待提交推送。Stage E semantic grouping与发布候选是下一入口；Tavily/X因无用户真实凭据仍只声明fixture证据，NodeSeek由独立side任务处理。
+- 实施状态：Shape 与 Grill 已收口；Stage 0—D 已提交并推送。Stage E 已在 `feature/stage-e-semantic-release` 完成 SemanticProfile、OpenAI-compatible embedding、SQLite v4 cache、exact cosine grouping、全部公共出口、CLI Probe 报告、版本/Skill/卸载与发布脚本；真实 binary E2E、公开来源 smoke、Skill forward-test 和 100 Item p95 已成立，正在冻结提交并完成 archive、三平台 CI 与最终 Review。Tavily/X 因无用户真实凭据仍只声明 fixture 证据，NodeSeek 当前真实 Probe 在 TLS 层失败并保持 conditional。
 - 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
 - Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；Stage C 已在 Dashboard readiness 的 route-group 聚合读模型中实现跨绑定 `ready_dependent`，单 Channel 仍只表达自身事实。
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
@@ -37,6 +37,7 @@
 - Stage D 只交付可安装的 Chrome Bridge/Native Host、安全合同和 mock consumer，不为演示增加通用 Cookie Adapter；Host 安装必须接收一个精确 Extension ID。OmniHub v1 只保证自身 Item/Observation 引用可追溯，不宣称审计任意 Agent 最终文本。首发使用三平台 archive、checksum 与 `go install`，不把包管理器和平台签名纳入完成条件。
 - Chrome Bridge 离线或 permission 缺失时，依赖它的 Channel 当前不可执行，readiness 始终为 `blocked`；已有成功 Snapshot 的 View 仍可作为 `stale` 分发。历史 Probe 不能把当前缺失的运行依赖降格成仅 `degraded`。
 - 已确认剩余 MVP 默认值：`serve` 只提供前台 loopback 进程，不实现三平台服务管理器；View 优先遵守上游 freshness hint，无 hint 时使用 15 分钟，不增加 per-View 覆盖项；SQLite 自动执行事务化、仅向前 migration，不支持降级；普通卸载保留用户数据。首个公开版本按 `0.1.x` preview 准备，传输 Schema 保持独立版本，正式 1.0 前完成 compatibility review。
+- Stage E 安全边界：远程 embedding Endpoint 只允许 HTTPS；明文 HTTP 只允许字面 loopback IP 经 direct Egress，用于本机 Ollama。管理写入与执行 preflight 复用同一判断，不允许环境或显式代理承载明文用户内容。
 
 ## Goal
 
@@ -100,8 +101,8 @@
 - `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
 - `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
 - `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`ready`，Stage 0—D 已完成，下一入口为 Stage E semantic grouping 与发布候选。
-- `dev/implementation.md`：`completed`，Stage D Chrome Cookie Backend 已实现并通过聚焦反馈。
-- `test/test-plan.md`：`completed`，TC-D01—D08 已执行。
-- `test/test-report.md`：`passed`，Chrome Host/IPC/Query/Dashboard/readiness、真实隔离CLI/loopback E2E、三平台构建与质量闸已闭合。
-- `review/review.md`：`approve`，最终Stage D完整diff无未解决P0—P3。
+- `plan.md`：`executing`，Stage 0—D 已完成，Stage E 实现完成并进入发布候选冻结。
+- `dev/implementation.md`：`completed`，Stage E semantic grouping、公共出口与发布面已实现并通过聚焦反馈。
+- `test/test-plan.md`：`executing`，TC-E01—E10 正在执行。
+- `test/test-report.md`：`executing`，TC-E01—E08 已通过，TC-E09/E10 等待 clean commit archive、CI 与最终 Review。
+- `review/review.md`：`stale`，当前仍是 Stage D 裁决；必须由最终 Stage E 独立 Review 替换。
