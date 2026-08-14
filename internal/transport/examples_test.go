@@ -348,6 +348,46 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	if plan, err := router.Build(trusted, operation); err != nil || len(plan.Selected) != 1 {
 		t.Fatalf("Build(trusted cookie) = %#v, %v", plan, err)
 	}
+
+	endpointTemplate := core.RouteTemplate{RouteTemplateID: "endpoint-required", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "provider", Capabilities: []string{"latest"}, EndpointRequired: true}
+	endpointCatalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{ID: "endpointless", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID, Enabled: true}}, nil, nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpointPlan, err := router.Build(endpointCatalog, operation)
+	if !errors.Is(err, router.ErrNoRoute) || len(endpointPlan.Skipped) != 1 || endpointPlan.Skipped[0].Reason != "preflight_endpoint_missing" {
+		t.Fatalf("Build(endpoint required) = %#v, %v", endpointPlan, err)
+	}
+	endpointHealth := readiness.Doctor(endpointCatalog, time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)).Channels[0]
+	if endpointHealth.Readiness != readiness.StateNotConfigured {
+		t.Fatalf("Doctor(endpoint required) = %#v", endpointHealth)
+	}
+
+	optionalAuthTemplate := core.RouteTemplate{RouteTemplateID: "optional-auth", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "provider", Capabilities: []string{"latest"}}
+	blankCredentialValue := "  "
+	optionalAuthCatalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{optionalAuthTemplate}, []core.Channel{
+			{ID: "stale-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "missing", Enabled: true},
+			{ID: "disabled-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "disabled", Enabled: true},
+			{ID: "empty-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "empty", Enabled: true},
+			{ID: "blank-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "blank", Enabled: true},
+		}, nil, []core.Credential{
+			{ID: "disabled", Provider: "provider", AuthKind: "api_key", Enabled: false},
+			{ID: "empty", Provider: "provider", AuthKind: "api_key", Enabled: true},
+			{ID: "blank", Provider: "provider", AuthKind: "api_key", Value: &blankCredentialValue, Enabled: true},
+		}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	optionalPlan, err := router.Build(optionalAuthCatalog, operation)
+	if !errors.Is(err, router.ErrNoRoute) || len(optionalPlan.Skipped) != 4 || optionalPlan.Skipped[0].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[1].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[2].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[3].Reason != "preflight_credential_missing" {
+		t.Fatalf("Build(optional auth stale credential) = %#v, %v", optionalPlan, err)
+	}
 }
 
 func TestStage2DirectFeedRegistryContracts(t *testing.T) {
@@ -409,6 +449,18 @@ func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 type fakeFeedExecutor struct {
 	results map[string]core.AdapterResult
 	calls   []string
+}
+
+type fakeRSSHubExecutor struct {
+	results  map[string]core.AdapterResult
+	calls    []string
+	requests []adapter.RSSHubRequest
+}
+
+func (executor *fakeRSSHubExecutor) Execute(_ context.Context, request adapter.RSSHubRequest) core.AdapterResult {
+	executor.calls = append(executor.calls, request.Channel.ID)
+	executor.requests = append(executor.requests, request)
+	return executor.results[request.Channel.ID]
 }
 
 func (executor *fakeFeedExecutor) Execute(_ context.Context, request adapter.FeedRequest) core.AdapterResult {
@@ -725,6 +777,75 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 }
 
+func TestStage3RSSHubQueryAndFallbackContracts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 14, 14, 0, 0, 0, time.UTC)
+	directTemplate := core.RouteTemplate{
+		RouteTemplateID: "direct", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"v2ex"}},
+		Provider: "direct-feed", Adapter: "feed", Capabilities: []string{"latest"},
+	}
+	rssHubTemplate := core.RouteTemplate{
+		RouteTemplateID: "rsshub", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"v2ex"}},
+		Provider: "rsshub", Adapter: "rsshub", Capabilities: []string{"latest"}, EndpointRequired: true,
+		Auth: core.AuthDescriptor{Kind: "api_key"},
+	}
+	channels := []core.Channel{
+		{ID: "rsshub", Source: "v2ex", RouteTemplateID: "rsshub", EndpointProfileID: "endpoint", Parameters: map[string]any{"path": "/v2ex/topics/latest"}, Priority: 200, FallbackChannelIDs: []string{"direct"}, Enabled: true},
+		{ID: "direct", Source: "v2ex", RouteTemplateID: "direct", Priority: 100, Enabled: true},
+	}
+	catalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "v2ex", Enabled: true}},
+		[]core.Provider{{ID: "direct-feed", Capabilities: []string{"latest"}, Enabled: true}, {ID: "rsshub", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{directTemplate, rssHubTemplate}, channels,
+		[]core.EndpointProfile{{ID: "endpoint", Provider: "rsshub", BaseURL: "https://rsshub.example", Enabled: true}}, nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamID := "direct-item"
+	feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{"direct": successfulFeedResult(core.Item{
+		Title: "Direct fallback", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}},
+	})}}
+	rssHub := &fakeRSSHubExecutor{results: map[string]core.AdapterResult{"rsshub": {
+		Errors: []core.Error{{Code: core.ErrorNetwork, Message: "RSSHub unavailable", Retryable: true}},
+	}}}
+	operation := stage2Operation(core.OperationLatest, []string{"rsshub", "direct"}, 10)
+	operation.RoutePolicy.AllowFallback = true
+	envelope, err := (queryservice.Service{Feed: feed, RSSHub: rssHub, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rssHub.calls, []string{"rsshub"}) || !slices.Equal(feed.calls, []string{"direct"}) {
+		t.Fatalf("adapter calls RSSHub/Direct = %v/%v", rssHub.calls, feed.calls)
+	}
+	if envelope.Status != core.StatusPartial || !slices.Equal(envelope.SelectedChannelIDs, []string{"rsshub", "direct"}) || len(envelope.Items) != 1 {
+		t.Fatalf("RSSHub fallback envelope = %#v", envelope)
+	}
+	if len(envelope.Executions) != 2 || envelope.Executions[0].Provider != "rsshub" || envelope.Executions[0].Status != core.ExecutionFailed || envelope.Executions[1].Selection != core.SelectionFallback || envelope.Executions[1].Status != core.ExecutionCompleted {
+		t.Fatalf("RSSHub fallback executions = %#v", envelope.Executions)
+	}
+
+	// A successful RSSHub execution receives the resolved Endpoint, and Query
+	// overwrites untrusted Adapter provenance with the selected route facts.
+	rssID := "rsshub-item"
+	rssHub.results["rsshub"] = successfulFeedResult(core.Item{
+		Title: "RSSHub", Observations: []core.Observation{{
+			Endpoint: "https://rsshub.example/v2ex/topics/latest", UpstreamID: &rssID, Verification: core.VerificationMetadata,
+		}},
+	})
+	onlyRSSHub := stage2Operation(core.OperationLatest, []string{"rsshub"}, 10)
+	envelope, err = (queryservice.Service{Feed: feed, RSSHub: rssHub, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, onlyRSSHub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Status != core.StatusComplete || len(envelope.Items) != 1 || envelope.Items[0].Observations[0].Provider != "rsshub" || envelope.Items[0].Observations[0].Endpoint != "endpoint" {
+		t.Fatalf("RSSHub success envelope = %#v", envelope)
+	}
+	lastRequest := rssHub.requests[len(rssHub.requests)-1]
+	if lastRequest.Endpoint.ID != "endpoint" || lastRequest.Credential != nil {
+		t.Fatalf("resolved RSSHub request = %#v", lastRequest)
+	}
+}
+
 func stage2ManagementService(t *testing.T) (management.Service, *sqlitestore.Store) {
 	t.Helper()
 	store, err := sqlitestore.Open(context.Background(), ":memory:")
@@ -796,6 +917,91 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		disabled, err := service.DisableChannel(ctx, updated.ID, updated.Revision)
 		if err != nil || disabled.Enabled || disabled.Revision != 3 {
 			t.Fatalf("DisableChannel() = %#v, %v", disabled, err)
+		}
+	})
+
+	t.Run("RSSHub endpoint and channel use Catalog CAS without Direct Feed or OPML semantics", func(t *testing.T) {
+		service, store := stage2ManagementService(t)
+		if _, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
+			ID: "rsshub-secret", BaseURL: "https://rsshub.example.com/?access_key=must-not-echo", Trust: "remote",
+		}); err == nil || strings.Contains(err.Error(), "must-not-echo") {
+			t.Fatalf("ApplyEndpointProfile(secret URL) error = %v", err)
+		}
+		endpoint, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
+			ID: "rsshub-remote", BaseURL: "HTTPS://RSSHub.Example.com:443", Trust: "remote",
+		})
+		if err != nil || endpoint.Provider != "rsshub" || endpoint.BaseURL != "https://rsshub.example.com" || endpoint.Revision != 1 {
+			t.Fatalf("ApplyEndpointProfile(create) = %#v, %v", endpoint, err)
+		}
+		if _, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
+			ID: endpoint.ID, BaseURL: endpoint.BaseURL, Trust: endpoint.Trust, ExpectedRevision: 0,
+		}); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("ApplyEndpointProfile(stale) error = %v, want ErrConflict", err)
+		}
+		endpoint, err = service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
+			ID: endpoint.ID, BaseURL: endpoint.BaseURL, Trust: "remote_configured", ExpectedRevision: endpoint.Revision,
+		})
+		if err != nil || endpoint.Revision != 2 || endpoint.Trust != "remote_configured" {
+			t.Fatalf("ApplyEndpointProfile(update) = %#v, %v", endpoint, err)
+		}
+
+		fallback, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "v2ex", ChannelID: "channel_v2ex_direct", URL: "https://www.v2ex.com/index.xml", Priority: 100,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing, err := store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing.Collections = append(routing.Collections, core.Collection{ID: "daily", Enabled: true, Revision: 1})
+		if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: routing.Revision, Catalog: routing}); err != nil {
+			t.Fatal(err)
+		}
+		credential, err := service.ApplyCredential(ctx, management.ApplyCredentialInput{
+			ID: "cred_rsshub", Provider: "rsshub", AuthKind: "api_key", Value: "not-a-real-key", Enabled: true,
+		})
+		if err != nil || credential.HasValue == false || strings.Contains(credential.ValueMasked, "not-a-real") {
+			t.Fatalf("ApplyCredential(create) = %#v, %v", credential, err)
+		}
+		credentials, err := service.ListCredentialSummaries(ctx)
+		if err != nil || len(credentials) != 1 || credentials[0].ID != credential.ID || strings.Contains(credentials[0].ValueMasked, "not-a-real") {
+			t.Fatalf("ListCredentialSummaries() = %#v, %v", credentials, err)
+		}
+		if _, err := service.ApplyRSSHubChannel(ctx, management.ApplyRSSHubChannelInput{
+			ID: "channel_v2ex_rsshub", SourceID: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: endpoint.ID,
+			Parameters: map[string]any{"path": "/v2ex/topics/latest", "access_key": "must-not-echo"}, Enabled: true,
+		}); err == nil || strings.Contains(err.Error(), "must-not-echo") {
+			t.Fatalf("ApplyRSSHubChannel(secret parameter) error = %v", err)
+		}
+		if _, err := service.ApplyRSSHubChannel(ctx, management.ApplyRSSHubChannelInput{
+			ID: "channel_v2ex_rsshub", SourceID: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: endpoint.ID,
+			Parameters: map[string]any{"path": "/v2ex/topics/latest", "limit": float64(101)}, Enabled: true,
+		}); !errors.Is(err, management.ErrInvalidRSSHub) {
+			t.Fatalf("ApplyRSSHubChannel(out-of-range parameter) error = %v, want ErrInvalidRSSHub", err)
+		}
+		channel, err := service.ApplyRSSHubChannel(ctx, management.ApplyRSSHubChannelInput{
+			ID: "channel_v2ex_rsshub", SourceID: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: endpoint.ID,
+			CredentialID: "cred_rsshub", Parameters: map[string]any{"path": "/v2ex/topics/latest", "limit": float64(50)},
+			Priority: 50, FallbackChannelIDs: []string{fallback.ID}, CollectionIDs: []string{"daily"}, Enabled: true,
+		})
+		if err != nil || channel.Revision != 1 || channel.EndpointProfileID != endpoint.ID || channel.CredentialID != "cred_rsshub" {
+			t.Fatalf("ApplyRSSHubChannel(create) = %#v, %v", channel, err)
+		}
+		if _, err := service.ApplyRSSHubChannel(ctx, management.ApplyRSSHubChannelInput{
+			ID: channel.ID, SourceID: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: endpoint.ID,
+			Parameters: map[string]any{"path": "/v2ex/topics/latest"}, Enabled: true,
+		}); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("ApplyRSSHubChannel(stale) error = %v, want ErrConflict", err)
+		}
+		disabled, err := service.DisableEndpointProfile(ctx, endpoint.ID, endpoint.Revision)
+		if err != nil || disabled.Enabled || disabled.Revision != 3 {
+			t.Fatalf("DisableEndpointProfile() = %#v, %v", disabled, err)
+		}
+		stored, err := store.LoadRoutingCatalog(ctx)
+		if err != nil || !slices.Equal(stored.Collections[0].ChannelIDs, []string{channel.ID}) || stored.Channels[1].RouteTemplateID == management.DirectFeedRouteTemplateID {
+			t.Fatalf("stored RSSHub configuration = %#v, %v", stored, err)
 		}
 	})
 

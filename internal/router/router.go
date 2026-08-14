@@ -199,6 +199,9 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 	if template.Origin == "imported" && template.Auth.Kind == "browser_cookie" && !catalog.TemplateTrusted(template.RouteTemplateID) {
 		return "preflight_template_untrusted"
 	}
+	if template.EndpointRequired && channel.EndpointProfileID == "" {
+		return "preflight_endpoint_missing"
+	}
 	if channel.EndpointProfileID != "" {
 		endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
 		if !ok {
@@ -208,12 +211,18 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 			return "preflight_endpoint_disabled"
 		}
 	}
-	if template.Auth.Required {
+	if template.Auth.Required && channel.CredentialID == "" {
+		return "preflight_credential_missing"
+	}
+	// Optional auth means the Channel may omit a Credential. Once it explicitly
+	// references one, the same existence/value checks still apply; a stale or
+	// disabled reference must not be silently treated as anonymous execution.
+	if channel.CredentialID != "" {
 		credential, ok := catalog.Credential(channel.CredentialID)
 		if !ok {
 			return "preflight_credential_missing"
 		}
-		if !credential.Enabled || (credential.AuthKind != "chrome_cookie" && credential.Value == nil) {
+		if !credential.Enabled || (credential.AuthKind != "chrome_cookie" && (credential.Value == nil || strings.TrimSpace(*credential.Value) == "")) {
 			return "preflight_credential_unresolved"
 		}
 	}

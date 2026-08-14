@@ -309,6 +309,8 @@ type FeedAdapter struct {
 	Cache            FeedCache
 	Now              func() time.Time
 	MaxResponseBytes int64
+	rssHubCredential *rssHubCredentialPolicy
+	rssHubProxy      func(*http.Request) (*url.URL, error)
 }
 
 func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) core.AdapterResult {
@@ -352,7 +354,7 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) cor
 		}
 		if cacheFound {
 			cachedURL, cacheURLErr := NormalizeFeedURL(cached.EffectiveURL)
-			if cacheURLErr != nil || len(cached.Body) == 0 || int64(len(cached.Body)) > adapter.maxResponseBytes() {
+			if cacheURLErr != nil || len(cached.Body) == 0 || int64(len(cached.Body)) > adapter.maxResponseBytes() || adapter.rssHubCredential != nil && adapter.rssHubCredential.cacheEntryContainsSensitive(cachedURL, cached) {
 				adapter.discardCache(ctx, cacheKey)
 				cacheFound = false
 			} else {
@@ -386,6 +388,11 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) cor
 	if failure != nil {
 		return feedFailureResult(request, result, failure.Code, failure.Message, failure.Retryable, failure.RetryAfterMS, failure.Details)
 	}
+	result.ProviderState["http_status"] = strconv.Itoa(response.Status)
+	if contentType := response.Header.Get("Content-Type"); contentType != "" {
+		mediaType, _, _ := mime.ParseMediaType(contentType)
+		result.ProviderState["content_type"] = mediaType
+	}
 
 	var body []byte
 	var effectiveURL string
@@ -406,6 +413,9 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) cor
 		// HTML discovery 只跟随一个明确的 alternate Feed。alternate 自身若仍是
 		// HTML，会以 protocol_error 终止，避免无界页面发现链。
 		if responseIsHTML(responseHeader, body) {
+			if adapter.rssHubCredential != nil {
+				return feedFailureResult(request, result, core.ErrorProtocol, "credentialed RSSHub responses cannot use HTML feed discovery", false, nil, nil)
+			}
 			alternate, discoveryErr := discoverAlternateFeed(body, effectiveURL)
 			if discoveryErr != nil {
 				return feedFailureResult(request, result, core.ErrorProtocol, "upstream HTML does not expose a valid alternate feed", false, nil, nil)
@@ -468,6 +478,7 @@ type feedHTTPResponse struct {
 	Header       http.Header
 	EffectiveURL string
 	NotModified  bool
+	Status       int
 }
 
 type feedRequestFailure struct {
@@ -501,6 +512,9 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
+		if errors.Is(err, errRSSHubExplicitEgressRequired) {
+			return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorConfig, Message: "credentialed RSSHub request requires an explicit egress profile"}
+		}
 		if errors.Is(err, ErrInvalidFeedURL) {
 			return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "upstream redirect selected an invalid feed URL"}
 		}
@@ -511,12 +525,25 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorNetwork, Message: "request upstream feed", Retryable: true}
 	}
 	defer response.Body.Close()
-	effectiveURL, normalizeErr := NormalizeFeedURL(response.Request.URL.String())
+	if adapter.rssHubCredential != nil && adapter.rssHubCredential.containsSensitiveHeaders(response.Header) {
+		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "RSSHub response exposed access material"}
+	}
+	var effectiveURL string
+	var normalizeErr error
+	if adapter.rssHubCredential != nil {
+		var cleanURL *url.URL
+		cleanURL, normalizeErr = adapter.rssHubCredential.cleanURL(response.Request.URL)
+		if normalizeErr == nil {
+			effectiveURL = cleanURL.String()
+		}
+	} else {
+		effectiveURL, normalizeErr = NormalizeFeedURL(response.Request.URL.String())
+	}
 	if normalizeErr != nil {
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "upstream response has an invalid effective URL"}
 	}
 	if response.StatusCode == http.StatusNotModified {
-		return feedHTTPResponse{Header: response.Header.Clone(), EffectiveURL: effectiveURL, NotModified: true}, nil
+		return feedHTTPResponse{Header: response.Header.Clone(), EffectiveURL: effectiveURL, NotModified: true, Status: response.StatusCode}, nil
 	}
 	if response.StatusCode != http.StatusOK {
 		code, retryable := core.ErrorProtocol, false
@@ -553,7 +580,10 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 		}
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorNetwork, Message: "read upstream feed response", Retryable: true}
 	}
-	return feedHTTPResponse{Body: body, Header: response.Header.Clone(), EffectiveURL: effectiveURL}, nil
+	if adapter.rssHubCredential != nil && adapter.rssHubCredential.containsSensitive(string(body)) {
+		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "RSSHub response exposed access material"}
+	}
+	return feedHTTPResponse{Body: body, Header: response.Header.Clone(), EffectiveURL: effectiveURL, Status: response.StatusCode}, nil
 }
 
 func (adapter FeedAdapter) httpClient() *http.Client {
@@ -562,8 +592,30 @@ func (adapter FeedAdapter) httpClient() *http.Client {
 		base = http.DefaultClient
 	}
 	client := *base
+	if adapter.rssHubCredential != nil {
+		client.Jar = nil
+		if client.Transport != nil {
+			// 调用方注入的 transport 可能自定义 dial/TLS/protocol 出口。Stage 3
+			// 无 EgressProfile 时无法证明其边界，因此不把 Credential 交给它。
+			client.Transport = rssHubCredentialTransportRejected{}
+		} else {
+			proxy := adapter.rssHubProxy
+			if proxy == nil {
+				proxy = http.ProxyFromEnvironment
+			}
+			client.Transport = restrictedRSSHubTransport(proxy, adapter.rssHubCredential)
+		}
+	}
 	originalCheck := client.CheckRedirect
 	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if adapter.rssHubCredential != nil {
+			cleanURL, err := adapter.rssHubCredential.cleanURL(request.URL)
+			if err != nil {
+				return err
+			}
+			request.URL = cleanURL
+			clearRSSHubRestrictedHeaders(request.Header)
+		}
 		if _, err := NormalizeFeedURL(request.URL.String()); err != nil {
 			return err
 		}

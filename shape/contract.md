@@ -430,6 +430,10 @@ Direct Feed URL、RSSHub path/parameters、Endpoint、Credential、priority/fall
 
 Direct Feed URL、Source canonical URL、Feed metadata URL 与 Endpoint base URL 只接受无 userinfo 的绝对 HTTP(S) URL；credential-like query/fragment key 必须在持久化或请求前拒绝。Direct Feed Channel 不使用 EndpointProfile/Credential，更新或 OPML 回导不得继承这两个字段；fallback 可以保留给后续 Direct Feed→RSSHub 路线。
 
+RSSHub `api_key` Credential 不复制到 Channel 或 Endpoint。执行时按实际 outbound URL 的 pathname 计算 `code=md5(pathname+accessKey)`；pathname 包含 Endpoint base path 且不含 query。同 origin 且仍位于分段 Endpoint base-path 内的 redirect 必须删除旧 `key/code` 并按新 pathname 重算；跨 origin、越 base path、编码 traversal、double slash 或认证 Feed 的 HTML alternate discovery在下一跳发网前失败。
+
+Stage 3 尚无 EgressProfile。认证链只使用 OmniHub 自建的受信任 transport，绝不继承外部注入的 `http.Transport`，包括自定义 DialContext/DialTLS、TLS 与 protocol 设置；任何外部 transport 都在发网前返回 `config_error`。proxy resolver 在签名前只接收已清除 `key/code` 与受限 headers 的 clean request clone；解析为 proxy 时，Endpoint 与 proxy 均不得收到网络请求。只有确认不命中 proxy 后，才向真实网络请求注入 code 并直连。原 key 与派生 code 不得进入 proxy resolver、配置、cache key/value、ProviderState、日志、Error、Envelope 或 Probe。只有带 code 的 RoundTrip 返回 response 时，Execution 才记录 `auth.used=true`；无 response 或 cache hit 均记录 `false`。独立 Endpoint Probe 不绑定 Credential，Channel Probe 使用 Channel Credential 检查 health、Route metadata 与实际 Feed；cache 按 Endpoint/Credential revision 分区。
+
 配置来源分为 `builtin | imported | user`：builtin RouteTemplate 只读，用户通过 Channel/overlay 个性化；imported 资源需审核后启用。远程查询结果不得指定 executable、login URL 或 Cookie scope。
 
 ### 7.5 Channel Health
@@ -457,6 +461,52 @@ Direct Feed URL、Source canonical URL、Feed metadata URL 与 Endpoint base URL
 ```
 
 `desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | degraded`。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
+
+### 7.6 EgressProfile 与主动 Probe（Stage 4 合同）
+
+Stage 4 新增独立资源；下列合同不表示 Stage 3 已经支持代理：
+
+```yaml
+apiVersion: omnihub.dev/v1alpha1
+kind: EgressProfile
+metadata:
+  id: egress_corp_socks
+  revision: 2
+spec:
+  mode: socks5 # environment | direct | http_proxy | socks5
+  proxyEndpoint: socks5://127.0.0.1:1080 # 禁止 userinfo
+  proxyCredential: cred_corp_proxy
+  socks5Dns: proxy # local | proxy；只适用于 socks5
+  enabled: true
+```
+
+- `environment` 显式采用当前进程受支持的 proxy environment/NO_PROXY 决策；`direct` 显式禁止代理；`http_proxy` 与 `socks5` 只使用资源中声明的地址。任何模式都不得隐式 fallback 到另一模式、公共 DoH、公共代理或关闭 TLS。
+- 代理 Credential 由 EgressProfile 引用，不出现在 `proxyEndpoint`。资源列表、日志、Error、Probe、readiness 与 Execution 不返回密码或完整 proxy URL。
+- Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID，不得内嵌 proxy 配置或任意 proxy URL。Egress 究竟固定绑定在哪一层，以及 Endpoint/Channel default/override 与 Operation/Probe allowlist 的 precedence，仍是 Stage 4 Owner decision，当前合同不提前冻结。
+- Probe、readiness 与 Execution 以 Endpoint×Egress 为事实键。普通输出只可携带 `egress.profile_id`、`egress.mode` 与 `egress.proxied`；无 Endpoint 时使用目标连接 ID 与 Egress 形成等价键。
+- 新建出站配置必须显式引用 profile ID。已有 Endpoint/Channel 的迁移在 breaking fail-closed 后人工补 profile 与 migration 生成并显式绑定 profile 之间保持未决；任何方案都不能暗中选择 direct/environment。
+
+显式 Channel Probe 的分层结果冻结 observation 与 Egress/subject 关联，不把代理路径伪装成 target 直连。以下示例表达 HTTP CONNECT，不承诺所有平台的额外诊断字段：
+
+```json
+{
+  "endpoint_id": "rsshub-remote",
+  "egress": {"profile_id": "egress_corp_http", "mode": "http_proxy", "proxied": true},
+  "observations": [
+    {"layer": "dns", "subject": "target", "status": "not_run", "duration_ms": 0, "reason": "delegated_to_egress", "retryable": false},
+    {"layer": "dns", "subject": "proxy", "status": "passed", "duration_ms": 8, "reason": null, "retryable": false},
+    {"layer": "tcp", "subject": "proxy", "status": "passed", "duration_ms": 21, "reason": null, "retryable": false},
+    {"layer": "proxy_connect", "subject": "target", "status": "passed", "duration_ms": 12, "reason": null, "retryable": false},
+    {"layer": "tls", "subject": "target", "status": "passed", "duration_ms": 34, "reason": null, "retryable": false},
+    {"layer": "http", "subject": "target", "status": "passed", "duration_ms": 42, "reason": null, "retryable": false},
+    {"layer": "feed_parse", "subject": "target", "status": "passed", "duration_ms": 3, "reason": null, "retryable": false}
+  ]
+}
+```
+
+`layer` 至少覆盖 `dns | tcp | proxy_connect | tls | http | feed_parse`，`subject` 区分 `target | proxy`；每层 `status` 为 `passed | degraded | failed | not_run`。`reason` 必须是可行动的脱敏原因，`retryable` 表示同一配置下重试是否可能恢复。Direct 才观察 target DNS/TCP；HTTP CONNECT 先观察 proxy DNS/TCP 与 CONNECT，再观察 tunnel 内 target TLS/HTTP/Feed。SOCKS5 local DNS 可观察本地 target DNS；proxy DNS 必须把 target DNS 标为 `not_run/delegated_to_egress`，不得输出伪造的 resolved IP。任一实际前置层失败时，依赖它的下游层统一为 `not_run`。普通 Query 使用相同的已解析 transport 与错误分类，但不自动运行完整分层 Probe。真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不在本合同中。
+
+当 direct 绑定失败、另一个显式 proxy 绑定成功时，各 Endpoint×Egress 事实独立成立；整体 readiness 映射为 `ready(dependent)` 还是 `degraded` 仍是 Owner decision，当前合同不预设答案。
 
 ## 8. Provider Binding
 

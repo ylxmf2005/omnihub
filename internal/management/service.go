@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -34,6 +35,8 @@ const (
 
 var (
 	ErrInvalidDirectFeed   = errors.New("invalid direct feed")
+	ErrInvalidRSSHub       = errors.New("invalid RSSHub configuration")
+	ErrRSSHubUnavailable   = errors.New("RSSHub resource unavailable")
 	ErrInvalidOPML         = errors.New("invalid OPML")
 	ErrUnsupportedTemplate = errors.New("unsupported route template")
 )
@@ -43,6 +46,13 @@ var (
 type routingStore interface {
 	LoadRoutingCatalog(context.Context) (core.RoutingCatalog, error)
 	SaveRoutingCatalog(context.Context, repository.SaveRoutingCatalog) (core.RoutingCatalog, error)
+}
+
+type credentialStore interface {
+	CreateCredential(context.Context, core.Credential) (core.Credential, error)
+	UpdateCredential(context.Context, repository.UpdateCredential) (core.Credential, error)
+	GetCredential(context.Context, string) (core.Credential, error)
+	ListCredentials(context.Context) ([]core.Credential, error)
 }
 
 // Service 是 Direct Feed 管理与 OPML 导入导出的唯一写入口。Catalog 只用于
@@ -66,6 +76,322 @@ type ApplyDirectFeedInput struct {
 	Priority           int                `json:"priority"`
 	ExpectedRevision   int64              `json:"expected_revision"`
 	FeedMetadata       *core.FeedMetadata `json:"feed_metadata,omitempty"`
+}
+
+// ApplyEndpointProfileInput 是用户拥有的 RSSHub Endpoint 配置。Credential
+// 归属 Channel，避免 Endpoint 被误解为一个账号或把 access key 写入 URL。
+type ApplyEndpointProfileInput struct {
+	ID               string `json:"id"`
+	BaseURL          string `json:"base_url"`
+	Trust            string `json:"trust"`
+	ExpectedRevision int64  `json:"expected_revision"`
+}
+
+// ApplyRSSHubChannelInput 描述一个用户拥有的 RSSHub Route 实例。Parameters
+// 保留 Route metadata 所需的类型；它们不是未经校验的 URL 拼接片段。
+type ApplyRSSHubChannelInput struct {
+	ID                 string         `json:"id"`
+	DisplayName        string         `json:"display_name,omitempty"`
+	SourceID           string         `json:"source_id"`
+	RouteTemplateID    string         `json:"route_template_id"`
+	EndpointProfileID  string         `json:"endpoint_profile_id"`
+	CredentialID       string         `json:"credential_id,omitempty"`
+	Parameters         map[string]any `json:"parameters"`
+	Priority           int            `json:"priority"`
+	FallbackChannelIDs []string       `json:"fallback_channel_ids,omitempty"`
+	CollectionIDs      []string       `json:"collection_ids,omitempty"`
+	Enabled            bool           `json:"enabled"`
+	ExpectedRevision   int64          `json:"expected_revision"`
+}
+
+// ApplyCredentialInput 是 Stage 3 RSSHub access key 的最窄本机管理输入。
+// 仅服务 API key，不建立通用 secret API 或 value detail 回显路径。
+type ApplyCredentialInput struct {
+	ID               string `json:"id"`
+	Provider         string `json:"provider"`
+	AuthKind         string `json:"auth_kind"`
+	Label            string `json:"label,omitempty"`
+	Value            string `json:"value"`
+	Enabled          bool   `json:"enabled"`
+	ExpectedRevision int64  `json:"expected_revision"`
+}
+
+// ApplyCredential 创建或更新 RSSHub API key，并始终只返回可安全展示的摘要。
+func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentialInput) (core.CredentialSummary, error) {
+	store, err := service.credentialStore()
+	if err != nil {
+		return core.CredentialSummary{}, err
+	}
+	if input.ExpectedRevision < 0 || strings.TrimSpace(input.Provider) != "rsshub" || strings.TrimSpace(input.AuthKind) != "api_key" || strings.TrimSpace(input.Value) == "" {
+		return core.CredentialSummary{}, fmt.Errorf("%w: RSSHub API key input is invalid", ErrInvalidRSSHub)
+	}
+	id := strings.TrimSpace(input.ID)
+	if err := validateResourceID(id); err != nil {
+		return core.CredentialSummary{}, fmt.Errorf("%w: credential id: %v", ErrInvalidRSSHub, err)
+	}
+	now := time.Now().UTC()
+	var credential core.Credential
+	if input.ExpectedRevision == 0 {
+		value := input.Value
+		credential, err = store.CreateCredential(ctx, core.Credential{ID: id, Provider: "rsshub", AuthKind: "api_key", Label: strings.TrimSpace(input.Label), Value: &value, Enabled: input.Enabled, CreatedAt: now, UpdatedAt: now})
+	} else {
+		existing, getErr := store.GetCredential(ctx, id)
+		if getErr != nil {
+			return core.CredentialSummary{}, fmt.Errorf("update RSSHub credential: %w", getErr)
+		}
+		if existing.Provider != "rsshub" || existing.AuthKind != "api_key" {
+			return core.CredentialSummary{}, fmt.Errorf("%w: credential is not an RSSHub API key", ErrInvalidRSSHub)
+		}
+		if label := strings.TrimSpace(input.Label); label != "" && label != existing.Label {
+			return core.CredentialSummary{}, fmt.Errorf("%w: credential label updates are not supported", ErrInvalidRSSHub)
+		}
+		if existing.Revision != input.ExpectedRevision {
+			return core.CredentialSummary{}, fmt.Errorf("%w: credential %s revision is %d, expected %d", repository.ErrConflict, id, existing.Revision, input.ExpectedRevision)
+		}
+		value := input.Value
+		credential, err = store.UpdateCredential(ctx, repository.UpdateCredential{ID: id, ExpectedRevision: input.ExpectedRevision, Value: &value, Enabled: input.Enabled, UpdatedAt: now})
+	}
+	if err != nil {
+		return core.CredentialSummary{}, fmt.Errorf("save RSSHub credential: %w", err)
+	}
+	return summarizeCredential(credential), nil
+}
+
+// ListCredentialSummaries 返回 RSSHub Credential 的掩码摘要。它不提供任何
+// include-value 分支，避免 Stage 3 管理面意外扩大为 secret read API。
+func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.CredentialSummary, error) {
+	store, err := service.credentialStore()
+	if err != nil {
+		return nil, err
+	}
+	credentials, err := store.ListCredentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list RSSHub credentials: %w", err)
+	}
+	result := make([]core.CredentialSummary, 0, len(credentials))
+	for _, credential := range credentials {
+		if credential.Provider == "rsshub" && credential.AuthKind == "api_key" {
+			result = append(result, summarizeCredential(credential))
+		}
+	}
+	return result, nil
+}
+
+// ApplyEndpointProfile 创建或更新 RSSHub Endpoint。更新与禁用均使用资源
+// revision，再以完整 Catalog revision 完成最终 CAS。
+func (service Service) ApplyEndpointProfile(ctx context.Context, input ApplyEndpointProfileInput) (core.EndpointProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return core.EndpointProfile{}, err
+	}
+	if input.ExpectedRevision < 0 {
+		return core.EndpointProfile{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidRSSHub)
+	}
+	id := strings.TrimSpace(input.ID)
+	if err := validateResourceID(id); err != nil {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint id: %v", ErrInvalidRSSHub, err)
+	}
+	parsedInput, parseErr := url.Parse(strings.TrimSpace(input.BaseURL))
+	if parseErr != nil || parsedInput.RawQuery != "" || parsedInput.Fragment != "" {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint base URL must not contain query or fragment", ErrInvalidRSSHub)
+	}
+	baseURL, _, err := normalizeHTTPURL(input.BaseURL)
+	if err != nil {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint base URL is invalid", ErrInvalidRSSHub)
+	}
+	trust := strings.TrimSpace(input.Trust)
+	if trust == "" {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint trust is required", ErrInvalidRSSHub)
+	}
+
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.EndpointProfile{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	endpointIndex := indexEndpoints(working.Endpoints)
+	index, exists := endpointIndex[id]
+	if exists && working.Endpoints[index].Provider != "rsshub" {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s is not RSSHub", ErrInvalidRSSHub, id)
+	}
+	if exists && working.Endpoints[index].Revision != input.ExpectedRevision {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s revision is %d, expected %d", repository.ErrConflict, id, working.Endpoints[index].Revision, input.ExpectedRevision)
+	}
+	if !exists && input.ExpectedRevision != 0 {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s does not exist at revision %d", repository.ErrConflict, id, input.ExpectedRevision)
+	}
+
+	endpoint := core.EndpointProfile{ID: id, Provider: "rsshub", BaseURL: baseURL, Trust: trust, Enabled: true}
+	if exists {
+		endpoint.Revision = working.Endpoints[index].Revision + 1
+		working.Endpoints[index] = endpoint
+	} else {
+		endpoint.Revision = 1
+		working.Endpoints = append(working.Endpoints, endpoint)
+	}
+	sortRoutingResources(&working)
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.EndpointProfile{}, err
+	}
+	for _, value := range saved.Endpoints {
+		if value.ID == id {
+			return value, nil
+		}
+	}
+	return core.EndpointProfile{}, fmt.Errorf("save routing catalog: endpoint %s missing from saved snapshot", id)
+}
+
+// DisableEndpointProfile 只切换 Endpoint desired state；依赖 Channel 保持原有
+// 配置，后续 readiness 如实表达 endpoint 不可用，不能在这里伪造 probe 记录。
+func (service Service) DisableEndpointProfile(ctx context.Context, id string, expectedRevision int64) (core.EndpointProfile, error) {
+	if err := service.requireStore(); err != nil {
+		return core.EndpointProfile{}, err
+	}
+	id = strings.TrimSpace(id)
+	if err := validateResourceID(id); err != nil || expectedRevision < 1 {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint id or expected revision is invalid", ErrInvalidRSSHub)
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.EndpointProfile{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	index, exists := indexEndpoints(working.Endpoints)[id]
+	if !exists {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s", repository.ErrNotFound, id)
+	}
+	endpoint := working.Endpoints[index]
+	if endpoint.Provider != "rsshub" {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s is not RSSHub", ErrInvalidRSSHub, id)
+	}
+	if endpoint.Revision != expectedRevision {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s revision is %d, expected %d", repository.ErrConflict, id, endpoint.Revision, expectedRevision)
+	}
+	endpoint.Enabled = false
+	endpoint.Revision++
+	working.Endpoints[index] = endpoint
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.EndpointProfile{}, err
+	}
+	for _, value := range saved.Endpoints {
+		if value.ID == id {
+			return value, nil
+		}
+	}
+	return core.EndpointProfile{}, fmt.Errorf("save routing catalog: endpoint %s missing from saved snapshot", id)
+}
+
+// ApplyRSSHubChannel 创建或更新 RSSHub Channel。它刻意不共用 Direct Feed
+// 的 URL/OPML 语义，RSSHub path 与参数始终由可信模板和 Endpoint 决定。
+func (service Service) ApplyRSSHubChannel(ctx context.Context, input ApplyRSSHubChannelInput) (core.Channel, error) {
+	if err := service.requireStore(); err != nil {
+		return core.Channel{}, err
+	}
+	if input.ExpectedRevision < 0 {
+		return core.Channel{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidRSSHub)
+	}
+	channelID := strings.TrimSpace(input.ID)
+	if err := validateResourceID(channelID); err != nil {
+		return core.Channel{}, fmt.Errorf("%w: channel id: %v", ErrInvalidRSSHub, err)
+	}
+	template, err := service.rssHubTemplate(input.RouteTemplateID)
+	if err != nil {
+		return core.Channel{}, err
+	}
+	sourceID := strings.TrimSpace(input.SourceID)
+	if err := validateResourceID(sourceID); err != nil || !templateAcceptsSource(template, sourceID) {
+		return core.Channel{}, fmt.Errorf("%w: source is not accepted by template", ErrInvalidRSSHub)
+	}
+	parameters, err := normalizeRSSHubParameters(input.Parameters)
+	if err != nil {
+		return core.Channel{}, fmt.Errorf("%w: parameters are invalid", ErrInvalidRSSHub)
+	}
+	if _, ok := parameters["path"].(string); !ok || strings.TrimSpace(parameters["path"].(string)) == "" {
+		return core.Channel{}, fmt.Errorf("%w: path is required", ErrInvalidRSSHub)
+	}
+
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.Channel{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	endpointID := strings.TrimSpace(input.EndpointProfileID)
+	endpointIndex, endpointExists := indexEndpoints(working.Endpoints)[endpointID]
+	if endpointID == "" || !endpointExists {
+		return core.Channel{}, fmt.Errorf("%w: RSSHub endpoint %s", repository.ErrNotFound, endpointID)
+	}
+	if working.Endpoints[endpointIndex].Provider != "rsshub" || !working.Endpoints[endpointIndex].Enabled {
+		return core.Channel{}, fmt.Errorf("%w: RSSHub endpoint is incompatible or disabled", ErrRSSHubUnavailable)
+	}
+	var resolvedCredential *core.Credential
+	if credentialID := strings.TrimSpace(input.CredentialID); credentialID != "" {
+		credentialStore, storeErr := service.credentialStore()
+		if storeErr != nil {
+			return core.Channel{}, storeErr
+		}
+		credential, credentialErr := credentialStore.GetCredential(ctx, credentialID)
+		if credentialErr != nil {
+			if errors.Is(credentialErr, repository.ErrNotFound) {
+				return core.Channel{}, fmt.Errorf("%w: RSSHub credential %s", repository.ErrNotFound, credentialID)
+			}
+			return core.Channel{}, fmt.Errorf("load RSSHub credential: %w", credentialErr)
+		}
+		if credential.Provider != "rsshub" || credential.AuthKind != "api_key" || !credential.Enabled {
+			return core.Channel{}, fmt.Errorf("%w: RSSHub credential is incompatible or disabled", ErrRSSHubUnavailable)
+		}
+		resolvedCredential = &credential
+	}
+	if !service.sourceExists(routing, sourceID) {
+		return core.Channel{}, fmt.Errorf("%w: source %s", repository.ErrNotFound, sourceID)
+	}
+
+	channelIndex := indexChannels(working.Channels)
+	index, exists := channelIndex[channelID]
+	if exists {
+		existing := working.Channels[index]
+		if existing.Revision != input.ExpectedRevision {
+			return core.Channel{}, fmt.Errorf("%w: channel %s revision is %d, expected %d", repository.ErrConflict, channelID, existing.Revision, input.ExpectedRevision)
+		}
+		if _, directErr := service.directFeedTemplate(existing.RouteTemplateID); directErr == nil {
+			return core.Channel{}, fmt.Errorf("%w: existing channel %s is a Direct Feed", ErrUnsupportedTemplate, channelID)
+		}
+		if _, rssHubErr := service.rssHubTemplate(existing.RouteTemplateID); rssHubErr != nil {
+			return core.Channel{}, fmt.Errorf("%w: existing channel %s is not RSSHub", ErrUnsupportedTemplate, channelID)
+		}
+	} else if input.ExpectedRevision != 0 {
+		return core.Channel{}, fmt.Errorf("%w: channel %s does not exist at revision %d", repository.ErrConflict, channelID, input.ExpectedRevision)
+	}
+
+	channel := core.Channel{ID: channelID, DisplayName: strings.TrimSpace(input.DisplayName), Source: sourceID,
+		RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpointID, CredentialID: strings.TrimSpace(input.CredentialID),
+		Parameters: parameters, Priority: input.Priority, FallbackChannelIDs: slices.Clone(input.FallbackChannelIDs), Enabled: input.Enabled}
+	if err := adapter.ValidateRSSHubRequest(adapter.RSSHubRequest{
+		Channel: channel, RouteTemplate: template, Endpoint: working.Endpoints[endpointIndex], Credential: resolvedCredential,
+	}); err != nil {
+		return core.Channel{}, fmt.Errorf("%w: parameters do not match route template", ErrInvalidRSSHub)
+	}
+	if exists {
+		channel.Revision = working.Channels[index].Revision + 1
+		working.Channels[index] = channel
+	} else {
+		channel.Revision = 1
+		working.Channels = append(working.Channels, channel)
+	}
+	if err := setChannelCollections(&working, channelID, input.CollectionIDs); err != nil {
+		return core.Channel{}, err
+	}
+	sortRoutingResources(&working)
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.Channel{}, err
+	}
+	for _, value := range saved.Channels {
+		if value.ID == channelID {
+			return cloneChannel(value), nil
+		}
+	}
+	return core.Channel{}, fmt.Errorf("save routing catalog: channel %s missing from saved snapshot", channelID)
 }
 
 // ImportReportEntry 记录一次实体动作或一个被忽略的输入节点。Reason 不包含
@@ -439,6 +765,156 @@ func (service Service) directFeedTemplate(id string) (core.RouteTemplate, error)
 	return template, nil
 }
 
+func (service Service) rssHubTemplate(id string) (core.RouteTemplate, error) {
+	if service.Catalog == nil {
+		return core.RouteTemplate{}, errors.New("management catalog is required")
+	}
+	templateID := strings.TrimSpace(id)
+	template, ok := service.Catalog.RouteTemplate(templateID)
+	if !ok {
+		return core.RouteTemplate{}, fmt.Errorf("%w: RSSHub route template does not exist", ErrUnsupportedTemplate)
+	}
+	if (template.Origin != "builtin" && template.Origin != "imported") || template.Provider != "rsshub" || template.Adapter != "rsshub" {
+		return core.RouteTemplate{}, fmt.Errorf("%w: route template is not a trusted RSSHub template", ErrUnsupportedTemplate)
+	}
+	if !service.Catalog.TemplateEnabled(template.RouteTemplateID) {
+		return core.RouteTemplate{}, fmt.Errorf("%w: RSSHub route template is disabled", ErrUnsupportedTemplate)
+	}
+	return template, nil
+}
+
+func (service Service) credentialStore() (credentialStore, error) {
+	store, ok := service.Store.(credentialStore)
+	if !ok {
+		return nil, fmt.Errorf("%w: configured store does not support credential operations", ErrInvalidRSSHub)
+	}
+	return store, nil
+}
+
+func summarizeCredential(credential core.Credential) core.CredentialSummary {
+	result := core.CredentialSummary{ID: credential.ID, Provider: credential.Provider, AuthKind: credential.AuthKind, Label: credential.Label, Enabled: credential.Enabled, Revision: credential.Revision}
+	if credential.Value == nil {
+		return result
+	}
+	result.HasValue = true
+	characters := []rune(*credential.Value)
+	if len(characters) <= 4 {
+		result.ValueMasked = "••••"
+		return result
+	}
+	visible := 4
+	result.ValueMasked = "••••" + string(characters[len(characters)-visible:])
+	return result
+}
+
+func (service Service) sourceExists(routing core.RoutingCatalog, id string) bool {
+	if service.Catalog != nil {
+		if source, ok := service.Catalog.Source(id); ok && source.Enabled {
+			return true
+		}
+	}
+	for _, source := range routing.Sources {
+		if source.ID == id && source.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeRSSHubParameters(input map[string]any) (map[string]any, error) {
+	if len(input) == 0 {
+		return nil, errors.New("parameters are required")
+	}
+	result := make(map[string]any, len(input))
+	for key, value := range input {
+		name := strings.TrimSpace(key)
+		if name == "" || core.CredentialLikeURLKey(name) {
+			return nil, errors.New("secret-like parameter is not allowed")
+		}
+		normalized, err := normalizeRSSHubParameter(value)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = normalized
+	}
+	path, ok := result["path"].(string)
+	if !ok || !validRSSHubPath(path) {
+		return nil, errors.New("path must be a route path")
+	}
+	result["path"] = strings.TrimSpace(path)
+	return result, nil
+}
+
+func normalizeRSSHubParameter(value any) (any, error) {
+	switch typed := value.(type) {
+	case nil, bool, string, float64, int, int64:
+		return typed, nil
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			normalized, err := normalizeRSSHubParameter(item)
+			if err != nil {
+				return nil, err
+			}
+			result[index] = normalized
+		}
+		return result, nil
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			name := strings.TrimSpace(key)
+			if name == "" || core.CredentialLikeURLKey(name) {
+				return nil, errors.New("secret-like parameter is not allowed")
+			}
+			normalized, err := normalizeRSSHubParameter(item)
+			if err != nil {
+				return nil, err
+			}
+			result[name] = normalized
+		}
+		return result, nil
+	default:
+		return nil, errors.New("parameter has unsupported type")
+	}
+}
+
+func validRSSHubPath(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	return err == nil && parsed.IsAbs() == false && parsed.Host == "" && strings.HasPrefix(parsed.Path, "/") && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
+}
+
+func setChannelCollections(catalog *core.RoutingCatalog, channelID string, requested []string) error {
+	targets := make(map[string]bool, len(requested))
+	collections := make(map[string]bool, len(catalog.Collections))
+	for _, collection := range catalog.Collections {
+		collections[collection.ID] = true
+	}
+	for _, id := range requested {
+		id = strings.TrimSpace(id)
+		if err := validateResourceID(id); err != nil || !collections[id] || targets[id] {
+			return fmt.Errorf("%w: collection membership is invalid", ErrInvalidRSSHub)
+		}
+		targets[id] = true
+	}
+	for index := range catalog.Collections {
+		collection := catalog.Collections[index]
+		membership := slices.Contains(collection.ChannelIDs, channelID)
+		want := targets[collection.ID]
+		if membership == want {
+			continue
+		}
+		if want {
+			collection.ChannelIDs = append(collection.ChannelIDs, channelID)
+			sort.Strings(collection.ChannelIDs)
+		} else {
+			collection.ChannelIDs = slices.DeleteFunc(collection.ChannelIDs, func(id string) bool { return id == channelID })
+		}
+		collection.Revision++
+		catalog.Collections[index] = collection
+	}
+	return nil
+}
+
 func (service Service) applySource(catalog *core.RoutingCatalog, id, displayName, canonicalURL string, feedURL *url.URL) error {
 	for index, source := range catalog.Sources {
 		if source.ID != id {
@@ -657,6 +1133,14 @@ func indexChannels(channels []core.Channel) map[string]int {
 	return result
 }
 
+func indexEndpoints(endpoints []core.EndpointProfile) map[string]int {
+	result := make(map[string]int, len(endpoints))
+	for index, endpoint := range endpoints {
+		result[endpoint.ID] = index
+	}
+	return result
+}
+
 func cloneRoutingCatalog(value core.RoutingCatalog) core.RoutingCatalog {
 	result := value
 	result.Sources = slices.Clone(value.Sources)
@@ -700,6 +1184,7 @@ func cloneAnyMap(value map[string]any) map[string]any {
 
 func sortRoutingResources(catalog *core.RoutingCatalog) {
 	sort.Slice(catalog.Sources, func(left, right int) bool { return catalog.Sources[left].ID < catalog.Sources[right].ID })
+	sort.Slice(catalog.Endpoints, func(left, right int) bool { return catalog.Endpoints[left].ID < catalog.Endpoints[right].ID })
 	sort.Slice(catalog.Channels, func(left, right int) bool { return catalog.Channels[left].ID < catalog.Channels[right].ID })
 	sort.Slice(catalog.Collections, func(left, right int) bool { return catalog.Collections[left].ID < catalog.Collections[right].ID })
 }

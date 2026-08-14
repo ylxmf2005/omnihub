@@ -30,15 +30,22 @@ const (
 
 var ErrInvalidExecutor = errors.New("invalid query executor")
 
-// FeedExecutor 是 Query Plane 对 Direct Feed 的唯一依赖。具体 Adapter 负责
+// FeedExecutor 是 Query Plane 对 Direct Feed 的窄依赖。具体 Adapter 负责
 // HTTP、缓存和解析；Executor 只编排已选 Channel 并合并规范化结果。
 type FeedExecutor interface {
 	Execute(context.Context, adapter.FeedRequest) core.AdapterResult
 }
 
+// RSSHubExecutor 接收 Router 已解析的 Endpoint 与可选 Credential，避免把
+// access key 或派生认证参数塞回 Channel.Parameters。
+type RSSHubExecutor interface {
+	Execute(context.Context, adapter.RSSHubRequest) core.AdapterResult
+}
+
 type Service struct {
-	Feed FeedExecutor
-	Now  func() time.Time
+	Feed   FeedExecutor
+	RSSHub RSSHubExecutor
+	Now    func() time.Time
 }
 
 // Execute 从同一份 Catalog 和 Operation 构建路由计划，并把所有已选择路径的
@@ -179,7 +186,38 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 
 	execution := baseExecution(decision, run.operation)
 	execution.StartedAt = started.UTC()
-	if decision.RouteTemplate.Adapter != "feed" {
+	var result core.AdapterResult
+	switch decision.RouteTemplate.Adapter {
+	case "feed":
+		if run.service.Feed == nil {
+			return false, fmt.Errorf("%w: feed executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.Feed.Execute(childContext, adapter.FeedRequest{
+			Operation:     run.operation,
+			Channel:       decision.Channel,
+			RouteTemplate: decision.RouteTemplate,
+		})
+	case "rsshub":
+		if run.service.RSSHub == nil {
+			return false, fmt.Errorf("%w: RSSHub executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		endpoint, endpointExists := run.catalog.Endpoint(decision.Channel.EndpointProfileID)
+		if !endpointExists {
+			return false, fmt.Errorf("%w: selected RSSHub channel %s has no resolved endpoint", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		var credential *core.Credential
+		if decision.Channel.CredentialID != "" {
+			resolved, credentialExists := run.catalog.Credential(decision.Channel.CredentialID)
+			if !credentialExists {
+				return false, fmt.Errorf("%w: selected RSSHub channel %s has no resolved credential", ErrInvalidExecutor, decision.Channel.ID)
+			}
+			credential = &resolved
+		}
+		result = run.service.RSSHub.Execute(childContext, adapter.RSSHubRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Credential: credential,
+		})
+	default:
 		reason := "unsupported_adapter"
 		execution.Status = core.ExecutionFailed
 		execution.Reason = &reason
@@ -196,15 +234,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		})
 		return true, nil
 	}
-	if run.service.Feed == nil {
-		return false, fmt.Errorf("%w: feed executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
-	}
-
-	result := run.service.Feed.Execute(childContext, adapter.FeedRequest{
-		Operation:     run.operation,
-		Channel:       decision.Channel,
-		RouteTemplate: decision.RouteTemplate,
-	})
+	execution.Auth.Used = result.ProviderState["auth_used"] == "true"
 	result, normalizeErr := normalizeAdapterResult(result, decision, execution.StartedAt)
 	if normalizeErr != nil {
 		return false, normalizeErr
@@ -234,7 +264,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 	run.problems = append(run.problems, result.Errors...)
 	if len(result.Coverage) == 0 {
 		if len(result.Errors) == 0 {
-			return false, fmt.Errorf("%w: feed channel %s returned neither coverage nor errors", ErrInvalidExecutor, decision.Channel.ID)
+			return false, fmt.Errorf("%w: adapter channel %s returned neither coverage nor errors", ErrInvalidExecutor, decision.Channel.ID)
 		}
 		reason := string(result.Errors[0].Code)
 		execution.Status = core.ExecutionFailed
@@ -281,7 +311,10 @@ func normalizeAdapterResult(result core.AdapterResult, decision router.Decision,
 			observation.Provider = decision.RouteTemplate.Provider
 			observation.ChannelID = decision.Channel.ID
 			observation.RouteTemplateID = decision.RouteTemplate.RouteTemplateID
-			if observation.Endpoint == "" {
+			// Endpoint-backed Channel 的公共 provenance 是用户配置资源 ID，
+			// 不能被 Adapter 的 effective URL 覆盖；Direct Feed 没有资源 ID，
+			// 继续保留实际 Feed URL。
+			if decision.Channel.EndpointProfileID != "" {
 				observation.Endpoint = decision.Channel.EndpointProfileID
 			}
 			if observation.RetrievedAt.IsZero() {

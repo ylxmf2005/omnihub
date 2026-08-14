@@ -24,7 +24,9 @@
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
 - 已确认语义去重边界：Stage 2 只实现可解释的 exact identity dedupe。Embedding Provider（云 API 或本地 Ollama）、向量索引（SQLite/本地 HNSW 或独立向量数据库）、阈值、误合并恢复与模型升级重算必须在后续独立选型中与用户确认；当前不得提前绑定实现。
-- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0/1 已提交并推送。Stage 2 已基于 `main@83577ca85cc02ebed0cb71dfb6c2b9af69c5fe94` 完成 Direct Feed Adapter、Query Service、`latest/search` CLI、文件条件缓存、Direct Feed 管理和 OPML 闭环，并通过 Test/Review。授权不扩大到 Stage 3+ 的 RSSHub/非 Feed Provider、Dashboard 前端或 Chrome Extension 客户端。
+- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0—2 已提交并推送，Stage 3 已完成用户自管 RSSHub Endpoint/Channel、三层 Probe、统一 Query/fallback、管理 CAS 与受限 access-key transport。最新 proxy-fail-closed E2E、全量 test/race/vet、四平台构建、Schema 与 diff check 已通过，独立全链复核 `approve` 且无未解决 P0–P2。NodeSeek 由独立 side 任务处理；Stage 3 授权未扩大到其他 Provider、Cookie、Dashboard 前端或 Chrome Extension 客户端。
+- 已确认后续出站方向：独立 Stage 4 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID，不能传任意 proxy URL；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
+- Stage 4 尚待 Owner 裁决：Egress 固定绑定位置与 Endpoint/Channel default/override/Operation/Probe allowlist precedence；已有 Endpoint/Channel 是 breaking fail-closed 后显式补 profile，还是由 migration 生成并显式绑定某个 profile；以及 direct 失败、显式 proxy 成功时整体 readiness 呈现 `ready(dependent)` 还是 `degraded`。任何选项都不能偷选 direct/environment。
 
 ## Goal
 
@@ -41,6 +43,7 @@
 - 允许用户管理 Direct Feed、RSSHub Channel/参数、Endpoint、Credential、Collection 与 View，而不是只能使用内建来源。
 - 定义 Channel、RouteTemplate、Credential 与 Browser Bridge；支持 Dashboard 录入 API Key、用户授权 Chrome 域权限、打开登录页、按执行读取 Cookie、撤销授权并查看分层健康。
 - 规划 Chrome Companion Extension 与 Native Messaging Host 的后端合同；Extension 客户端实现不属于本后端 Task。
+- 规划显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage 4，不反向进入 Stage 3 验收。
 - 用代表性路线验证抽象：Direct Feed、RSSHub、GitHub、Tavily 与 X，而不是先堆平台数量。
 - 规划可检查的实施阶段和验收证据。
 
@@ -56,6 +59,7 @@
 - v1 只支持 Google Chrome 常规 Profile；不直接解密浏览器 Cookie 数据库，不用 remote debugging/CDP 绕过 Chrome 保护，不默认扫描全部 Profile、域名或 Cookie，不支持 Firefox/Safari/Edge 与 Incognito。
 - v1 不接入系统 Keychain/Secret Service/Credential Manager；API Key/Token 的保护边界就是 loopback 进程、SQLite 文件权限和用户本机账号。Cookie 不持久化，因此 Chrome 未运行时不承诺依赖 Cookie 的后台刷新。
 - Stage 2 不实现 embedding、向量数据库或基于向量的删除式去重；后续能力默认先作为可解释的 similarity grouping 设计，是否删除内容需重新取得用户决定。
+- Stage 3 不实现 EgressProfile、HTTP/SOCKS5 代理或 DNS/TCP/TLS 分层 Probe。后续 Stage 4 也不实现真正的 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
 
 ## Acceptance Evidence
@@ -67,15 +71,16 @@
 - Stage 2 的 RSS/Atom/JSON Feed 与 HTML alternate discovery 必须从真实 CLI 进入统一 Envelope；ETag/Last-Modified 跨进程重验证、业务失败、缓存失败与覆盖窗口分别留证。
 - Direct Feed Channel 必须用 revision CAS 创建/更新/禁用；OPML import 为非破坏性 merge，并能回导标准 Feed metadata、稳定 Source/Channel identity、Collection 层级与 membership，不导出本地执行凭据。
 - Stage 2 只交付 `identity_dedupe=none|exact` 与 `similarity_grouping=off`；embedding API/本地 Ollama、向量索引和阈值在后续独立 Shape/选型前不得进入实现。
+- Stage 3 的受保护 RSSHub fixture 必须证明：匿名 Endpoint Probe 如实返回 auth failure；带 Credential 的 Channel Probe 与 Query 成功；cache hit 不虚报 auth 使用；Credential revision 隔离旧 cache；所有持久化与输出面不出现原 key 或派生 code。
 
 ## Current Artifacts
 
 - `shape/evidence/reference-study.md`：`ready`，参考项目、标准、许可证与来源实测。
-- `shape/requirements.md`：`ready`，产品范围、Channel/Chrome Auth、Dashboard 后端、持久层要求与已确认的承重决策。
-- `shape/contract.md`：`ready`，统一请求/结果、RouteTemplate/Channel、Credential、Chrome Bridge、Run、Dashboard 管理资源与出口映射。
-- `shape/design.md`：`ready`，Query/Subscription 双平面、Repository/SQLite、Channel 管理、Chrome Companion、Dashboard、刷新和安全设计。
-- `plan.md`：`ready`，从合同/Repository spike、Dashboard Backend 到 v1 候选发布的分阶段路线。
-- `dev/implementation.md`：`ready`，Stage 2 Direct Feed、Query/CLI、管理与 OPML 的最终实现账本。
-- `test/test-plan.md`：`ready`，Stage 2 风险模型、真实 CLI/Feed/SQLite 重放与质量闸。
-- `test/test-report.md`：`passed`，真实 CLI/Feed/SQLite/WAL/公开来源、race 与跨平台构建证据已收口。
-- `review/review.md`：`approve`，独立执行/安全审查与合同/CLI/证据审查均无剩余 P0-P2。
+- `shape/requirements.md`：`ready`，产品范围与可观察需求；Stage 4 绑定、迁移与整体 readiness 聚合仍有 Owner decisions。
+- `shape/contract.md`：`ready`，统一请求/结果与资源关系；Stage 4 新字段仅是后续合同，不代表已经实现。
+- `shape/design.md`：`ready`，当前系统回答与独立 Stage 4 出站设计边界。
+- `plan.md`：`completed`，Stage 3 已完成，Stage 4 及以后仍待实施。
+- `dev/implementation.md`：`completed`，Stage 3 受限 credential transport 已实现并通过聚焦反馈。
+- `test/test-plan.md`：`completed`，TC-301—307 与全部质量闸已执行。
+- `test/test-report.md`：`passed`，authenticated/proxy/cache/revision、脱敏 E2E、四平台构建与 Schema 已闭合。
+- `review/review.md`：`approve`，当前 proxy-fail-closed 完整对象无未解决 P0–P2。

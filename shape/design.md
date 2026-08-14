@@ -209,15 +209,28 @@ spec:
 
 - 只连接用户配置的本地/远程实例，不安装、不启动、不选择公共默认实例。
 - Endpoint 只是连接配置；用户还需显式创建 Channel，引用 RSSHub RouteTemplate，填写 path、typed parameters、Credential、priority/fallback 和 Collection。每个人的 RSSHub Channel 集合保存在 user-owned config，不由内建清单替代。
-- key/code 由内部构造；URL、日志、trace 与错误统一脱敏。
+- access key 只从 Channel 引用的 Credential 进入当前执行内存。Adapter 按实际 outbound URL 的 pathname（包含 Endpoint base path，不含 query）计算 `code=md5(pathname+accessKey)`；原 key 与派生 code 都不进入 Channel 参数、cache key/value、ProviderState、日志、trace、Error、Envelope 或 Probe 输出。
+- 认证请求只允许留在用户显式 Endpoint 的同 origin 与分段 base-path 边界内；未越界 redirect 清除旧 `key/code` 后按新 pathname 重算，跨 origin、越界、编码 traversal 或 double slash 在目标发网前失败。认证 Feed 禁止 HTML alternate discovery，避免凭据材料扩散到第二个 URL。
+- Stage 3 尚无 EgressProfile：认证链只构造 OmniHub 自有受信任 transport，不继承外部注入的 `http.Transport` 及其 DialContext/DialTLS、TLS 或 protocol 设置；任何外部 transport 都在发网前 `config_error`。proxy resolver 在签名前只观察已清 `key/code` 与受限 headers 的 clean request clone；命中 proxy 时 Endpoint/proxy 均不发网络请求，确认不命中后才向真实请求注入 code 并直连。Stage 4 通过显式 profile 才允许 environment/direct/http_proxy/socks5。
 - 优先读 RSSHub Route metadata；metadata 不可用时仍可实际请求 Feed，但 Channel readiness 记录为降级探测。
-- Channel Probe 检查 HTTP、Content-Type、Feed parse、最新时间和已知 `requireConfig/requirePuppeteer/antiCrawler`。
+- 独立 Endpoint Probe 没有 Channel Credential，受保护实例可以如实返回 auth required；Channel Probe 使用该 Channel 的 Credential 分别检查 health、Route metadata、实际 Feed、Content-Type、Feed parse、最新时间和已知 `requireConfig/requirePuppeteer/antiCrawler`。
 - readiness key 至少包含 Channel + RouteTemplate + Endpoint + Credential revision；Endpoint 200 不扩散为全局绿色。
+- `auth.used` 只由实际 RoundTrip 是否返回 response 决定；无 response 与 cache hit 都为 `false`。cache 按 Endpoint/Credential revision 隔离，不能继承历史请求的认证事实。
 - RSSHub X Route 只有用户配置 X credential 后才可能 ready；不能当匿名 X search 方案。
 
 后续的 managed RSSHub mode 会引入容器、升级、持久化、安全和监控责任，需单独 Shape。
 
-## 7. 统一格式与来源链路
+## 7. 后续 Stage 4：显式出站与主动分层 Probe
+
+Stage 4 在 Adapter 之前增加两个窄组件：Egress Resolver 只接受用户已配置的 EgressProfile ID；Transport Factory 只为 `environment | direct | http_proxy | socks5` 构造受信任 transport。`environment` 是用户显式选择，不是默认读取；`direct` 明确不使用代理；HTTP/SOCKS5 代理认证从 Credential 注入，代理 URL 不带 userinfo。任何构造或引用失败都在发网前结束，不自动直连、切公共 DoH/公共代理、关闭 TLS 或尝试未知出口。
+
+Egress 固定绑定在 Endpoint、Channel default/override，还是由 Operation/Probe 从用户允许的 profile ID 中选择，以及它们的 precedence/allowlist，必须由 Owner 在实现前裁决。已有 Endpoint/Channel 也需在 breaking fail-closed 后人工补 profile 与 migration 生成并显式绑定 profile 之间选择；设计不暗中补 direct/environment。Probe、readiness 与 Execution 均记录同一 Endpoint×Egress（无 Endpoint 时为目标连接×Egress）键，并只输出 profile ID、mode、proxied；代理密码和完整 proxy URL 始终脱敏。
+
+主动 `channels probe` 复用已解析 transport，并按真实连接拓扑生成 observation：Direct 是 target DNS/TCP/TLS/HTTP/Feed；HTTP CONNECT 是 proxy DNS/TCP、CONNECT、tunnel 内 target TLS/HTTP/Feed；SOCKS5 local DNS 才记录本地 target resolution，proxy DNS 把该层标为 `not_run/delegated_to_egress`，不编造 resolved IP。每层关联 Egress 与 target/proxy subject，保存 `passed | degraded | failed | not_run`、duration、可行动 reason 与 retryable；某个实际前置层失败后，依赖它的下游层统一 `not_run`。普通 Query 只执行真实业务请求，不自动支付重型诊断链的额外 DNS/连接/握手/Feed 请求成本。
+
+真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不进入该 Stage。direct 失败而另一个显式 proxy 成功时，底层只保存两个绑定各自的事实；整体 readiness 采用 `ready(dependent)` 还是 `degraded` 必须等待 Owner 决策。
+
+## 8. 统一格式与来源链路
 
 内部 Item 复用 JSON Feed 的内容字段语义，完整执行返回 OmniHub Envelope：
 
@@ -227,9 +240,9 @@ spec:
 - Feed 把兼容字段投影为 RSS/Atom/JSON Feed，额外信息进入 `_omnihub` 或 XML namespace。
 - Knowledge Studio 消费 Item URL/Observation 后负责深入抓取、保存证据和综合写作；OmniHub 不复制这部分状态机。
 
-## 8. Identity Dedupe 与 Similarity Grouping
+## 9. Identity Dedupe 与 Similarity Grouping
 
-### 8.1 Identity Dedupe
+### 9.1 Identity Dedupe
 
 默认开启，按可靠性依次判断：
 
@@ -239,15 +252,15 @@ spec:
 
 确认是同一对象后合并 Item，但保留全部 Observation。Feed 特例借鉴 Miniflux：如果上游错误地给所有条目相同 GUID，必须结合 URL 或位置避免整批被吞。
 
-### 8.2 Similarity Grouping
+### 9.2 Similarity Grouping
 
 标题/正文相似度只建立 group，不把不同发布者的报道折叠成一个事实来源。标题比较保护数字、日期、版本号和实体 token；正文可以在限定时间窗内用 SimHash 等低成本指纹。默认关闭。
 
 语义向量 grouping/rerank 需要单独选择 Embedding Provider（云 API 或本地 Ollama）、索引形态、阈值、费用、误合并恢复和模型升级重算策略，不进入 Stage 2。当前 `Similarity` 合同只保留扩展边界，不提前绑定向量数据库或模型。
 
-## 9. 状态、缓存与增量一致性
+## 10. 状态、缓存与增量一致性
 
-### 9.1 Repository 边界
+### 10.1 Repository 边界
 
 Repository 使用领域操作，不做机械的“每表一个 CRUD interface”。建议端口：
 
@@ -270,7 +283,7 @@ SQLite 是唯一 v1 Store。领域层不得使用 SQLite connection/error/SQL；
 
 本机配置目录和 SQLite 使用当前用户专属权限（Unix `0700/0600`，Windows 当前用户 ACL）。这只阻止其他本机账号误读，不宣称加密；未来 MySQL/远程部署必须重新 Shape Credential 保护。
 
-### 9.2 数据与未来多实例不变量
+### 10.2 数据与未来多实例不变量
 
 - 资源与 Run 使用 UUIDv7/ULID 一类全局唯一 ID，不使用仅在单库内有意义的自增 ID 作为公共标识。
 - 可写资源携带 `revision`；更新、Run claim/renew/finish 使用 compare-and-swap。
@@ -279,7 +292,7 @@ SQLite 是唯一 v1 Store。领域层不得使用 SQLite connection/error/SQL；
 - 进程内 singleflight 是 SQLite 单机优化；未来多实例正确性依赖持久 Run lease 与事务。
 - v1 不实现 MySQL Driver、distributed lock、leader election、sharding、tenant_id 或双写。
 
-### 9.3 SQLite 表边界
+### 10.3 SQLite 表边界
 
 - `managed_resources` 或按领域拆分的 Source/RouteTemplate/Channel/Endpoint/Collection 配置：origin、revision、enabled 与 overlay。
 - `credentials`：provider、auth kind、label、API Key/Token value、enabled、revision 与时间；`chrome_cookie` 记录的 value 为 null。
@@ -313,7 +326,7 @@ sequenceDiagram
 
 Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Retry-After。缓存 key 包含 Channel、RouteTemplate、Credential revision 与规范化参数，不能把一个 Endpoint 的命中扩散给所有 Channel。
 
-## 10. View Freshness
+## 11. View Freshness
 
 已确认 v1 使用 on-demand stale-while-revalidate，而非内置 scheduler：
 
@@ -325,7 +338,7 @@ Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Ret
 
 若未来选择内置 scheduler，需要额外 Shape 重试、错过执行、休眠恢复、任务租约、告警和监控；不能把一个 ticker 当成已完成的调度系统。
 
-## 11. 分页与排序
+## 12. 分页与排序
 
 - Channel 内的 Provider cursor 是 Adapter 私有实现细节。
 - Query Plane 多 Channel 只承诺 first window；coverage 标记 truncated，不伪造全局 `next_cursor`。
@@ -333,7 +346,7 @@ Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Ret
 - 搜索 merge 可以参考各 Channel position 与 Provider weight，但必须保留 observation positions；跨 Provider score 不视为可直接比较的“真分数”。
 - 排序用 canonical URL/稳定 ID 打破平局，保证同输入同响应可重复。
 
-## 12. Dashboard Backend
+## 13. Dashboard Backend
 
 Dashboard v1 Backend 围绕七个用户任务提供资源，而不是围绕数据库表暴露 CRUD：
 
@@ -349,7 +362,7 @@ Management API 写操作使用 revision/If-Match 和 idempotency key。`dashboar
 
 后端 Task 只交付 API、Schema、错误、Run/事件合同和可供前端开发的 fixture/示例；不创建前端页面，不替前端选择框架。
 
-## 13. Agent、CLI 与运行可观测性
+## 14. Agent、CLI 与运行可观测性
 
 固定调用形式：
 
@@ -365,7 +378,7 @@ omnihub doctor --channel channel_x_official --format json
 - Host 观察 Tool Call 即可知道 Agent 是否使用 OmniHub、搜索了什么范围；最终答案仍由 Agent 返回具体引用和 partial/coverage 限制。
 - `doctor` 的状态层级为 template-declared → channel-configured → dependency-installed → browser-permission-granted → credential-resolved → endpoint-reachable → channel-probed。
 
-## 14. Credential、Chrome Browser Bridge 与本机信任
+## 15. Credential、Chrome Browser Bridge 与本机信任
 
 - Dashboard 直接 CRUD API Key/Token Credential，值原样保存在本机 SQLite。列表返回掩码；detail 可在 `include_value=true` 时回显并使用 `Cache-Control: no-store`。日志、Run、Error、readiness 与默认 export 始终脱敏。
 - `chrome_cookie` Credential 不保存 Cookie。Chrome Extension 在用户手势下请求目标 origin 的 optional host permission，以 `chrome.cookies` 按 Channel Execute/Probe 读取 RouteTemplate allowlist；禁止 `<all_urls>` 常驻权限、`debugger`、默认 Profile CDP、Cookie SQLite 扫描或自行 OS 解密。
@@ -380,7 +393,7 @@ omnihub doctor --channel channel_x_official --format json
 - Authorization、Cookie、access key/code 与敏感 query 参数在日志、error 和 trace 中统一脱敏。
 - `twscrape` 只有在用户明确配置并接受账号/cookie与平台条款风险时启用；永不作为 xurl 鉴权失败后的自动回退。
 
-## 15. v1 纵切矩阵
+## 16. v1 纵切矩阵
 
 | Source/场景 | 首选 Channel（RouteTemplate） | 备选/作用 | 主要验证点 |
 |---|---|---|---|
@@ -393,7 +406,7 @@ omnihub doctor --channel channel_x_official --format json
 
 arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充 Source Bundle，不阻塞核心 v1。
 
-## 16. 当前取舍表
+## 17. 当前取舍表
 
 | 设计点 | 当前建议 | 代价 | 状态 |
 |---|---|---|---|
@@ -406,6 +419,7 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 | API Key | Dashboard 录入，SQLite 原样保存；列表掩码，detail 仅在 `include_value=true` 时完整回显 | 数据库备份可读到 Key | 已确认 |
 | Chrome 授权 | MV3 optional host permission + cookies API + connectNative 长连接；每次执行直接读 | Chrome/Bridge 离线时 Channel blocked | 已确认 |
 | RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
+| EgressProfile | Stage 4 显式 environment/direct/http_proxy/socks5；不隐式 fallback | 新增资源、transport 与诊断测试面；绑定/迁移/readiness 聚合待定 | 方向已确认 / Owner decision |
 | 扩展 | Built-in + Manifest + command/MCP | 要维护 mapping schema；不另造协议 | 已确认 |
 | 去重 | identity 默认；similarity 只分组 | 相似内容仍会占多条 | 已确认 |
 | v1 纵切 | Feed、V2EX/RSSHub、GitHub、Tavily、X/xurl | 首版不宣称大量平台 ready | 已确认 |

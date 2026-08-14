@@ -23,6 +23,7 @@ type RouteTemplate struct {
 	Pagination       PaginationDescriptor `json:"pagination"`
 	TimeRange        TimeRangeDescriptor  `json:"time_range" yaml:"time_range"`
 	Auth             AuthDescriptor       `json:"auth"`
+	EndpointRequired bool                 `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
 	ParametersSchema map[string]any       `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
 	Cost             string               `json:"cost"`
 	Trust            string               `json:"trust"`
@@ -522,6 +523,7 @@ type BundleRouteTemplate struct {
 	Pagination       PaginationDescriptor `json:"pagination" yaml:"pagination"`
 	TimeRange        TimeRangeDescriptor  `json:"time_range" yaml:"time_range"`
 	Auth             AuthDescriptor       `json:"auth" yaml:"auth"`
+	EndpointRequired bool                 `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
 	ParametersSchema map[string]any       `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
 	Cost             string               `json:"cost" yaml:"cost"`
 	Trust            string               `json:"trust" yaml:"trust"`

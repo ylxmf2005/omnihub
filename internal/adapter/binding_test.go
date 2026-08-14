@@ -1,17 +1,23 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -390,6 +396,486 @@ func TestFeedURLAndCacheKeyBoundaries(t *testing.T) {
 	}
 }
 
+func TestRSSHubBuildURLAndRouteContract(t *testing.T) {
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: "https://rsshub.example/base", Enabled: true}
+	template := core.RouteTemplate{
+		RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
+		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{
+			"path":  map[string]any{"type": "string", "enum": []any{"/v2ex/topics/latest"}},
+			"limit": map[string]any{"type": "integer"},
+		}},
+	}
+	channel := core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID,
+		Parameters: map[string]any{"path": "/v2ex/topics/latest", "limit": float64(20)}}
+	request := RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}
+	if err := ValidateRSSHubRequest(request); err != nil {
+		t.Fatalf("ValidateRSSHubRequest() = %v", err)
+	}
+	feedURL, err := BuildRSSHubFeedURL(endpoint, channel)
+	if err != nil || feedURL != "https://rsshub.example/base/v2ex/topics/latest?limit=20" {
+		t.Fatalf("BuildRSSHubFeedURL() = %q, %v", feedURL, err)
+	}
+	firstCacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Endpoint.Revision++
+	secondCacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil || firstCacheKey == secondCacheKey {
+		t.Fatalf("RSSHub cache key did not partition Endpoint revision: %q/%q, %v", firstCacheKey, secondCacheKey, err)
+	}
+	request.Channel.CredentialID = "credential_fixture"
+	request.Credential = &core.Credential{ID: "credential_fixture", Revision: 1}
+	credentialCacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Credential.Revision++
+	rotatedCredentialCacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil || credentialCacheKey == rotatedCredentialCacheKey {
+		t.Fatalf("RSSHub cache key did not partition Credential revision: %q/%q, %v", credentialCacheKey, rotatedCredentialCacheKey, err)
+	}
+	request.Channel.CredentialID = ""
+	request.Credential = nil
+
+	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "code": "must-not-enter-url"}
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil {
+		t.Fatal("ValidateRSSHubRequest() accepted an undeclared credential-like parameter")
+	}
+	if _, err := BuildRSSHubFeedURL(endpoint, channel); err == nil {
+		t.Fatal("BuildRSSHubFeedURL() accepted a credential-like parameter")
+	}
+
+	template.ParametersSchema = map[string]any{"type": "object", "additionalProperties": true}
+	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "nested": map[string]any{"value": "unsupported"}}
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil {
+		t.Fatal("ValidateRSSHubRequest() accepted a schema-valid parameter that the transport cannot encode")
+	}
+	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "target": "https://example.test/?access_token=must-not-enter"}
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil || strings.Contains(err.Error(), "must-not-enter") {
+		t.Fatalf("ValidateRSSHubRequest(secret URL parameter) error = %v", err)
+	}
+	requiredConfig, known := rssHubRequiredConfig([]any{
+		map[string]any{"name": "REQUIRED", "optional": false},
+		map[string]any{"name": "OPTIONAL", "optional": true},
+	})
+	if !known || !reflect.DeepEqual(requiredConfig, []string{"REQUIRED"}) {
+		t.Fatalf("rssHubRequiredConfig() = %#v/%v", requiredConfig, known)
+	}
+}
+
+func TestRSSHubCredentialExecuteSignsScopedRequestWithoutLeaks(t *testing.T) {
+	// 使用会自然出现在 Feed body 中的短 key，证明响应检查只针对真正派生并
+	// 外发的 code，不会把普通内容中的同名文本误判为 secret 泄漏。
+	const accessKey = "Fixture"
+	var receivedCode string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/base/v2ex/topics/latest" {
+			t.Errorf("request path = %q", request.URL.Path)
+		}
+		receivedCode = request.URL.Query().Get("code")
+		if receivedCode != rssHubAccessCode(request.URL.EscapedPath(), accessKey) || hasQueryKeyFold(request.URL.Query(), "key") {
+			t.Errorf("credential query = %q", request.URL.RawQuery)
+		}
+		assertNoInheritedRSSHubAuth(t, request)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer server.Close()
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpointURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(endpointURL, []*http.Cookie{{Name: "browser", Value: "must-not-be-sent"}})
+	cache := NewMemoryFeedCache()
+	request := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
+	adapter := RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Jar: jar}, Cache: cache}}
+	result := adapter.Execute(context.Background(), request)
+	if len(result.Errors) != 0 || len(result.Items) != 1 || result.ProviderState["auth_used"] != "true" {
+		t.Fatalf("Execute() = %#v", result)
+	}
+	assertNoRSSHubAccessMaterial(t, result, receivedCode)
+
+	feedURL, err := BuildRSSHubFeedURL(request.Endpoint, request.Channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, found, err := cache.Get(context.Background(), cacheKey)
+	if err != nil || !found {
+		t.Fatalf("cache entry = %#v/%v/%v", entry, found, err)
+	}
+	if !bytes.Contains(entry.Body, []byte(accessKey)) {
+		t.Fatal("fixture no longer proves that a short key can occur as ordinary feed content")
+	}
+	assertNoRSSHubAccessMaterial(t, entry, receivedCode)
+}
+
+func TestRSSHubCredentialRedirectRecomputesCodeAndClearsReferer(t *testing.T) {
+	const accessKey = "redirect-access-key"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		assertNoInheritedRSSHubAuth(t, request)
+		switch request.URL.Path {
+		case "/base/start":
+			if request.URL.Query().Get("code") != rssHubAccessCode("/base/start", accessKey) {
+				t.Errorf("start query = %q", request.URL.RawQuery)
+			}
+			http.Redirect(writer, request, "/base/final?CoDe=stale&KEY=stale", http.StatusFound)
+		case "/base/final":
+			if request.URL.Query().Get("code") != rssHubAccessCode("/base/final", accessKey) || hasQueryKeyFold(request.URL.Query(), "key") || hasNonCanonicalCodeKey(request.URL.Query()) {
+				t.Errorf("redirect query = %q", request.URL.RawQuery)
+			}
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	request := rssHubCredentialRequest(server.URL+"/base", "/start", accessKey, 1)
+	result := (RSSHubAdapter{}).Execute(context.Background(), request)
+	if len(result.Errors) != 0 || len(result.Items) != 1 || requests.Load() != 2 || result.ProviderState["auth_used"] != "true" {
+		t.Fatalf("redirect result/requests = %#v/%d", result, requests.Load())
+	}
+	assertNoRSSHubAccessMaterial(t, result, accessKey, rssHubAccessCode("/base/start", accessKey), rssHubAccessCode("/base/final", accessKey))
+}
+
+func TestRSSHubCredentialRedirectCannotLeaveEndpointScope(t *testing.T) {
+	const accessKey = "scope-access-key"
+	var externalRequests atomic.Int32
+	external := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		externalRequests.Add(1)
+	}))
+	defer external.Close()
+
+	tests := []struct {
+		name     string
+		location func(string) string
+	}{
+		{name: "cross origin", location: func(string) string { return external.URL + "/base/final" }},
+		{name: "base prefix collision", location: func(string) string { return "/baseevil/final" }},
+		{name: "decoded traversal", location: func(string) string { return "/base/%2e%2e/out" }},
+		{name: "double slash", location: func(string) string { return "/base//out" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var originRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				originRequests.Add(1)
+				if request.URL.Path != "/base/start" {
+					t.Errorf("out-of-scope target reached origin: %q", request.URL.Path)
+				}
+				writer.Header().Set("Location", test.location(request.Host))
+				writer.WriteHeader(http.StatusFound)
+			}))
+			defer server.Close()
+
+			request := rssHubCredentialRequest(server.URL+"/base", "/start", accessKey, 1)
+			result := (RSSHubAdapter{}).Execute(context.Background(), request)
+			assertRSSHubError(t, result, core.ErrorProtocol)
+			if originRequests.Load() != 1 || externalRequests.Load() != 0 || result.ProviderState["auth_used"] != "true" {
+				t.Fatalf("request counts/result = %d/%d/%#v", originRequests.Load(), externalRequests.Load(), result)
+			}
+			assertNoRSSHubAccessMaterial(t, result, accessKey, rssHubAccessCode("/base/start", accessKey))
+		})
+	}
+}
+
+func TestRSSHubCredentialDisablesHTMLAlternateDiscovery(t *testing.T) {
+	const accessKey = "discovery-access-key"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.URL.Path == "/base/feed.xml" {
+			t.Error("credentialed HTML discovery contacted the alternate feed")
+		}
+		writer.Header().Set("Content-Type", "text/html")
+		_, _ = writer.Write([]byte(`<html><head><link rel="alternate" type="application/rss+xml" href="/base/feed.xml"></head></html>`))
+	}))
+	defer server.Close()
+
+	request := rssHubCredentialRequest(server.URL+"/base", "/start", accessKey, 1)
+	result := (RSSHubAdapter{}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorProtocol)
+	if requests.Load() != 1 || result.ProviderState["auth_used"] != "true" {
+		t.Fatalf("discovery requests/result = %d/%#v", requests.Load(), result)
+	}
+}
+
+func TestRSSHubCredentialProbeAuthenticatesChannelButNotEndpointProbe(t *testing.T) {
+	const accessKey = "probe-access-key"
+	var authenticated, anonymous atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		code := request.URL.Query().Get("code")
+		if code == "" {
+			anonymous.Add(1)
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		authenticated.Add(1)
+		if code != rssHubAccessCode(request.URL.EscapedPath(), accessKey) {
+			t.Errorf("probe code for %q = %q", request.URL.Path, code)
+		}
+		assertNoInheritedRSSHubAuth(t, request)
+		switch request.URL.Path {
+		case "/base/healthz":
+			_, _ = writer.Write([]byte(`ok`))
+		case "/base/api/namespace/v2ex":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"routes":{"/topics/:type":{"path":"/topics/:type","example":"/v2ex/topics/latest","features":{"requireConfig":false,"requirePuppeteer":false,"antiCrawler":false}}}}`))
+		case "/base/v2ex/topics/latest":
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	request := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
+	report := (RSSHubAdapter{}).Probe(context.Background(), request)
+	if report.Readiness != "ready" || !report.Endpoint.Passed || !report.Metadata.Passed || !report.Feed.FeedParsed || authenticated.Load() != 3 {
+		t.Fatalf("Channel Probe report/requests = %#v/%d", report, authenticated.Load())
+	}
+	assertNoRSSHubAccessMaterial(t, report, accessKey,
+		rssHubAccessCode("/base/healthz", accessKey),
+		rssHubAccessCode("/base/api/namespace/v2ex", accessKey),
+		rssHubAccessCode("/base/v2ex/topics/latest", accessKey),
+	)
+
+	endpointProbe := (RSSHubAdapter{}).ProbeEndpoint(context.Background(), request.Endpoint)
+	if endpointProbe.Passed || endpointProbe.Error == nil || endpointProbe.Error.Code != core.ErrorAuth || anonymous.Load() != 1 {
+		t.Fatalf("anonymous Endpoint Probe = %#v, requests=%d", endpointProbe, anonymous.Load())
+	}
+}
+
+func TestRSSHubCredentialRotationPartitionsCacheAndAuthUsage(t *testing.T) {
+	var mu sync.Mutex
+	var receivedCodes []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		receivedCodes = append(receivedCodes, request.URL.Query().Get("code"))
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		writer.Header().Set("Cache-Control", "max-age=3600")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer server.Close()
+
+	now := time.Date(2026, 8, 14, 2, 0, 0, 0, time.UTC)
+	cache := NewMemoryFeedCache()
+	adapter := RSSHubAdapter{Feed: FeedAdapter{Cache: cache, Now: func() time.Time { return now }}}
+	firstRequest := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", "rotation-key-1", 1)
+	first := adapter.Execute(context.Background(), firstRequest)
+	cacheHit := adapter.Execute(context.Background(), firstRequest)
+	rotatedRequest := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", "rotation-key-2", 2)
+	rotated := adapter.Execute(context.Background(), rotatedRequest)
+	if len(first.Errors) != 0 || len(cacheHit.Errors) != 0 || len(rotated.Errors) != 0 || first.ProviderState["auth_used"] != "true" || cacheHit.ProviderState["auth_used"] != "" || cacheHit.ProviderState["cache_status"] != "hit" || rotated.ProviderState["auth_used"] != "true" {
+		t.Fatalf("rotation results = %#v/%#v/%#v", first, cacheHit, rotated)
+	}
+	mu.Lock()
+	gotCodes := append([]string(nil), receivedCodes...)
+	mu.Unlock()
+	wantCodes := []string{
+		rssHubAccessCode("/base/v2ex/topics/latest", "rotation-key-1"),
+		rssHubAccessCode("/base/v2ex/topics/latest", "rotation-key-2"),
+	}
+	if !reflect.DeepEqual(gotCodes, wantCodes) {
+		t.Fatalf("received codes = %#v, want %#v", gotCodes, wantCodes)
+	}
+}
+
+func TestRSSHubCredentialRejectsReflectedCode(t *testing.T) {
+	const accessKey = "reflection-access-key"
+	cache := NewMemoryFeedCache()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		code := request.URL.Query().Get("code")
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(strings.Replace(rssFeedFixture("http://"+request.Host), "RSS body", "RSS body "+code, 1)))
+	}))
+	defer server.Close()
+
+	request := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
+	result := (RSSHubAdapter{Feed: FeedAdapter{Cache: cache}}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorProtocol)
+	code := rssHubAccessCode("/base/v2ex/topics/latest", accessKey)
+	if result.ProviderState["auth_used"] != "true" {
+		t.Fatalf("auth_used = %q", result.ProviderState["auth_used"])
+	}
+	assertNoRSSHubAccessMaterial(t, result, accessKey, code)
+
+	feedURL, err := BuildRSSHubFeedURL(request.Endpoint, request.Channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheKey, err := FeedCacheKey(rssHubFeedRequest(request, feedURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := cache.Get(context.Background(), cacheKey); err != nil || found {
+		t.Fatalf("reflected response reached cache: found=%v err=%v", found, err)
+	}
+}
+
+func TestRSSHubCredentialDoesNotClaimAuthBeforeRequestWrite(t *testing.T) {
+	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "unused-access-key", 1)
+	result := (RSSHubAdapter{Feed: FeedAdapter{rssHubProxy: func(*http.Request) (*url.URL, error) { return nil, nil }}}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorNetwork)
+	if result.ProviderState["auth_used"] != "" {
+		t.Fatalf("auth_used = %q before request write", result.ProviderState["auth_used"])
+	}
+}
+
+func TestRSSHubCredentialDoesNotClaimAuthWithoutResponse(t *testing.T) {
+	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "unused-access-key", 1)
+	policy, err := newRSSHubCredentialPolicy(request.Endpoint, request.Credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:1/base/v2ex/topics/latest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := rssHubCredentialTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("fixture failed without a response")
+	}), policy: policy}
+	if _, err := transport.RoundTrip(httpRequest); err == nil {
+		t.Fatal("RoundTrip succeeded without a response")
+	}
+	if policy.authUsed.Load() {
+		t.Fatal("credential marked used without a response")
+	}
+}
+
+func TestRSSHubCredentialRejectsImplicitConfiguredProxy(t *testing.T) {
+	const accessKey = "proxy-boundary-access-key"
+	var endpointRequests, proxyRequests, proxyDecisions atomic.Int32
+	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		endpointRequests.Add(1)
+		if request.URL.Query().Get("code") != rssHubAccessCode(request.URL.EscapedPath(), accessKey) {
+			t.Errorf("endpoint query = %q", request.URL.RawQuery)
+		}
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer endpoint.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		proxyRequests.Add(1)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := rssHubCredentialRequest(endpoint.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
+	result := (RSSHubAdapter{Feed: FeedAdapter{rssHubProxy: func(request *http.Request) (*url.URL, error) {
+		proxyDecisions.Add(1)
+		if hasQueryKeyFold(request.URL.Query(), "key") || hasQueryKeyFold(request.URL.Query(), "code") || strings.Contains(request.URL.String(), accessKey) {
+			t.Errorf("proxy resolver observed access material: %q", request.URL)
+		}
+		return proxyURL, nil
+	}}}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorConfig)
+	if proxyDecisions.Load() != 1 || endpointRequests.Load() != 0 || proxyRequests.Load() != 0 || result.ProviderState["auth_used"] != "" {
+		t.Fatalf("implicit proxy boundary = %#v, decisions=%d endpoint=%d proxy=%d", result, proxyDecisions.Load(), endpointRequests.Load(), proxyRequests.Load())
+	}
+}
+
+func TestRSSHubCredentialRejectsUnverifiableCustomTransport(t *testing.T) {
+	var calls atomic.Int32
+	custom := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("must not run")
+	})
+	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "custom-transport-key", 1)
+	result := (RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Transport: custom}}}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorConfig)
+	if calls.Load() != 0 || result.ProviderState["auth_used"] != "" {
+		t.Fatalf("custom transport calls/auth = %d/%q", calls.Load(), result.ProviderState["auth_used"])
+	}
+}
+
+func TestRSSHubCredentialRejectsCustomDialTransport(t *testing.T) {
+	var calls atomic.Int32
+	transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("must not dial")
+	}}
+	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "custom-dial-key", 1)
+	result := (RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Transport: transport}}}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorConfig)
+	if calls.Load() != 0 || result.ProviderState["auth_used"] != "" {
+		t.Fatalf("custom dial calls/auth = %d/%q", calls.Load(), result.ProviderState["auth_used"])
+	}
+}
+
+func TestRSSHubProbeSeparatesEndpointMetadataAndFeed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/healthz":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"status":"ok"}`))
+		case "/api/namespace/v2ex":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"name":"V2EX","routes":{"/topics/:type":{"path":"/topics/:type","example":"/v2ex/topics/latest","features":{"requireConfig":false,"requirePuppeteer":true,"antiCrawler":false}}}}`))
+		case "/v2ex/topics/latest":
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, Enabled: true}
+	template := core.RouteTemplate{RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
+		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}}
+	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint}
+	report := (RSSHubAdapter{}).Probe(context.Background(), request)
+	if !report.Endpoint.Passed || !report.Metadata.Passed || !report.Metadata.RouteFound || report.Metadata.Pattern != "/v2ex/topics/latest" || !report.Metadata.Features.RequireConfigKnown || !report.Metadata.Features.RequirePuppeteerKnown || !report.Metadata.Features.RequirePuppeteer || !report.Metadata.Features.AntiCrawlerKnown || report.Readiness != "ready" {
+		t.Fatalf("Probe() report = %#v", report)
+	}
+	if !report.Feed.FeedParsed || report.Feed.Status != http.StatusOK || report.Feed.ContentType != "application/rss+xml" || report.Feed.LatestItemTime == nil {
+		t.Fatalf("Probe() feed facts = %#v", report.Feed)
+	}
+}
+
+func TestRSSHubProbeMetadataMissingRouteDegradesFeedSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/healthz":
+			_, _ = writer.Write([]byte(`ok`))
+		case "/api/namespace/v2ex":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"routes":{}}`))
+		case "/v2ex/topics/latest":
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+		}
+	}))
+	defer server.Close()
+
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, Enabled: true}
+	template := core.RouteTemplate{RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
+		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}}
+	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint}
+	report := (RSSHubAdapter{}).Probe(context.Background(), request)
+	if !report.Endpoint.Passed || report.Metadata.Passed || report.Metadata.Error == nil || !report.Feed.FeedParsed || report.Readiness != "degraded" {
+		t.Fatalf("Probe() report = %#v", report)
+	}
+}
+
 func TestFeedAdapterDoesNotInventCanonicalURLForMissingItemLink(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/rss+xml")
@@ -409,6 +895,88 @@ func TestFeedAdapterDoesNotInventCanonicalURLForMissingItemLink(t *testing.T) {
 		if len(item.Attachments) != 0 || observation.UpstreamID == nil || *observation.UpstreamID != "duplicate" || !reflect.DeepEqual(observation.Limitations, []string{"item_url_missing", "upstream_id_not_unique_in_feed", "attachment_url_invalid"}) {
 			t.Fatalf("bad GUID provenance = %#v", observation)
 		}
+	}
+}
+
+func rssHubCredentialRequest(baseURL, routePath, accessKey string, revision int64) RSSHubRequest {
+	template := core.RouteTemplate{
+		RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
+		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}},
+	}
+	credentialID := "credential_rsshub_fixture"
+	return RSSHubRequest{
+		Channel: core.Channel{
+			ID: "channel_rsshub_fixture", Source: "v2ex", RouteTemplateID: template.RouteTemplateID,
+			EndpointProfileID: "endpoint_rsshub_fixture", CredentialID: credentialID,
+			Parameters: map[string]any{"path": routePath}, Enabled: true,
+		},
+		RouteTemplate: template,
+		Endpoint: core.EndpointProfile{
+			ID: "endpoint_rsshub_fixture", Provider: "rsshub", BaseURL: baseURL, Enabled: true, Revision: 1,
+		},
+		Credential: &core.Credential{
+			ID: credentialID, Provider: "rsshub", AuthKind: "api_key", Value: &accessKey, Enabled: true, Revision: revision,
+		},
+	}
+}
+
+func rssHubAccessCode(requestPath, accessKey string) string {
+	digest := md5.Sum([]byte(requestPath + accessKey))
+	return fmt.Sprintf("%x", digest)
+}
+
+func hasQueryKeyFold(query url.Values, wanted string) bool {
+	for key := range query {
+		if strings.EqualFold(key, wanted) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonCanonicalCodeKey(query url.Values) bool {
+	for key := range query {
+		if strings.EqualFold(key, "code") && key != "code" {
+			return true
+		}
+	}
+	return false
+}
+
+func assertNoInheritedRSSHubAuth(t *testing.T, request *http.Request) {
+	t.Helper()
+	for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization", "Referer"} {
+		if value := request.Header.Get(header); value != "" {
+			t.Errorf("credentialed RSSHub request inherited %s: %q", header, value)
+		}
+	}
+	if hasQueryKeyFold(request.URL.Query(), "key") {
+		t.Errorf("credentialed RSSHub request exposed key query: %q", request.URL.RawQuery)
+	}
+}
+
+func assertNoRSSHubAccessMaterial(t *testing.T, value any, secrets ...string) {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower := strings.ToLower(string(raw))
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(lower, strings.ToLower(secret)) {
+			t.Fatalf("serialized value contains RSSHub access material: %s", raw)
+		}
+	}
+}
+
+func assertRSSHubError(t *testing.T, result core.AdapterResult, code core.ErrorCode) {
+	t.Helper()
+	if len(result.Errors) != 1 || result.Errors[0].Code != code {
+		t.Fatalf("errors = %#v, want one %s", result.Errors, code)
+	}
+	problem := result.Errors[0]
+	if problem.Source != "v2ex" || problem.Provider != "rsshub" || problem.ChannelID != "channel_rsshub_fixture" || problem.RouteTemplateID != "rsshub_fixture" {
+		t.Fatalf("RSSHub error lost provenance: %#v", problem)
 	}
 }
 

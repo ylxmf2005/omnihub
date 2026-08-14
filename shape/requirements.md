@@ -1,6 +1,6 @@
 # OmniHub Requirements
 
-状态：`ready`
+状态：`ready`；Stage 4 的绑定/迁移/readiness 聚合仍有 Owner decisions
 
 ## 1. 产品目标
 
@@ -21,9 +21,10 @@ OmniHub 解决“从哪里、用什么路线找到并统一交付”，不承担
 - **Provider**：实际提供检索/获取能力的外部服务或工具，如 `rsshub`、`github-api`、`tavily`、`xurl`、`direct-feed`。
 - **Capability**：Provider 通过 RouteTemplate 对 Source 提供的行为，v1 为 `search | latest | fetch | health`。
 - **RouteTemplate**：受信任的静态能力声明，绑定 `Provider + Capability + Adapter`，并声明可接受的 Source constraint、参数/认证 Schema、成本和限制；自身不可执行。它既可以只允许 `x`，也可以像 Direct Feed/Tavily 一样接受用户 Channel 给出的 Source/Domain。
-- **Channel**：用户真正管理和执行的 RouteTemplate 实例，引用可选 EndpointProfile/Credential，保存经校验的参数、优先级、回退、启停和健康状态。Direct Feed 同样是 Channel。
+- **Channel**：用户真正管理和执行的 RouteTemplate 实例，引用可选 EndpointProfile/Credential。后续 Stage 4 的 Endpoint、Channel、Operation 或 Probe 只能从用户已配置的 EgressProfile ID 中引用；具体绑定与覆盖关系仍待 Owner 裁决。Channel 保存经校验的参数、优先级、回退、启停和健康状态。Direct Feed 同样是 Channel。
 - **Adapter**：与一类 Provider 协议通信并映射到 OmniHub 合同的实现。
-- **EndpointProfile**：某个 Provider 的连接实例或 transport，例如 RSSHub base URL、MCP Server；账号凭据由 Channel 引用的 Credential 提供。
+- **EndpointProfile**：某个 Provider 的连接实例，例如 RSSHub base URL、MCP Server；账号凭据由 Channel 引用的 Credential 提供，出站路径由独立 EgressProfile 提供。
+- **EgressProfile**：后续 Stage 4 的显式出站资源，模式为 `environment | direct | http_proxy | socks5`；代理地址、DNS 策略与代理 Credential 属于该资源，Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID。
 - **Credential**：Dashboard 可管理的认证记录。`api_key | token` 的值直接保存在本机 SQLite；`chrome_cookie` 不保存 Cookie，只声明执行时从 Chrome Bridge 读取。
 - **BrowserBridge**：Chrome Companion Extension、Native Messaging Host 与 OmniHub serve 之间的长连接本机通道；Cookie 只在一次 Channel execution 的内存中存在。
 - **Collection**：用户定义的 Channel 组合，不创造全局分类本体。
@@ -57,7 +58,9 @@ v1 只连接用户显式配置的一个或多个本地/远程 RSSHub Endpoint；
 
 ### REQ-006：RSSHub 鉴权与诊断
 
-RSSHub key 可通过环境变量或 Dashboard 写入的 SQLite Credential 读取，不进入命令历史、Run、Error 或普通日志。诊断分开报告 Endpoint 配置、可达性、上游 Route 元数据、Channel 依赖与一次真实 Feed 解析；Endpoint 健康不能推导所有 Channel 健康。
+RSSHub key 可通过环境变量或 Dashboard 写入的 SQLite Credential 读取，不进入命令历史、Run、Error 或普通日志。执行时按实际 URL pathname 计算派生 `code`，只允许用户显式 Endpoint 的同 origin、分段 base-path 内请求；redirect 每跳清除旧 `key/code` 后重签，跨域、越界、编码 traversal、double slash 与认证 HTML discovery 都在下一跳发网前失败。Stage 3 尚无 EgressProfile：认证链只使用 OmniHub 自建受信任 transport，不继承外部 `http.Transport`、DialContext/DialTLS、TLS 或 protocol 设置；存在外部 transport 时必须在发网前 `config_error`。proxy resolver 只接收已清 `key/code` 和受限 headers 的 clean request clone；若会命中 proxy，Endpoint 与 proxy 都不能收到网络请求；只有确认不命中 proxy 后才向网络请求注入 code 并直连。
+
+Endpoint Probe 匿名，Channel Probe 使用 Channel Credential。只有带签名的 RoundTrip 得到 response 才能记录 `auth.used=true`；无 response 或 cache hit 都记录 `false`。cache 按 Endpoint/Credential revision 隔离。诊断分开报告 Endpoint 配置、可达性、上游 Route 元数据、Channel 依赖与一次真实 Feed 解析；Endpoint 健康不能推导所有 Channel 健康。
 
 ### REQ-007：统一请求合同
 
@@ -184,6 +187,20 @@ Companion Extension 用 `chrome.runtime.connectNative()` 与 `omnihub chrome-hos
 
 `serve` v1 只监听 loopback，并校验固定 Host/Origin/CORS；不增加 Dashboard 登录、bootstrap secret 或复杂 CSRF session。Host 不信任 payload 自报 sender，Extension/Host 断开是独立健康检查，不能冒充 Channel auth 失败。
 
+### REQ-029：显式 EgressProfile 出站资源（Stage 4）
+
+Stage 4 必须把网络出口建模为可管理、可 revision 的 EgressProfile，支持 `environment | direct | http_proxy | socks5`。`socks5` 必须显式选择 local DNS 或 proxy DNS；代理认证引用 Credential，用户名/密码不得放入代理 URL。新建出站配置必须显式引用用户已配置的 profile ID；Endpoint、Channel、Operation 或 Probe 不能携带任意 proxy URL，也不得隐式回退到直连、公共 DoH、公共代理或关闭 TLS，或读取未声明的新出口。
+
+Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoint 的 Channel 以目标连接×Egress 形成等价绑定。对外只披露 profile ID、mode 与本次是否经过代理，不返回代理密码或完整代理 URL。真正的 macOS System Proxy/PAC、VPN/TUN 和“自动选择最快线路”不属于该阶段。
+
+以下关系必须在 Stage 4 实现前由 Owner 裁决：Egress 固定绑定在 Endpoint、Channel default/override，还是 Operation/Probe 从资源允许的 profile ID 集中选择，以及各层 precedence/allowlist；已有 Endpoint/Channel 是（A）缺绑定即 breaking fail-closed、由用户显式补 profile，还是（B）migration 生成并显式绑定某个 profile。两种迁移都不得暗中选择 direct/environment。
+
+### REQ-030：主动分层网络 Probe（Stage 4）
+
+显式 `channels probe` 必须按实际出口拆分 observation，而不是把代理伪装成一条 target 直连链。Direct 观察 target DNS→target TCP→TLS→HTTP→Feed parse；HTTP CONNECT 至少区分 proxy DNS/TCP、CONNECT 与 tunnel 内 target TLS；SOCKS5 local DNS 才能报告本地 target DNS 结果，proxy DNS 时 target resolution 必须为 `not_run/delegated_to_egress` 或等价 limitation，不能编造 resolved IP。每个实际层输出 `passed | degraded | failed | not_run`、耗时、可行动 reason 与 `retryable`，并关联具体 Egress/target 或 proxy subject；前一层阻断时，未运行的下游层统一保持 `not_run`。正常 Query 复用同一 Endpoint×Egress transport 与错误分类，但不得自动执行这条重型分层 Probe。
+
+当 direct 绑定失败、另一个用户显式 proxy 绑定成功时，各绑定的事实必须分别保留；整体 readiness 呈现 `ready(dependent)` 还是 `degraded` 仍是 Owner decision，在裁决前不得由实现自行选择。
+
 ## 4. 非功能要求
 
 - 同一输入与同一上游响应产生确定性的规范化、排序和 identity dedupe。
@@ -197,6 +214,8 @@ Companion Extension 用 `chrome.runtime.connectNative()` 与 `omnihub chrome-hos
 - Dashboard API 与 CLI/MCP 共享 Schema、redaction 和 Envelope；前端不能依靠未记录的字段推断。
 - Channel health 是 checks 的派生读模型；登录、Chrome permission、Credential、Endpoint 和 Channel Probe 分层保存并各自带 checked/expires 时间。
 - API Key/Token 存本机 SQLite；Cookie 只存在 Chrome 与单次执行内存。测试 fixture 使用不可用假值，日志、Run 与错误统一脱敏。
+- EgressProfile 必须显式选择；代理 Credential 只在构造受信任 transport 时注入，所有普通输出仅保留 profile ID/mode/proxied，不出现密码或完整代理 URL。
+- 正常 Query 不隐式执行 DNS/TCP/TLS/HTTP/Feed parse 全链主动 Probe；Probe 的诊断成本只能由显式操作触发。
 
 ## 5. 建议的 v1 验证矩阵
 
@@ -226,7 +245,10 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 12. **渠道与 Chrome 授权方向**：Channel 是 Dashboard 一级管理对象；需要 Cookie 的 Channel 在用户授予 Chrome origin permission 后按每次执行直接读取，Cookie 不持久化。Dashboard 可打开登录链接并显示分层健康；Chrome Extension 客户端由独立 Agent/工作流实现，本 Task 负责后端 Bridge/合同。
 13. **本地 MVP Credential**：Dashboard 直接录入 API Key/Token，SQLite 保存真实值，不使用 Keychain、受保护 secret store 或 opaque handle。Credential 列表只返回掩码；只有 detail 请求显式传入 `include_value=true` 时才返回完整值，并设置 `Cache-Control: no-store`。日志、Run 与诊断不回显原值。
 14. **轻量本机信任模型**：只监听 loopback，保留 Host/Origin/CORS、SQLite 文件权限和日志脱敏；v1 不实现 Dashboard 登录、bootstrap session 或复杂 CSRF token。
+15. **显式出站方向**：独立 Stage 4 引入 EgressProfile，支持 environment/direct/http_proxy/socks5 与 SOCKS5 local/proxy DNS；Endpoint、Channel、Operation/Probe 只能引用用户已配置的 profile ID，代理认证引用 Credential，不在 URL 中携带。
+16. **出站 fail-closed**：不隐式 fallback、直连、公共 DoH、公共代理或关闭 TLS；真正 System Proxy/PAC、VPN/TUN 与最快线路不在 Stage 4。Probe/readiness/Execution 绑定 Endpoint×Egress，输出脱敏的 profile 事实。
+17. **主动 Probe 成本**：只有显式 Channel Probe 执行 DNS→TCP→TLS→HTTP→Feed parse 分层诊断；正常 Query 不自动运行。
 
 ## 7. Grill 结论
 
-用户已确认采用显式回显方案：Credential 列表只返回掩码；只有 detail 请求带 `include_value=true` 时返回完整 API Key/Token，并设置 `Cache-Control: no-store`。当前 v1 Shape 的承重决策已全部关闭，可以进入实施。
+用户已确认采用显式回显方案：Credential 列表只返回掩码；只有 detail 请求带 `include_value=true` 时返回完整 API Key/Token，并设置 `Cache-Control: no-store`。Stage 3 的 RSSHub credential transport 决策已经关闭；Stage 4 的 EgressProfile 与主动分层 Probe 方向已确认，但绑定/覆盖/allowlist precedence、既有资源迁移策略，以及 direct 失败、显式 proxy 成功时的整体 readiness 聚合仍需 Owner 裁决。

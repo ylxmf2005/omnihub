@@ -2,15 +2,14 @@
 
 把多来源信息接入统一成 Agent 与应用可复用、可追溯的搜索合同。
 
-> 当前实现到 Stage 2：统一模型、Registry/Router、SQLite 配置、readiness 与诊断 CLI 已稳定；Direct RSS/Atom/JSON Feed 的 `latest`、bounded local `search`、条件缓存、Channel 管理和 OPML 导入导出已经接入。RSSHub、GitHub、Tavily、X、HTTP/MCP/Skill 与 Dashboard 仍属于后续阶段。
+> Stage 3 已完成实现、E2E、质量闸与独立复核：Stage 2 的统一模型、Registry/Router、SQLite 配置、Direct RSS/Atom/JSON Feed 查询、条件缓存、Channel 管理与 OPML 保持稳定；新增了用户自管 RSSHub Endpoint/Channel、分层 Probe、统一 Query/fallback，以及受限的 access-key 请求传输。GitHub、Tavily、X、HTTP/MCP/Skill 与 Dashboard 仍属于后续阶段。
 
 ```text
-一次性 Feed URL ───────────────┐
-                              ├─ Registry → Router → Feed Adapter
-SQLite Channel / OPML ─────────┘                │
-                                      Normalize + exact identity
-                                                │
-                                      可追溯 Envelope JSON
+一次性 Feed URL / Direct Channel ── Feed Adapter ─┐
+                                                  ├─ Query → Normalize / exact identity → Envelope JSON
+RSSHub Channel ─ Router ─ RSSHub Adapter ─────────┘
+                      │
+             user-owned Endpoint + 分层 Probe
 ```
 
 ## 快速开始
@@ -109,6 +108,26 @@ JSON
 
 Import 是非破坏性 merge，不把文档中缺失的订阅解释为退订；重复 URL 复用同一个 Direct Feed Channel，同一 Channel 可以属于多个 Collection。标准 Feed metadata、Collection 层级与 membership 可以回导。OPML 不承载 priority、enabled、RouteTemplate、fallback、Endpoint 或 Credential 等本地执行策略；`include`/`link` 不会被执行，未知 attribute 会在脱敏报告中说明后忽略。
 
+### RSSHub Endpoint 与 Channel（Stage 3）
+
+OmniHub 不安装 RSSHub，也不内置或默认选择公共实例。用户必须先显式保存 Endpoint，再创建引用该 Endpoint 的 RSSHub Channel：
+
+```bash
+./omnihub endpoints apply < endpoint.json
+./omnihub channels apply-rsshub < channel.json
+
+./omnihub endpoints probe ENDPOINT_ID
+./omnihub channels probe CHANNEL_ID
+```
+
+Endpoint Probe 只检查实例 health；Channel Probe 分开报告 Endpoint、Route metadata 与实际 Feed。三层成功才是 `ready`，Feed 可读但 health/metadata 不完整是 `degraded`，Feed 失败是 `failed`。这些 Probe 是单次事实，不会被 `doctor` 冒充为持续监控结果。
+
+API key 可以按本地 MVP 方案保存，并通过 `credentials` 查看掩码摘要。引用 Credential 的 RSSHub 请求只向 Channel 显式 Endpoint 发出：按实际 URL pathname（包含 Endpoint base path，不含 query）计算 `code=md5(pathname+accessKey)`；同 origin 且仍位于分段 base-path 内的 redirect 会先清除旧 `key/code`，再按新 pathname 重签。跨 origin、越界、编码 traversal、double slash 与认证 Feed 的 HTML alternate discovery 都在下一跳发网前失败。
+
+Stage 3 尚无 EgressProfile，认证链只使用 OmniHub 自建的受信任 transport，绝不继承外部注入的 `http.Transport`、DialContext/DialTLS、TLS 或 protocol 设置；发现外部 transport 即在发网前返回 `config_error`。proxy resolver 在签名前只读取已经清除 `key/code` 和受限 headers 的 request clone；若解析结果会命中 proxy，则 Endpoint 与 proxy 都不会收到网络请求。只有确认不命中 proxy 后，才向真正的网络请求注入 code 并直连。原 key 和派生 code 因而也不会暴露给 proxy resolver、Catalog、cache、日志、Error、Envelope 或 Probe。
+
+Endpoint Probe 始终匿名，因此受保护实例可如实返回 `403/auth_error`；Channel Probe 使用 Channel Credential 分别检查 health、Route metadata 与实际 Feed。`auth.used` 只在带签名的 RoundTrip 已取得 response 时为 `true`；无 response 或 cache hit 都保守为 `false`。
+
 ## 路由与诊断
 
 ```bash
@@ -182,7 +201,7 @@ Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 cr
 - `coverage` 描述 Adapter 实际观察的窗口；空结果不自动等于全量无结果。
 - `identity_dedupe=exact` 按同 Source 的稳定 upstream ID、canonical URL、最后才是规范化内容 hash 合并，并保留全部 Observation；`none` 不删除条目。
 - 坏 Feed 若重复使用 GUID，会优先借助条目 URL，或用内容/确定性 rank 保持条目独立，不把整批吞成一个 Item。
-- `similarity_grouping` 在 Stage 2 必须是 `off`。Embedding API、本地 Ollama、向量索引、阈值、模型升级重算和误合并恢复会在后续单独与项目 Owner 选型，不在当前实现中预埋一种答案。
+- `similarity_grouping` 当前必须是 `off`。Embedding API、本地 Ollama、向量索引、阈值、模型升级重算和误合并恢复会在后续单独与项目 Owner 选型，不在当前实现中预埋一种答案。
 - 无 Channel 完成为 `failed`；有成功但同时发生错误、fallback、截断或明确覆盖缺口为 `partial`；其余为 `complete`。
 
 ## 当前验证
@@ -193,16 +212,19 @@ Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 cr
 - V2EX `https://www.v2ex.com/index.xml` 实际 examined 50、返回 3 条；linux.do `https://linux.do/latest.rss` 实际 examined 30、返回 3 条。两者都因 Feed window/全局 limit 如实标记 `partial`，不是全站 exhaustive。
 - NodeSeek 的 `/rss.xml`、`/latest.rss` 和第三方 `rss.nodeseek.com` 在同一环境均返回 retryable `network_error`；因此内建 Source 仍只是声明，不标记 runtime ready。
 
-这些是一次验收窗口，不是可用性监控或长期 SLA。完整命令、修前/修后 hidden HTML 重放、SQLite/OPML 与质量闸记录在 [Test Report](test/test-report.md)。
+这些是一次验收窗口，不是可用性监控或长期 SLA。Stage 2 的完整证据保留在对应提交历史；当前 [Test Report](test/test-report.md) 记录 Stage 3 的真实 CLI、SQLite、loopback 与质量闸。
+
+同日的 Stage 3 当前对象验收进一步确认：Endpoint revision 4 的受保护 Endpoint 匿名 Probe exit 5、`403/auth_error`；带 Credential revision 3（v1）的 Channel Probe exit 0，health、Route metadata、Feed 三层均为 200，`route_found/feed_parsed=true` 并成为 `ready`。首次 Query 使 fixture log 4→5，exit 0、Envelope 为 `partial`、返回 1 Item 且 `auth.used=true`；同请求 cache hit 保持 5→5 且 `auth.used=false`。Credential revision 3→4（v2）后再次 Query 使日志 5→6、`auth.used=true`。隐式 proxy 负例中 proxy callback 恰好 1 次但看不到 access material，Endpoint/proxy 网络请求均为 0；外部 transport 负例的 custom DialContext 调用为 0，均返回 `config_error`、`auth.used=false`。Catalog、cache、CLI 输出与请求日志全文扫描均未出现原 key、`key=` 或 `code=`；全量 Go test/race/vet、四平台构建、Schema 与 `git diff --check` 均 exit 0。最终独立全链复核结论为 `approve`，无未解决 P0–P2。详见同一 [Test Report](test/test-report.md)。
 
 ## 当前边界
 
-尚未实现：
+尚未完成或尚未实现：
 
-- RSSHub 多 Endpoint 与 Route 探测；
+- OmniHub 不安装、启动或托管 RSSHub，也不保证每种 RSSHub 部署都提供 namespace metadata API；缺失 metadata 会被如实降级，不会冒充完整 Probe 成功；
 - GitHub、Tavily、X 等非 Feed Provider；
 - `fetch` 上游执行、HTTP API、MCP Server、JSONL、Feed 分发与 Agent Skill；
 - View/Subscription Plane、Run refresh、Dashboard Backend、Chrome Native Messaging Bridge 与前端；
+- Cookie transport，以及显式 EgressProfile、代理和 DNS→TCP→TLS→HTTP→Feed parse 主动诊断；这些属于后续独立阶段，不是 Stage 3 已交付能力；
 - embedding/向量数据库/Ollama similarity grouping；
 - MySQL Store、多实例运行、Linux/Windows 运行验证与 Windows 当前用户 ACL。
 

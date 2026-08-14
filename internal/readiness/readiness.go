@@ -1,6 +1,7 @@
 package readiness
 
 import (
+	"strings"
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
@@ -123,6 +124,11 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 	}
 
 	configured := true
+	if template.EndpointRequired && channel.EndpointProfileID == "" {
+		code := "endpoint_missing"
+		addCheck("endpoint_configured", CheckFailed, &code)
+		configured = false
+	}
 	if channel.EndpointProfileID != "" {
 		endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
 		switch {
@@ -138,7 +144,12 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 			addCheck("endpoint_configured", CheckPassed, nil)
 		}
 	}
-	if template.Auth.Required {
+	if template.Auth.Required && channel.CredentialID == "" {
+		code := "credential_missing"
+		addCheck("credential_resolved", CheckFailed, &code)
+		result.Readiness = StateBlocked
+		configured = false
+	} else if channel.CredentialID != "" {
 		credential, ok := catalog.Credential(channel.CredentialID)
 		switch {
 		case !ok:
@@ -146,7 +157,7 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 			addCheck("credential_resolved", CheckFailed, &code)
 			result.Readiness = StateBlocked
 			configured = false
-		case !credential.Enabled || (credential.AuthKind != "chrome_cookie" && credential.Value == nil):
+		case !credential.Enabled || (credential.AuthKind != "chrome_cookie" && (credential.Value == nil || strings.TrimSpace(*credential.Value) == "")):
 			code := "credential_unresolved"
 			addCheck("credential_resolved", CheckFailed, &code)
 			result.Readiness = StateBlocked
@@ -167,7 +178,7 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 
 	// Feed Adapter 随二进制发布，因此安装状态可以确定；但普通 doctor 仍不
 	// 发起网络请求，不能把“内建依赖存在”提升成“这个 Channel 已可达”。
-	if template.Adapter == "feed" {
+	if template.Adapter == "feed" || template.Adapter == "rsshub" {
 		addCheck("dependency_installed", CheckPassed, nil)
 		code := "upstream_not_probed"
 		addCheck("channel_probe", CheckUnknown, &code)

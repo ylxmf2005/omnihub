@@ -261,6 +261,10 @@ func (catalog *Catalog) RouteTemplates() []core.RouteTemplate {
 
 func (catalog *Catalog) Channels() []core.Channel { return catalog.SortedChannels() }
 
+func (catalog *Catalog) Endpoints() []core.EndpointProfile {
+	return sortedValues(catalog.endpoints, func(value core.EndpointProfile) string { return value.ID }, cloneEndpoint)
+}
+
 func (catalog *Catalog) Channel(id string) (core.Channel, bool) {
 	value, ok := catalog.channels[id]
 	return cloneChannel(value), ok

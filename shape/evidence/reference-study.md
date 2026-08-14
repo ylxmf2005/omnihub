@@ -72,7 +72,7 @@
 
 - 支持 RSS、Atom、JSON Feed 输出，也有 namespace、Radar rules 和 Route status 等 metadata。
 - Route 能声明 parameters/categories/features，其中 `requireConfig`、`requirePuppeteer`、`antiCrawler` 直接说明运行依赖。
-- 实例可配置 `ACCESS_KEY`，请求用 key/code；OmniHub 必须内部构造并统一脱敏。
+- 实例可配置 `ACCESS_KEY`。2026-08-14 再核对官方 [`access-control.ts`](https://github.com/DIYgod/RSSHub/blob/master/lib/middleware/access-control.ts) 与对应测试：服务端读取实际 URL `pathname`，接受原 `key` 或 `code=md5(pathname+ACCESS_KEY)`；query 不参与摘要，`/healthz` 不在免鉴权列表。常规 Node app 在 health、namespace API 与 Feed 前全局挂载该 middleware；Worker 部署不提供 namespace API。OmniHub 只发送派生 code，并自行收紧同源/base-path redirect、HTML discovery 与全链脱敏；这些收紧不是 RSSHub 官方保证。
 - RSSHub 自身可能使用 memory/Redis/HTTP cache；外部调用方不能假设不同实例、Route 的 TTL 与 freshness 一致。
 - 当前代码树有 V2EX Route；没有发现 NodeSeek 或 linux.do Route 目录。
 - 当前 Twitter/X Route 要求 `TWITTER_AUTH_TOKEN` 或 Developer API 配置。RSSHub 并不是匿名 X 搜索替代品。

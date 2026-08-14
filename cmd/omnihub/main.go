@@ -31,9 +31,17 @@ const usage = `usage:
   omnihub sources
   omnihub providers
   omnihub route-templates
+  omnihub endpoints
+  omnihub endpoints apply < endpoint.json
+  omnihub endpoints disable ID --revision N
+  omnihub endpoints probe ID
+  omnihub credentials
+  omnihub credentials apply < credential.json
   omnihub channels
   omnihub channels apply < direct-feed.json
+  omnihub channels apply-rsshub < rsshub-channel.json
   omnihub channels disable ID --revision N
+  omnihub channels probe ID
   omnihub opml import < subscriptions.opml
   omnihub opml export > subscriptions.opml
   omnihub doctor --json
@@ -54,11 +62,13 @@ const (
 )
 
 type catalogOutput struct {
-	SchemaVersion  string                `json:"schema_version"`
-	Sources        *[]core.Source        `json:"sources,omitempty"`
-	Providers      *[]core.Provider      `json:"providers,omitempty"`
-	RouteTemplates *[]core.RouteTemplate `json:"route_templates,omitempty"`
-	Channels       *[]core.Channel       `json:"channels,omitempty"`
+	SchemaVersion  string                    `json:"schema_version"`
+	Sources        *[]core.Source            `json:"sources,omitempty"`
+	Providers      *[]core.Provider          `json:"providers,omitempty"`
+	RouteTemplates *[]core.RouteTemplate     `json:"route_templates,omitempty"`
+	Endpoints      *[]core.EndpointProfile   `json:"endpoints,omitempty"`
+	Credentials    *[]core.CredentialSummary `json:"credentials,omitempty"`
+	Channels       *[]core.Channel           `json:"channels,omitempty"`
 }
 
 type routePlanOutput struct {
@@ -67,6 +77,19 @@ type routePlanOutput struct {
 	UpstreamExecuted bool        `json:"upstream_executed"`
 	Routable         bool        `json:"routable"`
 	Plan             router.Plan `json:"plan"`
+}
+
+type rssHubEndpointProbeOutput struct {
+	SchemaVersion     string                      `json:"schema_version"`
+	EndpointProfileID string                      `json:"endpoint_profile_id"`
+	Probe             adapter.RSSHubEndpointProbe `json:"probe"`
+}
+
+type rssHubChannelProbeOutput struct {
+	SchemaVersion     string                    `json:"schema_version"`
+	ChannelID         string                    `json:"channel_id"`
+	EndpointProfileID string                    `json:"endpoint_profile_id"`
+	Probe             adapter.RSSHubProbeReport `json:"probe"`
 }
 
 func main() {
@@ -148,6 +171,119 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		templates := catalog.RouteTemplates()
 		value = catalogOutput{SchemaVersion: core.SchemaVersion, RouteTemplates: &templates}
 
+	case "endpoints":
+		if len(args) == 1 {
+			catalog, closeCatalog, err := loadCatalog(context.Background())
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+				return exitConfig
+			}
+			defer closeCatalog()
+			endpoints := catalog.Endpoints()
+			if endpoints == nil {
+				endpoints = []core.EndpointProfile{}
+			}
+			value = catalogOutput{SchemaVersion: core.SchemaVersion, Endpoints: &endpoints}
+			break
+		}
+		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" && args[1] != "probe" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		switch args[1] {
+		case "apply":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyEndpointProfileInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode RSSHub endpoint: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			endpoint, applyErr := service.ApplyEndpointProfile(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply RSSHub endpoint: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = endpoint
+		case "disable":
+			if len(args) < 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			expectedRevision, parseErr := revisionFlag("endpoints disable", args[3:], stderr)
+			if parseErr != nil {
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			endpoint, disableErr := service.DisableEndpointProfile(context.Background(), args[2], expectedRevision)
+			if disableErr != nil {
+				fmt.Fprintf(stderr, "omnihub: disable RSSHub endpoint: %v\n", disableErr)
+				return managementExitCode(disableErr)
+			}
+			value = endpoint
+		case "probe":
+			if len(args) != 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			probe, code := runRSSHubEndpointProbe(args[2], stderr)
+			if probe == nil {
+				return code
+			}
+			value, resultExitCode = probe, code
+		}
+
+	case "credentials":
+		if len(args) == 1 {
+			service, closeService, err := openReadManagementService(context.Background())
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: open credential reader: %v\n", err)
+				return exitConfig
+			}
+			defer closeService()
+			credentials, listErr := service.ListCredentialSummaries(context.Background())
+			if listErr != nil {
+				fmt.Fprintf(stderr, "omnihub: list credentials: %v\n", listErr)
+				return managementExitCode(listErr)
+			}
+			value = catalogOutput{SchemaVersion: core.SchemaVersion, Credentials: &credentials}
+			break
+		}
+		if len(args) != 2 || args[1] != "apply" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		input, decodeErr := decodeStrictJSON[management.ApplyCredentialInput](stdin)
+		if decodeErr != nil {
+			fmt.Fprintf(stderr, "omnihub: decode RSSHub credential: %v\n", decodeErr)
+			return exitParameter
+		}
+		service, closeService, openErr := openManagementService(context.Background())
+		if openErr != nil {
+			fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+			return exitConfig
+		}
+		defer closeService()
+		credential, applyErr := service.ApplyCredential(context.Background(), input)
+		if applyErr != nil {
+			fmt.Fprintf(stderr, "omnihub: apply RSSHub credential: %v\n", applyErr)
+			return managementExitCode(applyErr)
+		}
+		value = credential
+
 	case "channels":
 		if len(args) == 1 {
 			catalog, closeCatalog, err := loadCatalog(context.Background())
@@ -163,7 +299,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			value = catalogOutput{SchemaVersion: core.SchemaVersion, Channels: &channels}
 			break
 		}
-		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" {
+		if len(args) < 2 || args[1] != "apply" && args[1] != "apply-rsshub" && args[1] != "disable" && args[1] != "probe" {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
 		}
@@ -190,19 +326,35 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				return managementExitCode(applyErr)
 			}
 			value = channel
+		case "apply-rsshub":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyRSSHubChannelInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode RSSHub channel: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			channel, applyErr := service.ApplyRSSHubChannel(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply RSSHub channel: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = channel
 		case "disable":
 			if len(args) < 3 {
 				fmt.Fprint(stderr, usage)
 				return exitParameter
 			}
-			flags := flag.NewFlagSet("channels disable", flag.ContinueOnError)
-			flags.SetOutput(stderr)
-			var expectedRevision int64
-			flags.Int64Var(&expectedRevision, "revision", 0, "expected Channel revision")
-			if parseErr := flags.Parse(args[3:]); parseErr != nil || flags.NArg() != 0 {
-				if parseErr == nil {
-					fmt.Fprintln(stderr, "omnihub: channels disable: unexpected positional arguments")
-				}
+			expectedRevision, parseErr := revisionFlag("channels disable", args[3:], stderr)
+			if parseErr != nil {
 				return exitParameter
 			}
 			service, closeService, openErr := openManagementService(context.Background())
@@ -217,6 +369,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				return managementExitCode(disableErr)
 			}
 			value = channel
+		case "probe":
+			if len(args) != 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			probe, code := runRSSHubChannelProbe(args[2], stderr)
+			if probe == nil {
+				return code
+			}
+			value, resultExitCode = probe, code
 		}
 
 	case "opml":
@@ -226,7 +388,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		openService := openManagementService
 		if args[1] == "export" {
-			openService = openOPMLExportService
+			openService = openReadManagementService
 		}
 		service, closeService, err := openService(context.Background())
 		if err != nil {
@@ -366,7 +528,8 @@ func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, st
 		fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
 		return nil, exitConfig
 	}
-	service := query.Service{Feed: adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}}
+	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
+	service := query.Service{Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}}
 	envelope, err := service.Execute(context.Background(), catalog, operation)
 	if err != nil {
 		if errors.Is(err, router.ErrNoRoute) {
@@ -383,6 +546,85 @@ func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, st
 		return envelope, exitFailed
 	}
 	return envelope, 0
+}
+
+func runRSSHubEndpointProbe(endpointID string, stderr io.Writer) (any, int) {
+	catalog, closeCatalog, err := loadCatalog(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+		return nil, exitConfig
+	}
+	defer closeCatalog()
+	endpoint, ok := catalog.Endpoint(strings.TrimSpace(endpointID))
+	if !ok || endpoint.Provider != "rsshub" {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub endpoint: endpoint %q is not configured\n", endpointID)
+		return nil, exitConfig
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	probe := (adapter.RSSHubAdapter{}).ProbeEndpoint(ctx, endpoint)
+	code := 0
+	if !probe.Passed {
+		code = exitFailed
+		if probe.Error != nil && probe.Error.Code == core.ErrorConfig {
+			code = exitConfig
+		}
+	}
+	return rssHubEndpointProbeOutput{SchemaVersion: core.SchemaVersion, EndpointProfileID: endpoint.ID, Probe: probe}, code
+}
+
+func runRSSHubChannelProbe(channelID string, stderr io.Writer) (any, int) {
+	catalog, closeCatalog, err := loadCatalog(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+		return nil, exitConfig
+	}
+	defer closeCatalog()
+	channel, ok := catalog.Channel(strings.TrimSpace(channelID))
+	if !ok {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: channel %q is not configured\n", channelID)
+		return nil, exitConfig
+	}
+	template, ok := catalog.RouteTemplate(channel.RouteTemplateID)
+	if !ok || template.Adapter != "rsshub" || template.Provider != "rsshub" {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: channel %q is not bound to RSSHub\n", channelID)
+		return nil, exitConfig
+	}
+	endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
+	if !ok {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: endpoint %q is not configured\n", channel.EndpointProfileID)
+		return nil, exitConfig
+	}
+	var credential *core.Credential
+	if channel.CredentialID != "" {
+		resolved, exists := catalog.Credential(channel.CredentialID)
+		if !exists || !resolved.Enabled || resolved.Value == nil {
+			fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: credential %q is unresolved\n", channel.CredentialID)
+			return nil, exitConfig
+		}
+		credential = &resolved
+	}
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationLatest,
+		Scope: core.Scope{Channels: []string{channel.ID}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
+		Limit: 100, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
+	}
+	ctx, cancel, err := operation.Context(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: %v\n", err)
+		return nil, exitInternal
+	}
+	defer cancel()
+	probe := (adapter.RSSHubAdapter{}).Probe(ctx, adapter.RSSHubRequest{
+		Operation: operation, Channel: channel, RouteTemplate: template, Endpoint: endpoint, Credential: credential,
+	})
+	code := 0
+	if probe.Readiness == "failed" {
+		code = exitFailed
+	}
+	return rssHubChannelProbeOutput{
+		SchemaVersion: core.SchemaVersion, ChannelID: channel.ID, EndpointProfileID: endpoint.ID, Probe: probe,
+	}, code
 }
 
 type transientDirectFeed struct {
@@ -514,6 +756,21 @@ func decodeStrictJSON[T any](reader io.Reader) (T, error) {
 	return value, nil
 }
 
+func revisionFlag(name string, args []string, stderr io.Writer) (int64, error) {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var expectedRevision int64
+	flags.Int64Var(&expectedRevision, "revision", 0, "expected resource revision")
+	if err := flags.Parse(args); err != nil {
+		return 0, err
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "omnihub: %s: unexpected positional arguments\n", name)
+		return 0, errors.New("unexpected positional arguments")
+	}
+	return expectedRevision, nil
+}
+
 func loadCatalog(ctx context.Context) (*registry.Catalog, func(), error) {
 	paths, err := resolveCLIPaths()
 	if err != nil {
@@ -577,7 +834,9 @@ func openManagementService(ctx context.Context) (management.Service, func(), err
 	return management.Service{Store: store, Catalog: catalog}, func() { _ = store.Close() }, nil
 }
 
-func openOPMLExportService(ctx context.Context) (management.Service, func(), error) {
+// openReadManagementService 为 OPML/Credential 读取复用同一无副作用入口。
+// 缺数据库时使用内存 Store，不创建用户目录或 SQLite 文件。
+func openReadManagementService(ctx context.Context) (management.Service, func(), error) {
 	paths, err := resolveCLIPaths()
 	if err != nil {
 		return management.Service{}, func() {}, fmt.Errorf("resolve paths: %w", err)
@@ -610,7 +869,7 @@ func openOPMLExportService(ctx context.Context) (management.Service, func(), err
 }
 
 func managementExitCode(err error) int {
-	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidOPML) {
+	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) {
 		return exitParameter
 	}
 	return exitConfig
