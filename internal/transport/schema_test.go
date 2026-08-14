@@ -171,9 +171,14 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 
 	itemSchema := resolvedSchema(t, artifacts.Schemas.Item)
 	item := contractExample(t, "../../shape/contract.md", 5)
-	item["observations"] = nil
-	if err := itemSchema.Validate(&item); err == nil {
-		t.Fatal("item schema accepted null observations")
+	for name, observations := range map[string]any{"null": nil, "empty": []any{}} {
+		t.Run("item observations "+name, func(t *testing.T) {
+			value := cloneJSONMap(t, item)
+			value["observations"] = observations
+			if err := itemSchema.Validate(&value); err == nil {
+				t.Fatalf("item schema accepted %s observations", name)
+			}
+		})
 	}
 }
 

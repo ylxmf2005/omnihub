@@ -197,7 +197,7 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 		applyEnvelopeConstraints(schema)
 	}
 	if typ == reflect.TypeFor[core.Item]() {
-		requireArray(schema.Properties["observations"], false)
+		requireArray(schema.Properties["observations"], true)
 	}
 }
 
@@ -301,7 +301,7 @@ func applyEnvelopeConstraints(schema *jsonschema.Schema) {
 		requireArray(continuation.Properties["limitations"], false)
 	}
 	if items := schema.Properties["items"]; items != nil && items.Items != nil {
-		requireArray(items.Items.Properties["observations"], false)
+		requireArray(items.Items.Properties["observations"], true)
 	}
 }
 

@@ -165,10 +165,16 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 	}
 	addCheck("channel_configured", CheckPassed, nil)
 
-	// Stage 1 不执行 dependency 或上游 probe；任何 Adapter 都不能仅凭声明被
-	// 报成已安装/可达。真实 Probe 会在后续纵切里替换这条 unknown 证据。
-	code := "dependency_not_probed"
-	addCheck("dependency_installed", CheckUnknown, &code)
+	// Feed Adapter 随二进制发布，因此安装状态可以确定；但普通 doctor 仍不
+	// 发起网络请求，不能把“内建依赖存在”提升成“这个 Channel 已可达”。
+	if template.Adapter == "feed" {
+		addCheck("dependency_installed", CheckPassed, nil)
+		code := "upstream_not_probed"
+		addCheck("channel_probe", CheckUnknown, &code)
+	} else {
+		code := "dependency_not_probed"
+		addCheck("dependency_installed", CheckUnknown, &code)
+	}
 	if result.Readiness == StateUnknown {
 		result.Readiness = StateDegraded
 	}

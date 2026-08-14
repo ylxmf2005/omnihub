@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/config"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/management"
+	"github.com/ylxmf2005/omnihub/internal/query"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/router"
@@ -26,8 +32,16 @@ const usage = `usage:
   omnihub providers
   omnihub route-templates
   omnihub channels
+  omnihub channels apply < direct-feed.json
+  omnihub channels disable ID --revision N
+  omnihub opml import < subscriptions.opml
+  omnihub opml export > subscriptions.opml
   omnihub doctor --json
   omnihub plan < operation.json
+  omnihub latest < latest.json
+  omnihub search < search.json
+  omnihub latest --feed-url URL --source ID [--limit N] [--format json]
+  omnihub search --feed-url URL --source ID --query QUERY [--limit N] [--format json]
 
 plan only selects declared channels; it never executes an upstream request.
 `
@@ -36,6 +50,7 @@ const (
 	exitInternal  = 1
 	exitParameter = 3
 	exitConfig    = 4
+	exitFailed    = 5
 )
 
 type catalogOutput struct {
@@ -134,21 +149,104 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		value = catalogOutput{SchemaVersion: core.SchemaVersion, RouteTemplates: &templates}
 
 	case "channels":
-		if len(args) != 1 {
+		if len(args) == 1 {
+			catalog, closeCatalog, err := loadCatalog(context.Background())
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+				return exitConfig
+			}
+			defer closeCatalog()
+			channels := catalog.Channels()
+			if channels == nil {
+				channels = []core.Channel{}
+			}
+			value = catalogOutput{SchemaVersion: core.SchemaVersion, Channels: &channels}
+			break
+		}
+		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
 		}
-		catalog, closeCatalog, err := loadCatalog(context.Background())
+		switch args[1] {
+		case "apply":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyDirectFeedInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode direct feed: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			channel, applyErr := service.ApplyDirectFeed(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply direct feed: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = channel
+		case "disable":
+			if len(args) < 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			flags := flag.NewFlagSet("channels disable", flag.ContinueOnError)
+			flags.SetOutput(stderr)
+			var expectedRevision int64
+			flags.Int64Var(&expectedRevision, "revision", 0, "expected Channel revision")
+			if parseErr := flags.Parse(args[3:]); parseErr != nil || flags.NArg() != 0 {
+				if parseErr == nil {
+					fmt.Fprintln(stderr, "omnihub: channels disable: unexpected positional arguments")
+				}
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			channel, disableErr := service.DisableChannel(context.Background(), args[2], expectedRevision)
+			if disableErr != nil {
+				fmt.Fprintf(stderr, "omnihub: disable channel: %v\n", disableErr)
+				return managementExitCode(disableErr)
+			}
+			value = channel
+		}
+
+	case "opml":
+		if len(args) != 2 || args[1] != "import" && args[1] != "export" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		openService := openManagementService
+		if args[1] == "export" {
+			openService = openOPMLExportService
+		}
+		service, closeService, err := openService(context.Background())
 		if err != nil {
-			fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+			fmt.Fprintf(stderr, "omnihub: open management service: %v\n", err)
 			return exitConfig
 		}
-		defer closeCatalog()
-		channels := catalog.Channels()
-		if channels == nil {
-			channels = []core.Channel{}
+		defer closeService()
+		if args[1] == "export" {
+			if err := service.ExportOPML(context.Background(), stdout); err != nil {
+				fmt.Fprintf(stderr, "omnihub: export OPML: %v\n", err)
+				return managementExitCode(err)
+			}
+			return 0
 		}
-		value = catalogOutput{SchemaVersion: core.SchemaVersion, Channels: &channels}
+		report, err := service.ImportOPML(context.Background(), stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: import OPML: %v\n", err)
+			return managementExitCode(err)
+		}
+		value = report
 
 	case "doctor":
 		if len(args) != 2 || args[1] != "--json" {
@@ -170,18 +268,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 
 		// Operation 从 stdin 严格读取，避免调用方拼接 argv 或遗漏未知字段。
-		decoder := json.NewDecoder(stdin)
-		decoder.DisallowUnknownFields()
-		var operation core.Operation
-		if err := decoder.Decode(&operation); err != nil {
-			fmt.Fprintf(stderr, "omnihub: decode plan operation: %v\n", err)
-			return exitParameter
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-			if err == nil {
-				err = errors.New("more than one JSON value")
-			}
+		operation, err := decodeStrictJSON[core.Operation](stdin)
+		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: decode plan operation: %v\n", err)
 			return exitParameter
 		}
@@ -217,6 +305,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			resultExitCode = exitConfig
 		}
 
+	case "latest", "search":
+		operationKind := core.OperationKind(args[0])
+		result, code := runQueryCommand(operationKind, args[1:], stdin, stderr)
+		if result == nil {
+			return code
+		}
+		value = result
+		resultExitCode = code
+
 	default:
 		fmt.Fprint(stderr, usage)
 		return exitParameter
@@ -229,6 +326,192 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitInternal
 	}
 	return resultExitCode
+}
+
+type directFeedFlags struct {
+	feedURL    string
+	source     string
+	query      string
+	format     string
+	identity   string
+	from       string
+	to         string
+	limit      int
+	deadlineMS int
+}
+
+func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (any, int) {
+	operation, transient, err := queryOperation(kind, args, stdin, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: decode %s operation: %v\n", kind, err)
+		return nil, exitParameter
+	}
+
+	catalog, closeCatalog, err := loadCatalog(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
+		return nil, exitConfig
+	}
+	defer closeCatalog()
+	if transient != nil {
+		catalog, err = catalog.WithSourceAndChannel(transient.source, transient.channel)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: configure direct feed: %v\n", err)
+			return nil, exitConfig
+		}
+	}
+
+	paths, err := resolveCLIPaths()
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: resolve paths: %v\n", err)
+		return nil, exitConfig
+	}
+	service := query.Service{Feed: adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}}
+	envelope, err := service.Execute(context.Background(), catalog, operation)
+	if err != nil {
+		if errors.Is(err, router.ErrNoRoute) {
+			fmt.Fprintf(stderr, "omnihub: execute %s: %v\n", kind, err)
+			return nil, exitConfig
+		}
+		fmt.Fprintf(stderr, "omnihub: execute %s: %v\n", kind, err)
+		if errors.Is(err, core.ErrInvalidOperation) {
+			return nil, exitParameter
+		}
+		return nil, exitInternal
+	}
+	if envelope.Status == core.StatusFailed {
+		return envelope, exitFailed
+	}
+	return envelope, 0
+}
+
+type transientDirectFeed struct {
+	source  core.Source
+	channel core.Channel
+}
+
+func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (core.Operation, *transientDirectFeed, error) {
+	if len(args) == 0 {
+		switch kind {
+		case core.OperationLatest:
+			input, err := decodeStrictJSON[core.LatestInput](stdin)
+			return input.OperationRequest(), nil, err
+		case core.OperationSearch:
+			input, err := decodeStrictJSON[core.SearchInput](stdin)
+			return input.OperationRequest(), nil, err
+		default:
+			return core.Operation{}, nil, fmt.Errorf("unsupported operation %q", kind)
+		}
+	}
+
+	flags := flag.NewFlagSet(string(kind), flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	options := directFeedFlags{}
+	flags.StringVar(&options.feedURL, "feed-url", "", "absolute RSS, Atom, JSON Feed, or discovery page URL")
+	flags.StringVar(&options.source, "source", "", "logical source ID")
+	flags.StringVar(&options.query, "query", "", "bounded-window search query")
+	flags.StringVar(&options.format, "format", "json", "output format (json)")
+	flags.StringVar(&options.identity, "identity-dedupe", string(core.IdentityExact), "identity dedupe mode (exact or none)")
+	flags.StringVar(&options.from, "from", "", "inclusive RFC3339 lower time bound")
+	flags.StringVar(&options.to, "to", "", "inclusive RFC3339 upper time bound")
+	flags.IntVar(&options.limit, "limit", 20, "maximum returned items")
+	flags.IntVar(&options.deadlineMS, "deadline-ms", 30000, "whole-operation deadline in milliseconds")
+	if err := flags.Parse(args); err != nil {
+		return core.Operation{}, nil, err
+	}
+	if flags.NArg() != 0 {
+		return core.Operation{}, nil, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if strings.TrimSpace(options.feedURL) == "" || strings.TrimSpace(options.source) == "" {
+		return core.Operation{}, nil, errors.New("--feed-url and --source are required for flag-based queries")
+	}
+	if options.format != "json" {
+		return core.Operation{}, nil, fmt.Errorf("unsupported format %q", options.format)
+	}
+	if kind == core.OperationSearch && strings.TrimSpace(options.query) == "" {
+		return core.Operation{}, nil, errors.New("--query is required for search")
+	}
+	if kind == core.OperationLatest && options.query != "" {
+		return core.Operation{}, nil, errors.New("--query is only valid for search")
+	}
+	normalizedURL, err := adapter.NormalizeFeedURL(options.feedURL)
+	if err != nil {
+		return core.Operation{}, nil, err
+	}
+	timeRange, err := parseTimeRange(options.from, options.to)
+	if err != nil {
+		return core.Operation{}, nil, err
+	}
+
+	sourceID := strings.TrimSpace(options.source)
+	digest := sha256.Sum256([]byte(sourceID + "\x00" + normalizedURL))
+	channelID := fmt.Sprintf("channel_ephemeral_feed_%x", digest)
+	operation := core.Operation{
+		SchemaVersion:      core.SchemaVersion,
+		Operation:          kind,
+		Scope:              core.Scope{Channels: []string{channelID}},
+		RoutePolicy:        core.RoutePolicy{Mode: core.RouteAuto, Aggregate: false, AllowFallback: false},
+		Limit:              options.limit,
+		TimeRange:          timeRange,
+		IdentityDedupe:     core.IdentityDedupe(options.identity),
+		SimilarityGrouping: core.SimilarityOff,
+		DeadlineMS:         options.deadlineMS,
+	}
+	if kind == core.OperationSearch {
+		query := strings.TrimSpace(options.query)
+		operation.Query = &query
+	}
+	if err := operation.Validate(); err != nil {
+		return core.Operation{}, nil, err
+	}
+	return operation, &transientDirectFeed{
+		source: core.Source{ID: sourceID, DisplayName: sourceID, Origin: "user", Enabled: true},
+		channel: core.Channel{
+			ID: channelID, DisplayName: sourceID, Source: sourceID,
+			RouteTemplateID: "direct-feed-window", Parameters: map[string]any{"url": normalizedURL},
+			Priority: 100, Enabled: true, Revision: 1,
+		},
+	}, nil
+}
+
+func parseTimeRange(from, to string) (core.TimeRange, error) {
+	result := core.TimeRange{}
+	for _, bound := range []struct {
+		raw    string
+		target **time.Time
+	}{{raw: from, target: &result.From}, {raw: to, target: &result.To}} {
+		raw, target := bound.raw, bound.target
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return core.TimeRange{}, fmt.Errorf("parse time bound %q as RFC3339: %w", raw, err)
+		}
+		utc := parsed.UTC()
+		*target = &utc
+	}
+	if result.From != nil && result.To != nil && result.From.After(*result.To) {
+		return core.TimeRange{}, errors.New("--from must not be after --to")
+	}
+	return result, nil
+}
+
+func decodeStrictJSON[T any](reader io.Reader) (T, error) {
+	var value T
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("more than one JSON value")
+		}
+		return value, err
+	}
+	return value, nil
 }
 
 func loadCatalog(ctx context.Context) (*registry.Catalog, func(), error) {
@@ -277,6 +560,62 @@ func openCatalogStore(ctx context.Context, databasePath string) (*sqlite.Store, 
 	return sqlite.OpenReadOnly(ctx, databasePath)
 }
 
+func openManagementService(ctx context.Context) (management.Service, func(), error) {
+	paths, err := resolveCLIPaths()
+	if err != nil {
+		return management.Service{}, func() {}, fmt.Errorf("resolve paths: %w", err)
+	}
+	store, err := sqlite.Open(ctx, paths.Database)
+	if err != nil {
+		return management.Service{}, func() {}, err
+	}
+	catalog, err := registry.Load(ctx, store, filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename))
+	if err != nil {
+		_ = store.Close()
+		return management.Service{}, func() {}, err
+	}
+	return management.Service{Store: store, Catalog: catalog}, func() { _ = store.Close() }, nil
+}
+
+func openOPMLExportService(ctx context.Context) (management.Service, func(), error) {
+	paths, err := resolveCLIPaths()
+	if err != nil {
+		return management.Service{}, func() {}, fmt.Errorf("resolve paths: %w", err)
+	}
+	bundlePath := filepath.Join(paths.ConfigDir, registry.ImportedBundleFilename)
+	if _, err := os.Stat(paths.Database); errors.Is(err, os.ErrNotExist) {
+		store, openErr := sqlite.Open(ctx, ":memory:")
+		if openErr != nil {
+			return management.Service{}, func() {}, openErr
+		}
+		catalog, loadErr := registry.Load(ctx, store, bundlePath)
+		if loadErr != nil {
+			_ = store.Close()
+			return management.Service{}, func() {}, loadErr
+		}
+		return management.Service{Store: store, Catalog: catalog}, func() { _ = store.Close() }, nil
+	} else if err != nil {
+		return management.Service{}, func() {}, fmt.Errorf("inspect database: %w", err)
+	}
+	store, err := openCatalogStore(ctx, paths.Database)
+	if err != nil {
+		return management.Service{}, func() {}, err
+	}
+	catalog, err := registry.Load(ctx, store, bundlePath)
+	if err != nil {
+		_ = store.Close()
+		return management.Service{}, func() {}, err
+	}
+	return management.Service{Store: store, Catalog: catalog}, func() { _ = store.Close() }, nil
+}
+
+func managementExitCode(err error) int {
+	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidOPML) {
+		return exitParameter
+	}
+	return exitConfig
+}
+
 func resolveCLIPaths() (config.Paths, error) {
 	paths, err := config.Resolve()
 	if err != nil {
@@ -293,6 +632,12 @@ func resolveCLIPaths() (config.Paths, error) {
 			return config.Paths{}, errors.New("OMNIHUB_DATABASE must not be empty")
 		}
 		paths.Database = value
+	}
+	if value, exists := os.LookupEnv("OMNIHUB_CACHE_DIR"); exists {
+		if value == "" {
+			return config.Paths{}, errors.New("OMNIHUB_CACHE_DIR must not be empty")
+		}
+		paths.CacheDir = value
 	}
 	return paths, nil
 }

@@ -23,7 +23,8 @@
 - Chrome 现实：普通 localhost Dashboard 受同源与 HttpOnly 限制，无法读取其他站点 Cookie；可支持的正式路径是 Chrome MV3 Companion Extension 请求 optional host permission，通过 `chrome.cookies` 按执行直接读取，再经长连接 Native Messaging 与当前用户专属 IPC 交给 CLI/`serve`。Chrome 105+ 在 `connectNative()` 端口存活时会保持 Extension Service Worker；Chrome 关闭或 Bridge 断开时，依赖 Cookie 的 Channel 必须明确不可用。
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
-- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0 已提交并推送，Stage 1 的 Core、Registry、Router、readiness、SQLite user catalog 与诊断 CLI 已实现并完成 Test/Review。授权仍不扩大到 Stage 2+ 的真实 Provider、Dashboard 前端或 Chrome Extension 客户端。
+- 已确认语义去重边界：Stage 2 只实现可解释的 exact identity dedupe。Embedding Provider（云 API 或本地 Ollama）、向量索引（SQLite/本地 HNSW 或独立向量数据库）、阈值、误合并恢复与模型升级重算必须在后续独立选型中与用户确认；当前不得提前绑定实现。
+- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0/1 已提交并推送。Stage 2 已基于 `main@83577ca85cc02ebed0cb71dfb6c2b9af69c5fe94` 完成 Direct Feed Adapter、Query Service、`latest/search` CLI、文件条件缓存、Direct Feed 管理和 OPML 闭环，并通过 Test/Review。授权不扩大到 Stage 3+ 的 RSSHub/非 Feed Provider、Dashboard 前端或 Chrome Extension 客户端。
 
 ## Goal
 
@@ -54,6 +55,7 @@
 - v1 不实现 MySQL Store、多实例部署、分布式锁、租户/RBAC 或伪分布式兼容层；这里只冻结未来替换 Store 所需的领域边界和数据不变量。
 - v1 只支持 Google Chrome 常规 Profile；不直接解密浏览器 Cookie 数据库，不用 remote debugging/CDP 绕过 Chrome 保护，不默认扫描全部 Profile、域名或 Cookie，不支持 Firefox/Safari/Edge 与 Incognito。
 - v1 不接入系统 Keychain/Secret Service/Credential Manager；API Key/Token 的保护边界就是 loopback 进程、SQLite 文件权限和用户本机账号。Cookie 不持久化，因此 Chrome 未运行时不承诺依赖 Cookie 的后台刷新。
+- Stage 2 不实现 embedding、向量数据库或基于向量的删除式去重；后续能力默认先作为可解释的 similarity grouping 设计，是否删除内容需重新取得用户决定。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
 
 ## Acceptance Evidence
@@ -62,6 +64,9 @@
 - Chrome Cookie 只能经用户授权的当前 Chrome Profile 与在线 Browser Bridge 按执行读取；Cookie 不进入 SQLite、HTTP、Run、Error、日志或 fixture，CLI 与 `serve` 复用同一本机 IPC。
 - Channel health 分开呈现 Bridge、权限、Credential、Endpoint 与真实 Probe；依赖 Chrome 的 Channel 在 Bridge 离线时如实返回 `browser_unavailable`，不影响无关 Channel，并保留已有 View Snapshot。
 - 公共合同示例可通过 JSON/YAML 校验，实施计划能从合同冻结、Repository/SQLite spike、五条纵切一路推进到 Dashboard Backend 与公共出口。
+- Stage 2 的 RSS/Atom/JSON Feed 与 HTML alternate discovery 必须从真实 CLI 进入统一 Envelope；ETag/Last-Modified 跨进程重验证、业务失败、缓存失败与覆盖窗口分别留证。
+- Direct Feed Channel 必须用 revision CAS 创建/更新/禁用；OPML import 为非破坏性 merge，并能回导标准 Feed metadata、稳定 Source/Channel identity、Collection 层级与 membership，不导出本地执行凭据。
+- Stage 2 只交付 `identity_dedupe=none|exact` 与 `similarity_grouping=off`；embedding API/本地 Ollama、向量索引和阈值在后续独立 Shape/选型前不得进入实现。
 
 ## Current Artifacts
 
@@ -70,7 +75,7 @@
 - `shape/contract.md`：`ready`，统一请求/结果、RouteTemplate/Channel、Credential、Chrome Bridge、Run、Dashboard 管理资源与出口映射。
 - `shape/design.md`：`ready`，Query/Subscription 双平面、Repository/SQLite、Channel 管理、Chrome Companion、Dashboard、刷新和安全设计。
 - `plan.md`：`ready`，从合同/Repository spike、Dashboard Backend 到 v1 候选发布的分阶段路线。
-- `dev/implementation.md`：`ready`，Stage 1 Core、Registry、Router、readiness、SQLite v2 与诊断 CLI 的实际实现和边界。
-- `test/test-plan.md`：`completed`，Stage 1 风险模型、真实 CLI/SQLite 重放与完整质量闸。
-- `test/test-report.md`：`passed`，最终对象可按 Stage 1 承诺交付；范围外能力与证据边界已具名。
-- `review/review.md`：`approve`，相对 `5442559232e9c39608ce99b2f3cbf98af9406389` 的完整工作树无未解决 finding。
+- `dev/implementation.md`：`ready`，Stage 2 Direct Feed、Query/CLI、管理与 OPML 的最终实现账本。
+- `test/test-plan.md`：`ready`，Stage 2 风险模型、真实 CLI/Feed/SQLite 重放与质量闸。
+- `test/test-report.md`：`passed`，真实 CLI/Feed/SQLite/WAL/公开来源、race 与跨平台构建证据已收口。
+- `review/review.md`：`approve`，独立执行/安全审查与合同/CLI/证据审查均无剩余 P0-P2。

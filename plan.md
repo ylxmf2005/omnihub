@@ -1,10 +1,10 @@
 # OmniHub Implementation Plan
 
-状态：`ready`
+状态：`Stage 2 complete`
 
-已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。本计划不表示仓库已创建或代码已实现。
+已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0/1 已交付；Stage 2 已实现并处于最终 Test/Review，后续阶段仍只是计划。
 
-## Stage 0：冻结合同与创建独立仓库
+## Stage 0：冻结合同与创建独立仓库（已完成）
 
 目标：先固定真实项目边界和单一合同来源，再开始写 Adapter。
 
@@ -20,7 +20,7 @@
 
 完成证据：Schema 示例全部可校验；四个 spike 有可重放命令和实际输出；Repository contract 不泄露 SQLite 类型；没有自造的 External Adapter handshake。
 
-## Stage 1：Core、Registry、Router 与诊断骨架
+## Stage 1：Core、Registry、Router 与诊断骨架（已完成）
 
 目标：即使不访问真实上游，也能确定性校验请求、选择 Channel、聚合状态。
 
@@ -33,7 +33,7 @@
 
 完成证据：固定 registry 下 Channel 选择、回退、skipped reason 与状态聚合可重复；builtin RouteTemplate 不可被原地修改，user Channel/overlay 可升级保留；Repository 原子性、stdout/stderr 与 secret redaction 有证据。
 
-## Stage 2：Query Plane + Direct Feed 纵切
+## Stage 2：Query Plane + Direct Feed 纵切（已完成）
 
 目标：先交付不依赖 daemon/RSSHub 的真实可用路径。
 
@@ -155,7 +155,7 @@
 - MySQL Store、多实例部署、分布式锁/选主、租户/RBAC；v1 只落实可迁移的领域不变量。
 - 通用网页爬虫/浏览器自动化平台。
 - Go plugin 与自定义进程 RPC 协议。
-- 语义向量去重/rerank。
+- 语义向量去重/rerank；Embedding API/本地 Ollama 与向量索引需要后续独立选型。
 - 本 Task 的 Dashboard 前端实现、移动端、Chrome Extension UI/客户端、Webhook、WebSub、SSE/WebSocket。
 - 长期正文归档、OCR/ASR/Vision、证据编排与综合报告。
 - 未经实际 Channel Probe 就宣称支持大量平台。

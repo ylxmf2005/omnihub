@@ -359,7 +359,7 @@ func TestRoutingCatalogPersistsWithRevisionCAS(t *testing.T) {
 	if err := reopened.db.QueryRowContext(ctx, `SELECT CAST(catalog_json AS TEXT) FROM routing_catalog WHERE id = 1`).Scan(&encoded); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(encoded, `"revision":999`) || strings.Contains(encoded, `"route_templates"`) || strings.Contains(encoded, `"providers"`) || strings.Contains(encoded, `"sources"`) {
+	if strings.Contains(encoded, `"revision":999`) || strings.Contains(encoded, `"route_templates"`) || strings.Contains(encoded, `"providers"`) || strings.Contains(encoded, `"origin":"builtin"`) {
 		t.Fatalf("catalog JSON contains aggregate revision or builtin declarations: %s", encoded)
 	}
 }
@@ -375,16 +375,94 @@ func TestRoutingCatalogRejectsSecretsAndInvalidGraphs(t *testing.T) {
 			t.Fatalf("SaveRoutingCatalog(%s) error = %v, want ErrInvalidRoutingCatalog", key, err)
 		}
 	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*core.RoutingCatalog)
+	}{
+		{
+			name: "source canonical URL secret query",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Sources[0].CanonicalURL = "https://example.com/?access_token=must-not-persist"
+			},
+		},
+		{
+			name: "feed metadata HTML URL client secret",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Channels[0].FeedMetadata = &core.FeedMetadata{HTMLURL: "https://example.com/?clientIDSecret=must-not-persist"}
+			},
+		},
+		{
+			name: "parameter URL feed token",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Channels[0].Parameters = map[string]any{"url": "https://example.com/feed?feed_token=must-not-persist"}
+			},
+		},
+		{
+			name: "endpoint base URL userinfo",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Endpoints[0].BaseURL = "https://user:must-not-persist@example.com"
+			},
+		},
+		{
+			name: "endpoint base URL secret query",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Endpoints[0].BaseURL = "https://example.com/?sig=must-not-persist"
+			},
+		},
+		{
+			name: "source canonical URL secret fragment",
+			mutate: func(catalog *core.RoutingCatalog) {
+				catalog.Sources[0].CanonicalURL = "https://example.com/#access_token=must-not-persist"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			secret := routingCatalogFixture("channel_" + strings.ReplaceAll(test.name, " ", "_"))
+			test.mutate(&secret)
+			if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: secret}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+				t.Fatalf("SaveRoutingCatalog() error = %v, want ErrInvalidRoutingCatalog", err)
+			}
+		})
+	}
 	var rows int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM routing_catalog`).Scan(&rows); err != nil || rows != 0 {
 		t.Fatalf("routing catalog rows after rejected secret = %d, %v", rows, err)
 	}
+
+	t.Run("uppercase HTTP schemes remain valid", func(t *testing.T) {
+		safeStore := openTestStore(t)
+		safe := routingCatalogFixture("channel_uppercase_scheme")
+		safe.Sources[0].CanonicalURL = "HTTPS://example.com"
+		safe.Channels[0].FeedMetadata = &core.FeedMetadata{HTMLURL: "HTTP://example.com/about"}
+		safe.Endpoints[0].BaseURL = "HTTPS://example.com/api"
+		if _, err := safeStore.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: safe}); err != nil {
+			t.Fatalf("SaveRoutingCatalog(uppercase schemes) error = %v", err)
+		}
+	})
 
 	cycle := routingCatalogFixture("channel_a")
 	cycle.Channels = append(cycle.Channels, core.Channel{ID: "channel_b", Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", FallbackChannelIDs: []string{"channel_a"}, Enabled: true})
 	cycle.Channels[0].FallbackChannelIDs = []string{"channel_b"}
 	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: cycle}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
 		t.Fatalf("SaveRoutingCatalog(cycle) error = %v, want ErrInvalidRoutingCatalog", err)
+	}
+
+	collectionCycle := routingCatalogFixture("channel_collection")
+	collectionCycle.Collections = []core.Collection{
+		{ID: "parent", ParentID: "child", Enabled: true},
+		{ID: "child", ParentID: "parent", Enabled: true},
+	}
+	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: collectionCycle}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+		t.Fatalf("SaveRoutingCatalog(collection cycle) error = %v, want ErrInvalidRoutingCatalog", err)
+	}
+
+	nonUserSource := routingCatalogFixture("channel_source")
+	nonUserSource.Sources[0].Origin = "builtin"
+	if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: nonUserSource}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+		t.Fatalf("SaveRoutingCatalog(non-user source) error = %v, want ErrInvalidRoutingCatalog", err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM routing_catalog`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("routing catalog rows after all rejected saves = %d, %v", rows, err)
 	}
 }
 
@@ -510,6 +588,7 @@ func validRunEnvelope(t *testing.T, started time.Time) core.Envelope {
 
 func routingCatalogFixture(channelID string) core.RoutingCatalog {
 	return core.RoutingCatalog{
+		Sources:     []core.Source{{ID: "feed:fixture", DisplayName: "Fixture", CanonicalURL: "https://example.com", Origin: "user", Enabled: true}},
 		Endpoints:   []core.EndpointProfile{{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", Trust: "local", Enabled: true, Revision: 1}},
 		Channels:    []core.Channel{{ID: channelID, Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", Priority: 100, Enabled: true, Revision: 1}},
 		Collections: []core.Collection{{ID: "daily", ChannelIDs: []string{channelID}, Enabled: true, Revision: 1}},

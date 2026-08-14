@@ -3,9 +3,11 @@ package core
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var ErrInvalidRoutingCatalog = errors.New("invalid routing catalog")
@@ -61,6 +63,7 @@ type CookieScope struct {
 
 type Channel struct {
 	ID                 string         `json:"id"`
+	DisplayName        string         `json:"display_name,omitempty"`
 	Source             string         `json:"source"`
 	RouteTemplateID    string         `json:"route_template_id"`
 	EndpointProfileID  string         `json:"endpoint_profile_id,omitempty"`
@@ -70,13 +73,25 @@ type Channel struct {
 	FallbackChannelIDs []string       `json:"fallback_channel_ids,omitempty"`
 	Enabled            bool           `json:"enabled"`
 	Revision           int64          `json:"revision"`
+	FeedMetadata       *FeedMetadata  `json:"feed_metadata,omitempty"`
+}
+
+// FeedMetadata 只保存 OPML 标准订阅字段，不能影响 Adapter 执行或携带凭据。
+// 未识别的 OPML attribute 在 Stage 2 import report 中披露后忽略。
+type FeedMetadata struct {
+	HTMLURL     string `json:"html_url,omitempty"`
+	Description string `json:"description,omitempty"`
+	Language    string `json:"language,omitempty"`
+	Version     string `json:"version,omitempty"`
 }
 
 type Source struct {
-	ID      string   `json:"id"`
-	Tags    []string `json:"tags,omitempty"`
-	Origin  string   `json:"origin"`
-	Enabled bool     `json:"enabled"`
+	ID           string   `json:"id"`
+	DisplayName  string   `json:"display_name,omitempty"`
+	CanonicalURL string   `json:"canonical_url,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	Origin       string   `json:"origin"`
+	Enabled      bool     `json:"enabled"`
 }
 
 type Provider struct {
@@ -98,6 +113,9 @@ type EndpointProfile struct {
 
 type Collection struct {
 	ID         string   `json:"id"`
+	Title      string   `json:"title,omitempty"`
+	ParentID   string   `json:"parent_id,omitempty"`
+	Position   int      `json:"position"`
 	ChannelIDs []string `json:"channel_ids"`
 	Enabled    bool     `json:"enabled"`
 	Revision   int64    `json:"revision"`
@@ -112,6 +130,7 @@ type TemplateOverlay struct {
 
 type RoutingCatalog struct {
 	Revision    int64             `json:"revision"`
+	Sources     []Source          `json:"sources"`
 	Endpoints   []EndpointProfile `json:"endpoints"`
 	Channels    []Channel         `json:"channels"`
 	Collections []Collection      `json:"collections"`
@@ -125,7 +144,16 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	if catalog.Revision < 0 {
 		return fmt.Errorf("%w: revision must not be negative", ErrInvalidRoutingCatalog)
 	}
-	_, err := uniqueIDs("endpoint", len(catalog.Endpoints), func(index int) string { return catalog.Endpoints[index].ID })
+	_, err := uniqueIDs("source", len(catalog.Sources), func(index int) string { return catalog.Sources[index].ID })
+	if err != nil {
+		return err
+	}
+	for _, source := range catalog.Sources {
+		if source.Origin != "user" || !validOptionalPublicHTTPURL(source.CanonicalURL) {
+			return fmt.Errorf("%w: persisted source %s must be user-owned and contain a safe canonical URL", ErrInvalidRoutingCatalog, source.ID)
+		}
+	}
+	_, err = uniqueIDs("endpoint", len(catalog.Endpoints), func(index int) string { return catalog.Endpoints[index].ID })
 	if err != nil {
 		return err
 	}
@@ -133,7 +161,8 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	if err != nil {
 		return err
 	}
-	if _, err := uniqueIDs("collection", len(catalog.Collections), func(index int) string { return catalog.Collections[index].ID }); err != nil {
+	collections, err := uniqueIDs("collection", len(catalog.Collections), func(index int) string { return catalog.Collections[index].ID })
+	if err != nil {
 		return err
 	}
 	if _, err := uniqueIDs("template overlay", len(catalog.Overlays), func(index int) string { return catalog.Overlays[index].RouteTemplateID }); err != nil {
@@ -141,12 +170,13 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	}
 
 	for _, endpoint := range catalog.Endpoints {
-		if strings.TrimSpace(endpoint.Provider) == "" || containsSensitiveConfig(endpoint.Options) {
+		if strings.TrimSpace(endpoint.Provider) == "" || !validOptionalPublicHTTPURL(endpoint.BaseURL) || containsSensitiveConfig(endpoint.Options) {
 			return fmt.Errorf("%w: endpoint %s is incomplete or contains credential material", ErrInvalidRoutingCatalog, endpoint.ID)
 		}
 	}
 	for _, channel := range catalog.Channels {
-		if strings.TrimSpace(channel.Source) == "" || strings.TrimSpace(channel.RouteTemplateID) == "" || containsSensitiveConfig(channel.Parameters) {
+		metadataURLValid := channel.FeedMetadata == nil || validOptionalPublicHTTPURL(channel.FeedMetadata.HTMLURL)
+		if strings.TrimSpace(channel.Source) == "" || strings.TrimSpace(channel.RouteTemplateID) == "" || !metadataURLValid || containsSensitiveConfig(channel.Parameters) {
 			return fmt.Errorf("%w: channel %s is incomplete or contains credential material", ErrInvalidRoutingCatalog, channel.ID)
 		}
 		seenFallback := make(map[string]bool)
@@ -162,6 +192,11 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 		return fmt.Errorf("%w: fallback graph contains a cycle", ErrInvalidRoutingCatalog)
 	}
 	for _, collection := range catalog.Collections {
+		if collection.ParentID != "" {
+			if _, ok := collections[collection.ParentID]; !ok || collection.ParentID == collection.ID {
+				return fmt.Errorf("%w: collection %s has invalid parent %s", ErrInvalidRoutingCatalog, collection.ID, collection.ParentID)
+			}
+		}
 		seen := make(map[string]bool)
 		for _, channelID := range collection.ChannelIDs {
 			if _, ok := channels[channelID]; !ok || seen[channelID] {
@@ -169,6 +204,9 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 			}
 			seen[channelID] = true
 		}
+	}
+	if hasCollectionCycle(catalog.Collections, collections) {
+		return fmt.Errorf("%w: collection hierarchy contains a cycle", ErrInvalidRoutingCatalog)
 	}
 	return nil
 }
@@ -216,6 +254,33 @@ func hasFallbackCycle(channels []Channel, index map[string]int) bool {
 	return false
 }
 
+func hasCollectionCycle(collections []Collection, index map[string]int) bool {
+	visiting, visited := make(map[string]bool), make(map[string]bool)
+	var visit func(string) bool
+	visit = func(id string) bool {
+		if visiting[id] {
+			return true
+		}
+		if visited[id] {
+			return false
+		}
+		visiting[id] = true
+		parentID := collections[index[id]].ParentID
+		if parentID != "" && visit(parentID) {
+			return true
+		}
+		delete(visiting, id)
+		visited[id] = true
+		return false
+	}
+	for id := range index {
+		if visit(id) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsSensitiveConfig(value any) bool {
 	return inspectSensitive(reflect.ValueOf(value), "")
 }
@@ -245,6 +310,73 @@ func inspectSensitive(value reflect.Value, key string) bool {
 				return true
 			}
 		}
+	case reflect.String:
+		return containsSensitiveURL(value.String())
+	}
+	return false
+}
+
+func validOptionalPublicHTTPURL(value string) bool {
+	if strings.TrimSpace(value) == "" {
+		return true
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return false
+	}
+	return !parsedURLContainsCredentialMaterial(parsed)
+}
+
+func containsSensitiveURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return false
+	}
+	return parsedURLContainsCredentialMaterial(parsed)
+}
+
+func parsedURLContainsCredentialMaterial(parsed *url.URL) bool {
+	if parsed.User != nil {
+		return true
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return true
+	}
+	for key := range query {
+		if CredentialLikeURLKey(key) {
+			return true
+		}
+	}
+	// OAuth 等流程常把 access_token 放在 fragment。普通页面 anchor 不带
+	// key=value，仍允许保存；结构化 fragment 则复用与 query 相同的判定。
+	if strings.Contains(parsed.Fragment, "=") {
+		fragment, fragmentErr := url.ParseQuery(strings.TrimPrefix(parsed.Fragment, "?"))
+		if fragmentErr == nil {
+			for key := range fragment {
+				if CredentialLikeURLKey(key) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// CredentialLikeURLKey 是 Feed 执行、用户配置持久化与 OPML 导出共享的
+// URL credential 边界。它只判断 query/fragment key，不检查 value。
+func CredentialLikeURLKey(key string) bool {
+	parts := normalizedConfigKeyParts(key)
+	compact := strings.Join(parts, "")
+	switch compact {
+	case "apikey", "accesskey", "accesstoken", "privatekey":
+		return true
+	}
+	for _, part := range parts {
+		switch part {
+		case "auth", "authorization", "bearer", "code", "cookie", "credential", "key", "passwd", "password", "secret", "sig", "signature", "token":
+			return true
+		}
 	}
 	return false
 }
@@ -252,25 +384,7 @@ func inspectSensitive(value reflect.Value, key string) bool {
 func sensitiveConfigKey(key string) bool {
 	// 同时拆分 snake/kebab/dotted 与 camelCase，避免 accessToken、
 	// clientSecret 等常见配置名绕过只允许引用 Credential 的存储边界。
-	var normalized strings.Builder
-	for index, current := range key {
-		if current >= 'A' && current <= 'Z' {
-			if index > 0 {
-				previous := rune(key[index-1])
-				if previous >= 'a' && previous <= 'z' || previous >= '0' && previous <= '9' {
-					normalized.WriteByte('_')
-				}
-			}
-			normalized.WriteRune(current + ('a' - 'A'))
-			continue
-		}
-		if current >= 'a' && current <= 'z' || current >= '0' && current <= '9' {
-			normalized.WriteRune(current)
-			continue
-		}
-		normalized.WriteByte('_')
-	}
-	parts := strings.FieldsFunc(normalized.String(), func(value rune) bool { return value == '_' })
+	parts := normalizedConfigKeyParts(key)
 	compact := strings.Join(parts, "")
 	if compact == "apikey" || compact == "accesskey" || compact == "privatekey" {
 		return true
@@ -285,6 +399,30 @@ func sensitiveConfigKey(key string) bool {
 		}
 	}
 	return false
+}
+
+func normalizedConfigKeyParts(key string) []string {
+	var normalized strings.Builder
+	characters := []rune(key)
+	for index, current := range characters {
+		if unicode.IsUpper(current) {
+			if index > 0 {
+				previous := characters[index-1]
+				wordAfterAcronym := unicode.IsUpper(previous) && index+1 < len(characters) && unicode.IsLower(characters[index+1])
+				if unicode.IsLower(previous) || unicode.IsDigit(previous) || wordAfterAcronym {
+					normalized.WriteByte('_')
+				}
+			}
+			normalized.WriteRune(unicode.ToLower(current))
+			continue
+		}
+		if unicode.IsLetter(current) || unicode.IsDigit(current) {
+			normalized.WriteRune(unicode.ToLower(current))
+			continue
+		}
+		normalized.WriteByte('_')
+	}
+	return strings.FieldsFunc(normalized.String(), func(value rune) bool { return value == '_' })
 }
 
 type Credential struct {

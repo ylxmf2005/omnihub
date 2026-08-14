@@ -1,154 +1,171 @@
-# TestPlan：OmniHub Stage 1 Core、Registry、Router 与诊断骨架
+# TestPlan：Stage 2 Query Plane + Direct Feed
 
 ## 计划状态
 
-- 被测对象：`/Users/ethan/Desktop/omnihub`，`main` 工作树相对 baseline `5442559232e9c39608ce99b2f3cbf98af9406389` 的完整 Stage 1 diff。
-- 计划状态：completed
-- 任务承诺：`context.md`、`plan.md` Stage 1、`shape/contract.md` 与 `dev/implementation.md`。
-- 结论边界：证明无真实上游时的合同、Registry、Router、readiness、SQLite Repository 与只读 CLI；不证明真实 Provider、写入型管理 CLI/API、HTTP/MCP Server、Dashboard 或异平台运行。
+- 被测对象：`/private/tmp/omnihub-stage2` 的 `main` 工作树；基线与远程 `main` 均为 `83577ca85cc02ebed0cb71dfb6c2b9af69c5fe94`，最终执行前记录完整 diff 与构建物摘要。
+- 计划状态：`ready`
+- 任务承诺：`context.md`、`shape/contract.md`、`shape/design.md` 与 `plan.md` 的 Stage 2。
+- 结论边界：证明 Direct Feed 的真实 CLI 查询、统一 Envelope、条件缓存、配置/OPML 闭环与 Stage 1 回归；不证明 RSSHub、GitHub/Tavily/X、HTTP/MCP/Skill、Dashboard、Chrome Bridge、MySQL、长期订阅或向量去重。
 
 ## 测试事实账本
 
-- 环境与路由：macOS arm64 本机、Go 1.26.4 执行 `go 1.25` module；公共行为使用编译后的 `omnihub`，配置与数据库均指向 `/private/tmp` 隔离目录，不访问上游。
-- 身份与权限：当前本机用户；无外部账号或真实 Credential。SQLite fixture 使用仅供测试的假 token。
-- 数据与清理责任：unit tests 使用 `t.TempDir()`；CLI/SQLite/WAL fixture 位于 `/private/tmp`，由本轮清理；仓库不保留一次性 harness。
-- 观察面：Go test/race/vet、JSON Schema resolver、CLI stdout/stderr/exit、文件树与 DB/WAL/SHM metadata/hash、交叉构建产物格式。
-- 已知限制：当前无公开 Channel/Credential 写入 CLI，因此写入/CAS 是 Repository contract 证据，不冒充公共 CLI E2E。
+- 环境与路由：macOS arm64 本机 Go 工具链；确定性场景使用一次性 loopback HTTP fixture；公开来源场景直接访问 V2EX/linux.do/NodeSeek；不经过 daemon、代理路由或 RSSHub。
+- 身份与权限：公开 Feed 匿名访问；本地 fixture 不使用 credential；SQLite 和 cache 均位于每个用例自己的临时目录。
+- 数据与清理责任：只创建 `/private/tmp` 下的二进制、fixture、配置、SQLite 与 cache；结束后停止 loopback 进程并删除临时目录。目标仓库只在最终交付时提交/推送。
+- 观察面：CLI exit code/stdout/stderr、Envelope JSON、HTTP 请求头和状态、SQLite routing snapshot、文件 mode/hash/mtime、package test/race/vet/build 终态。
+- 已知限制：Linux/Windows 仅做交叉构建，不冒充对应系统运行验证；公开来源结果受执行时网络和上游控制；NodeSeek 只要求如实失败，不要求恢复上游。
 
 ## 风险与覆盖
 
 | 风险或承诺 | 来源 | 失败后果 | 覆盖用例 |
 | --- | --- | --- | --- |
-| Operation/Envelope、Schema 与合同互相矛盾 | Core、Transport、合同 diff | Agent 按公开合同发送或接受 Core 必拒绝的数据 | TC-S1-001 |
-| Registry 导入不严格或泄露/覆盖权威声明 | Stage 1 Registry 承诺 | 配置歧义、builtin 被替换、secret 混入声明 | TC-S1-002 |
-| Router 顺序、preflight、aggregate/fallback 不确定或重复 | Router 状态路径 | 选错 Channel、重复调用/计费、错误诊断 | TC-S1-003 |
-| readiness 把 declared/configured 当 runtime ready | Stage 1 Doctor 承诺 | Dashboard/Agent 相信未探测依赖可用 | TC-S1-004 |
-| SQLite migration/CAS/Run/secret 边界破坏状态 | Repository 与 Store diff | 数据被改写、并发覆盖、future DB 损坏、密钥复制 | TC-S1-005 |
-| 只读 CLI 产生副作用或错误码/JSON 不稳定 | CLI 公共入口 | 诊断改写用户机器，Agent 无法可靠捕获过程 | TC-S1-006 |
-| README Bundle 与真实 Loader 不一致 | README/Registry | 用户照文档配置仍失败 | TC-S1-007 |
-| 当前对象不能构建或存在 data race | 完整 diff | 无法交付或并发行为不可信 | TC-S1-008 |
+| RSS/Atom/JSON Feed 与 HTML discovery 能通过真实入口返回统一 Envelope | Stage 2 纵切 | CLI 名义可用但不能消费真实 Feed | TC-201、TC-202 |
+| ETag/Last-Modified 与文件缓存能跨进程重验证，且不把缓存故障伪装成上游结果 | Stage 2 cache contract | 重复抓取、陈旧内容或请求失败 | TC-203 |
+| Router/fallback、exact identity、搜索/时间/排序/limit 语义确定且可追溯 | Query/Envelope contract | Agent 得到重复、越界或不可解释结果 | TC-204 |
+| Direct Feed 配置、revision CAS、disable 与 OPML merge/round-trip 不破坏已有状态 | 管理闭环 | Dashboard/CLI 覆盖配置或把 import 当退订 | TC-205 |
+| URL/报告/OPML/SQLite 不意外泄露 credential material | 用户本地凭据边界 | secret 出现在导出、日志或 catalog JSON | TC-205、TC-206 |
+| 只读/无状态查询与导出不创建数据库或修改活跃 WAL | Query Plane 无状态优先 | 一次查询产生隐式持久状态或干扰运行库 | TC-206 |
+| 参数、配置、上游失败使用稳定 exit/Envelope 状态，stdout 保持机器可解析 | 公共 CLI contract | Agent 无法可靠区分重试、修配置或失败 | TC-207 |
+| V2EX/linux.do 真实来源可执行，NodeSeek 受限时如实报告 | Stage 2 完成证据 | 把声明/网络偶然性写成已支持 | TC-208 |
+| Stage 1 合同、race/vet 与跨平台构建没有回归 | 已交付基线 | 新纵切破坏基础设施或不可发布 | TC-209 |
 
 ## 用例
 
-### TC-S1-001 — Core 与公共合同语义
+### TC-201 — Feed 格式与 discovery
 
-- 背景与风险：Schema 只能表达部分语义，必须证明可表达约束已投影且合同示例同时通过 Core 和 Router。
-- 优先级：P0
-- 环境与身份：本机 Go test，无外部依赖。
-- 前置数据：`shape/contract.md` JSON blocks 与代码内固定 Operation/Envelope fixture。
-- 实际动作：运行 `go test ./internal/core ./internal/transport -count=1`；用生成 Schema 的 resolver 重放 empty/null scope、mode 缺 selector、Operation 条件字段、null public arrays、Stage 1 continuation；把合同 Envelope 反序列化后调用 `Validate()`，并从示例构造含 required Credential 的 Catalog 调用 Router。
-- 预期：所有负例被对应层拒绝；示例的 selected/selection 可由 Router 产生并通过 Envelope Validator；Schema `$comment` 固定剩余语义边界。
-- 观察面与窗口：测试进程终态和生成的 `schema` JSON。
-- 证据：`internal/core/model_test.go`、`internal/transport/schema_test.go`、`internal/transport/examples_test.go`。
-- 失败处理：阻断交付。
-- 清理：none。
-- 证据边界：不证明尚未实现出口的网络传输。
-
-### TC-S1-002 — Registry 严格装配
-
-- 背景与风险：builtin/imported/user 三层必须只有一个确定解释。
-- 优先级：P0
-- 环境与身份：Go test + `/private/tmp` CLI fixture。
-- 前置数据：README 有效 Bundle；错误版本/kind、未知字段、重复键/文档、拼接 JSON、重复/冲突 ID 负例。
-- 实际动作：运行现有 Transport 跨模块 Registry 回归；经编译后二进制读取有效/无效 `sources.yaml`。
-- 预期：有效示例出现 `example`/`example-search`；所有歧义输入 fail-closed；builtin 不可变，imported Cookie 必须经 trusted overlay。
-- 观察面与窗口：测试终态、CLI stdout/stderr/exit 与文件树。
-- 证据：现有 `internal/transport/examples_test.go` 中的跨模块 Registry 回归和 CLI 重放记录。
-- 失败处理：阻断交付。
-- 清理：移除临时 config。
-- 证据边界：不证明管理 API 写入 Bundle。
-
-### TC-S1-003 — Router 确定性选择与回退
-
-- 背景与风险：排序、选择和回退决定未来真实调用成本与 Envelope 终态。
-- 优先级：P0
-- 环境与身份：固定内存 Catalog，无上游。
-- 前置数据：同 Source Direct/RSSHub Channel、极值 priority、aggregate 已选 fallback、missing/untrusted references。
-- 实际动作：运行现有 Transport 跨模块 Router 回归。
-- 预期：`auto/prefer/only/exclude/aggregate` 稳定；极值不溢出；selected preflight 为 true，skipped 为 false；Fallback 只从当前 Plan 提升未选 eligible Channel且不重复。
-- 观察面与窗口：Plan selected/skipped/selection/reason。
-- 证据：现有 `internal/transport/examples_test.go` 中的跨模块 Router 回归。
-- 失败处理：阻断交付。
-- 清理：none。
-- 证据边界：当前无执行器，不证明真实 fallback 上游行为。
-
-### TC-S1-004 — Doctor 证据诚实性
-
-- 背景与风险：静态声明不能冒充依赖或上游 ready。
-- 优先级：P0
-- 环境与身份：固定 Catalog 与真实 CLI doctor。
-- 前置数据：缺 Source/Template/Endpoint/Credential、disabled、untrusted、已配置但未 probe Channel。
-- 实际动作：运行现有 Transport 跨模块 Readiness 回归，并运行 `omnihub doctor --json`。
-- 预期：分层 check code 准确；无 probe 时为 `degraded` + `unknown/dependency_not_probed`，绝不为 ready。
-- 观察面与窗口：Doctor JSON。
-- 证据：现有 `internal/transport/examples_test.go` 中的跨模块 Readiness 回归与 CLI JSON。
-- 失败处理：阻断交付。
-- 清理：none。
-- 证据边界：不证明 executable/Endpoint/Cookie 真可用。
-
-### TC-S1-005 — SQLite Repository、migration 与只读边界
-
-- 背景与风险：Stage 1 增加 v2 routing snapshot，同时必须保持 Stage 0 原子性和 Run 不变量。
-- 优先级：P0
-- 环境与身份：`t.TempDir()` Store tests + `/private/tmp` v2/WAL fixture。
-- 前置数据：fresh/v1/future DB，CAS revision，Credential，合法/非法 RoutingCatalog，活跃 WAL writer。
-- 实际动作：运行 `go test ./internal/store/sqlite -count=1`；用 CLI 读取 v2 catalog/credential；对读取前后的 DB/WAL/SHM mode、size、mtime/ctime、inode、SHA 做比较。
-- 预期：fresh/v1→v2、CAS、Run/Envelope、credential isolation 全成立；future DB bytes/sidecar 不变；secret 型参数被拒绝；只读 CLI 看得到 WAL 中提交且不修改任何文件。
-- 观察面与窗口：Repository 回读、SQLite rows、文件 metadata/hash、CLI JSON。
-- 证据：`internal/store/sqlite/store_test.go` 与临时 fixture 重放。
-- 失败处理：阻断交付。
-- 清理：终止 writer 并移除 fixture。
-- 证据边界：公共 CLI 没有写入口，不能证明管理旅程 E2E。
-
-### TC-S1-006 — CLI 无副作用、输入防线与退出码
-
-- 背景与风险：Agent 依赖固定 stdout/exit 观测过程。
-- 优先级：P0
-- 环境与身份：编译后的本机二进制；不存在 config/state 路径。
-- 前置数据：README latest Operation、未知字段/多 root/条件字段/空 scope/deadline/domain 等负例。
-- 实际动作：运行所有只读命令；对 plan 重放合法无 Channel 与非法输入。
-- 预期：JSON 命令 exit 0；缺 DB 不建路径；无可路由 plan 输出诊断 JSON、`upstream_executed:false`、exit 4；非法 Operation 无 stdout、exit 3；secret 不出现在任何输出。
-- 观察面与窗口：stdout/stderr/exit 与路径存在性。
-- 证据：独立 CLI 重放。
-- 失败处理：阻断交付。
-- 清理：移除临时二进制/输入。
-- 证据边界：`search/latest/fetch` 执行 CLI 尚未实现。
-
-### TC-S1-007 — README Bundle 可重放
-
-- 背景与风险：文档必须是可执行入口。
+- 背景与风险：Parser 单测不能单独证明 CLI 到 Envelope 的完整链路。
 - 优先级：P1
-- 环境与身份：编译后二进制、无 DB。
-- 前置数据：README `sources.yaml` 原文。
-- 实际动作：运行 `sources`、`route-templates`，再加入未知字段重跑。
-- 预期：有效 Bundle 被装配且不建 DB；非法 Bundle stdout 为空、exit 4、stderr 含 `invalid source bundle`。
-- 观察面与窗口：CLI JSON/exit/文件树。
-- 证据：独立 CLI 重放。
-- 失败处理：阻断 README 交付。
-- 清理：移除临时配置。
-- 证据边界：不证明第三方 Adapter 可执行。
+- 环境与身份：loopback fixture，无鉴权；使用当前工作树构建的 native 二进制。
+- 前置数据：分别准备 RSS 2.0、Atom、JSON Feed 1.1，以及带单个 `rel=alternate` 的 HTML 页面。
+- 实际动作：对四个 URL 逐一执行 `omnihub latest --feed-url URL --source fixture --limit 20 --format json`。
+- 预期：exit 0；stdout 为可验证 Envelope；真实 `provider/channel/route_template/observation` 完整；格式字段、附件、时间按合同归一；HTML 只发现一跳。
+- 观察面与窗口：命令同步终态与 fixture 请求日志。
+- 证据：保存命令退出、Envelope 摘要和请求路径。
+- 失败处理：记录失败并阻断 TC-202/203 对同一格式的推断，其余继续。
+- 清理：TC-209 后停止 fixture 并确认端口释放。
+- 证据边界：不证明任意非标准 Feed 或网页抓取。
 
-### TC-S1-008 — 完整质量闸与构建矩阵
+### TC-202 — bounded search、时间与终态
 
-- 背景与风险：变更跨 Core/Store/CLI，需要完整回归和目标构建。
-- 优先级：P0
-- 环境与身份：macOS arm64；Go toolchain。
-- 前置数据：当前完整工作树。
-- 实际动作：`go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`gofmt -l cmd internal`、`git diff --check`；交叉构建 darwin/arm64、linux/amd64、windows/amd64。
-- 预期：全部 exit 0；三产物格式匹配目标平台。
-- 观察面与窗口：命令终态和 `file` 输出。
-- 证据：`test/test-report.md`。
-- 失败处理：阻断交付。
-- 清理：移除 `/private/tmp` 产物。
-- 证据边界：交叉构建不等于异平台运行或 Windows ACL。
+- 背景与风险：Direct Feed `search` 只是已取得窗口内的本地搜索，必须避免冒充站内全量索引。
+- 优先级：P1
+- 环境与身份：TC-201 fixture。
+- 前置数据：含 visible/hidden HTML、边界时间、无时间和相同/不同 identity 的条目。
+- 实际动作：执行 flag-based `search`，再用严格 JSON stdin 执行 persisted Channel 的 `latest/search`。
+- 预期：空白分词 Unicode lowercase AND；hidden/script/style 不命中；`[from,to]` 边界包含、未知时间排除并披露 limitation；结果稳定排序且全局 limit 回写 execution/coverage；`similarity_grouping` 始终为 `off`。
+- 观察面与窗口：Envelope request/items/executions/coverage/errors/continuation/meta。
+- 证据：CLI 响应与公共 API 自动回归。
+- 失败处理：失败阻断 Stage 2 Query Plane 交付。
+- 清理：复用 TC-201。
+- 证据边界：不证明 Feed 窗口之外的搜索召回或 continuation。
+
+### TC-203 — 条件缓存跨进程重验证
+
+- 背景与风险：只测内存 cache 无法证明可全局安装 CLI 的跨次行为。
+- 优先级：P1
+- 环境与身份：独立 `OMNIHUB_CACHE_DIR`，fixture 首次 200+ETag/Last-Modified，第二次要求 conditional header 并返回 304。
+- 前置数据：同一 Channel/Template/参数与稳定响应体。
+- 实际动作：用两个独立 CLI 进程连续执行同一 latest。
+- 预期：第一次无 conditional header 且落盘 0600 完整 JSON；第二次发送 `If-None-Match`/`If-Modified-Since`、接受 304，Items 与身份保持一致。`ProviderState` 仍是 Adapter 私有状态，不要求进入公共 Envelope。
+- 观察面与窗口：fixture 请求头/状态、两次 Envelope 与 cache 文件 mode/完整 JSON。
+- 证据：两次响应和请求日志。
+- 失败处理：失败阻断条件缓存承诺，但继续其他 Query 测试。
+- 清理：删除 cache 临时目录并回读不存在。
+- 证据边界：不证明多机共享缓存；Windows 替换路径仅由交叉构建支持。
+
+### TC-204 — Query 编排与 exact identity
+
+- 背景与风险：路由、fallback、aggregate、坏 GUID 与全局 limit 的组合容易在单 Adapter 测试中漏掉。
+- 优先级：P1
+- 环境与身份：既有测试文件中的公共 API fake FeedExecutor，不访问网络。
+- 前置数据：同 Source 多 Channel、失败/成功结果、相同 stable upstream ID、重复 GUID limitation、不同 canonical URL 与缺 observation 结果。
+- 实际动作：运行覆盖 Query Service 的定向 Go 测试。
+- 预期：每个 selected Channel 唯一终态；fallback 只执行一次；同 Source stable upstream ID 合并 observations；重复 GUID 不吞整批；exact/none、latest/search/time/limit 与 counts 符合合同；无 observation 或非 off similarity fail closed。
+- 观察面与窗口：test assertions 与 Envelope.Validate。
+- 证据：定向测试输出和既有测试源码。
+- 失败处理：失败阻断 Stage 2 交付。
+- 清理：none。
+- 证据边界：fake 只证明编排，不替代 TC-201 的 HTTP/parse 证据。
+
+### TC-205 — Direct Feed 管理与 OPML 闭环
+
+- 背景与风险：导入不能覆盖并发配置，也不能把 OPML 缺失项当作退订。
+- 优先级：P1
+- 环境与身份：临时 SQLite；管理 Service 自动回归与真实 CLI 重放。
+- 前置数据：已有 Direct Feed、fallback、两个 Collection、嵌套 OPML、跨 Collection 重复 URL、标准 metadata 和恶意 label/URL。
+- 实际动作：create/update/stale revision/disable；导入两次并在已有 membership 上 merge；export 后导入全新 store；运行 `channels apply/disable` 与 `opml import/export` CLI。
+- 预期：Catalog/Channel 双 revision CAS；Direct Feed 清空 credential/endpoint 且保留合法 fallback；重复 URL 复用 Channel；membership 非破坏且幂等；层级/标准字段/identity 可回导；unknown/include/link 如实报告；export 不含执行凭据。
+- 观察面与窗口：CLI JSON、ImportReport、SQLite readback、OPML XML 与二次 store。
+- 证据：自动回归输出、CLI 响应、脱敏扫描。
+- 失败处理：失败阻断管理闭环交付。
+- 清理：关闭 Store、删除临时 DB 并回读。
+- 证据边界：OPML 不携带 priority/enabled/template/fallback 等本地执行策略，也不等于同步退订。
+
+### TC-206 — 无副作用读取、WAL 与 secret 边界
+
+- 背景与风险：只读 CLI 不得因 SQLite 初始化、cache 或导出隐式改写用户状态。
+- 优先级：P1
+- 环境与身份：不存在的 config/state/cache 根；另建一个保持活跃 WAL 的 v2 DB。
+- 前置数据：user Source/Channel/Collection 与测试 Credential；URL query/userinfo/fragment secret 负例。
+- 实际动作：在缺 DB 环境执行 catalog/doctor/plan/opml export；在活跃 WAL 上执行 channels/doctor/plan/latest；Repository 逐一尝试保存 secret URL。
+- 预期：缺 DB 只读命令不创建目录/DB（真实查询只有取得响应后才可创建 cache）；活跃 WAL 中的最新 catalog 可读，业务 DB/WAL 的 mode/size/hash/mtime 不变且 routing revision/JSON 不变。SQLite reader 可以更新 `-shm` 的临时协调/read-mark 字节，不能把这类变化误报为业务写入；secret snapshot 全部拒绝且无 row；任何 stdout/stderr/OPML 不含 secret/value。
+- 观察面与窗口：文件 stat/hash、SQL row count、进程输出全文扫描。
+- 证据：前后文件清单与摘要、定向 store 测试。
+- 失败处理：失败阻断交付。
+- 清理：关闭持有 WAL 的进程并删除 fixture。
+- 证据边界：不证明 Windows ACL；API Key 本身按用户决定可存 Credential 表，本项只防止旁路进入 URL/catalog export。
+
+### TC-207 — 错误分类与机器出口
+
+- 背景与风险：Agent 依赖 exit code、stdout JSON 和 Envelope 终态作下一步决策。
+- 优先级：P1
+- 环境与身份：临时目录与 fixture 的 400/401/403/429/5xx、超时、超限、坏 Feed 路径。
+- 前置数据：合法/非法 stdin、flags、OPML 与路由配置。
+- 实际动作：重放参数错误、无路由、上游业务失败、内部 contract 错误和 OPML/CAS 冲突。
+- 预期：参数 3、配置/无路由 4、执行失败 Envelope 5、内部错误 1；参数/config 错误 stdout 空；执行失败 stdout 仍是有效 failed Envelope；stderr 不含 URL secret value。
+- 观察面与窗口：exit/stdout/stderr 与 Envelope errors。
+- 证据：命令矩阵。
+- 失败处理：失败阻断 CLI contract 交付。
+- 清理：复用 fixture 清理。
+- 证据边界：不证明未来 HTTP status/RFC 9457 映射。
+
+### TC-208 — 公开来源现实
+
+- 背景与风险：内建 Source 声明和 parser 测试不能冒充公开来源当前可用。
+- 优先级：P2
+- 环境与身份：执行时公网，匿名请求。
+- 前置数据：V2EX Atom、linux.do RSS、NodeSeek 已调查候选 URL。
+- 实际动作：用当前二进制直接查询三类 URL，记录时间、最终 URL、HTTP/Envelope 终态。
+- 预期：V2EX/linux.do 若当前网络允许则产生真实 Item/Observation；NodeSeek 或任一上游受限时返回明确 error/failed，不改写为成功；README 只陈述本轮真实证据。
+- 观察面与窗口：CLI Envelope 和 HTTP 终态，不长时间重试。
+- 证据：脱敏后的响应摘要。
+- 失败处理：公开网络失败只使对应来源证据 partial，不替代 TC-201 的产品正确性；若产品错误则 failed。
+- 清理：删除公开请求 cache。
+- 证据边界：一次成功不证明长期 SLA、监控或平台全量搜索。
+
+### TC-209 — 全量质量闸与可移植构建
+
+- 背景与风险：Stage 2 新增网络、XML/JSON、SQLite 与 CLI 路径，必须证明没有数据竞争和 Stage 1 回归。
+- 优先级：P1
+- 环境与身份：最终稳定工作树；独立 Go cache；必要时允许 loopback listener。
+- 前置数据：全部既有与本轮追加测试。
+- 实际动作：`gofmt`、`go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`git diff --check`；构建 native/darwin-arm64/linux-amd64/windows-amd64；运行 `omnihub schema` 并验证 JSON。
+- 预期：全部 exit 0；四个产物格式/架构正确；Schema 与合同样例继续通过；无新增测试文件。
+- 观察面与窗口：命令最终 exit、构建物 `file`、git diff/status。
+- 证据：质量闸汇总与原始输出。
+- 失败处理：任一承重 gate 失败即不交付，修复后按受影响范围重跑并保留历史红色。
+- 清理：删除构建物与临时 cache。
+- 证据边界：交叉构建不等于 Linux/Windows 运行测试。
 
 ## 执行顺序与依赖
 
-- 先跑聚焦 Core/Registry/Router/Readiness/SQLite/Transport，再跑真实 CLI，最后执行全量 race/vet/build。
-- 任一合同、状态持久化、secret 或无副作用失败均停止交付并交回 Dev；其他不依赖路径仍继续收集证据。
+- 先完成并冻结实现与长期回归，再执行 TC-204/205/206 的定向测试。
+- 启动一个受控 loopback fixture，顺序执行 TC-201/202/203/207，保存请求计数后停止。
+- TC-208 独立访问公开来源，不让网络波动阻断本地确定性场景。
+- 最后在同一稳定对象执行 TC-209；其后若代码变化，至少重跑受影响用例与全量 gate。
 
 ## 计划攻击与开放缺口
 
-- 仍可能全绿但产品错误的路径：真实 Provider、执行型 CLI、HTTP/MCP、Dashboard 均未进入 Stage 1；因此本计划不声称搜索已经可用。动态 Envelope 跨数组关系由 Core Validator 而不是 JSON Schema 证明。
-- 仍需现场发明的输入或步骤：none。
-- 下一步：以相同对象执行完成，结论见 `test/test-report.md`。
+- 仍可能全绿但产品错误的路径：公开站点未来改变格式、Linux/Windows 运行时文件语义、跨进程 Windows cache 竞争、超大真实订阅和长期 cache 老化不由本轮完整证明；活跃 WAL 的 `-shm` 临时协调变化不能替代 routing revision/DB/WAL 终态判断；均不得写成已验证。
+- 仍需现场发明的输入或步骤：none；loopback fixture 的字面 Feed/状态机在执行证据中固定。
+- 下一步：实现冻结后建立 `test-report.md` 执行账本，按 TC-201 至 TC-209 重放并给出 Stage 2 裁决。

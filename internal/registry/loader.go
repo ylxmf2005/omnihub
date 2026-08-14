@@ -102,6 +102,20 @@ func Load(ctx context.Context, store catalogStore, importedBundlePath string) (*
 		if err != nil {
 			return nil, fmt.Errorf("load credentials: %w", err)
 		}
+
+		// OPML 与管理命令创建的 Source 属于 user-owned routing snapshot。
+		// 它们不能遮蔽 builtin/imported Source；同 ID 冲突应在装配时显式失败。
+		knownSources := make(map[string]bool, len(sources))
+		for _, source := range sources {
+			knownSources[source.ID] = true
+		}
+		for _, source := range routing.Sources {
+			if source.Origin != "user" || knownSources[source.ID] {
+				return nil, fmt.Errorf("assemble registry: %w: user source %s conflicts with an existing source", ErrInvalidCatalog, source.ID)
+			}
+			knownSources[source.ID] = true
+			sources = append(sources, cloneSource(source))
+		}
 	}
 	catalog, err := NewCatalog(sources, providers, templates, routing.Channels, routing.Endpoints, credentials, routing.Collections, routing.Overlays)
 	if err != nil {

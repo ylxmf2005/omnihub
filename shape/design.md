@@ -119,6 +119,8 @@ Registry 合并四类配置，并保持静态能力与用户实例分离：
 3. 文件或 SQLite 中的 Channel、EndpointProfile、Credential 与 Collection；
 4. OPML 导入后创建的 Direct Feed Channel 与 Collection membership。
 
+OPML 是订阅交换而不是配置同步协议：普通 import 采用 additive merge，保留 Collection 既有 membership，再按文档顺序追加缺失 Channel；重复导入幂等，文档缺失项不触发 disable/退订。标准 URL/metadata 与 OmniHub identity extension 可回导，本地 priority/enabled/template/fallback/credential/endpoint 不进入 OPML。报告路径使用不透明稳定摘要，不把不可信 title/text 复制到日志或 Dashboard 响应。
+
 Source tags 只用于发现；没有封闭类别枚举。RouteTemplate Descriptor 表达“理论支持”，Channel Probe 表达“当前这组 Endpoint、Credential 与参数真能执行”。
 
 配置层级固定为 `builtin < imported < user overlay`：内建资源只读，升级时可替换；用户可以 disable 或 overlay，而不是直接修改随二进制发布的文件。Dashboard、CLI 和 import 都调用同一 Registry Command Service，不能各自维护配置副本。
@@ -137,7 +139,7 @@ Source tags 只用于发现；没有封闭类别枚举。RouteTemplate Descripto
 
 ### 4.3 一般优先级
 
-- Direct Feed：适合低成本 `latest`。
+- Direct Feed：适合低成本 `latest`，也可以在已经取得的 bounded Feed window 内提供明确降级标记的本地 `search`；不等价于源站全量索引。
 - Native API/official CLI：适合 `search`、结构化 metadata、指标和真实分页。
 - RSSHub：适合把没有官方 Feed 的来源变成增量 Feed；不默认等价于平台搜索。
 - Specialized command/MCP：适合 X 等已有专项工具的来源。
@@ -167,6 +169,8 @@ type Adapter interface {
 - 高价值专用 Adapter：例如 GitHub API；只在通用 mapping 无法正确处理鉴权、分页、rate limit 或语义时进入核心。
 
 v1 不内建通用 HTML/CSS scraping DSL：RSSHub/RSS-Bridge 已经解决这类扩展，OmniHub 若再造会迅速背上反爬和浏览器维护成本。
+
+Stage 2 的 `feed` Adapter 只接受无 userinfo/credential query 的绝对 HTTP(S) URL，HTML discovery 只跟随一跳明确的 alternate Feed。文件缓存按 Channel、RouteTemplate、参数与额外分区生成 key，保存已成功解析的受限 body、ETag、Last-Modified 和 freshness；Query Plane 在 Adapter 之后统一做本地 search、闭区间 TimeRange、exact identity、排序与全局 limit，避免每个 Feed parser 各自解释请求。
 
 ### 5.2 Command binding
 
@@ -239,7 +243,7 @@ spec:
 
 标题/正文相似度只建立 group，不把不同发布者的报道折叠成一个事实来源。标题比较保护数字、日期、版本号和实体 token；正文可以在限定时间窗内用 SimHash 等低成本指纹。默认关闭。
 
-语义向量 grouping/rerank 需要模型、阈值、费用和可解释性，不进入 v1。
+语义向量 grouping/rerank 需要单独选择 Embedding Provider（云 API 或本地 Ollama）、索引形态、阈值、费用、误合并恢复和模型升级重算策略，不进入 Stage 2。当前 `Similarity` 合同只保留扩展边界，不提前绑定向量数据库或模型。
 
 ## 9. 状态、缓存与增量一致性
 

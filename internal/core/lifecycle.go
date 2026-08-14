@@ -153,8 +153,8 @@ func (envelope Envelope) Validate() error {
 		return fmt.Errorf("%w: every selected channel needs a completed or failed execution", ErrInvalidEnvelope)
 	}
 	for index, item := range envelope.Items {
-		if item.Observations == nil {
-			return fmt.Errorf("%w: item %d observations must not be null", ErrInvalidEnvelope, index)
+		if len(item.Observations) == 0 {
+			return fmt.Errorf("%w: item %d must contain at least one observation", ErrInvalidEnvelope, index)
 		}
 	}
 	for index, problem := range envelope.Errors {

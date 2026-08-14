@@ -1,38 +1,48 @@
-# Implementation：OmniHub Stage 1 Core、Registry、Router 与诊断骨架
+# Implementation：OmniHub Stage 2 Query Plane + Direct Feed
 
 ## 实际交付
 
-- 对象与基线：`/Users/ethan/Desktop/omnihub` 的 `main` 工作树，相对 `5442559232e9c39608ce99b2f3cbf98af9406389` 实现 Stage 1；该基线与开始实施时的 `origin/main` 一致。
-- 已实现行为：Core 可以严格校验 Operation、生成 `req_` UUIDv4、施加 deadline，并用已选 Channel 的唯一运行终态聚合 `complete | partial | failed` Envelope；Registry 从 builtin、严格 `sources.yaml` 与 SQLite user catalog 装配声明和配置；Router 可确定性执行 `auto/prefer/only/exclude/aggregate/fallback`；Doctor 只在有真实证据时提升 readiness。
-- 根因与实现边界：Stage 1 要在不访问真实上游的前提下固定请求、配置、选择与诊断语义，因此实现止于声明装配、只读诊断、路由计划和 Repository 合同。`plan` 固定输出 `upstream_executed:false`；`search/latest/fetch` 执行 CLI、真实 Adapter、服务端与 Dashboard 仍属后续阶段。
+- 对象与基线：`/Users/ethan/Desktop/omnihub` 的 `main`，相对 `83577ca85cc02ebed0cb71dfb6c2b9af69c5fe94` 实现 Stage 2；实施和验收在同基线的隔离工作树完成，本文件随 Stage 2 提交交付。
+- 用户结果：不启动 daemon、不安装 RSSHub、也不创建 SQLite 时，`omnihub latest/search --feed-url ... --source ...` 可以读取 RSS 2.0、Atom、JSON Feed 或一跳 HTML alternate，并返回 Stage 1 定义的可追溯 Envelope。常用订阅可保存为 Direct Feed Channel，通过严格 JSON stdin 查询，并用 OPML 组织 Collection。
+- 实现边界：本阶段只执行内建 `feed` Adapter；`fetch`、RSSHub、GitHub/Tavily/X、HTTP/MCP/Skill、View/Subscription Plane、Dashboard/Chrome Bridge 与 MySQL 都没有借 Stage 2 名义提前接入。similarity 固定为 `off`，embedding API/本地 Ollama/向量索引留待独立选型。
 
 ## 变更
 
-- `internal/core`：增加稳定 ErrorCode/Selection、request lifecycle、Envelope builder/validator，以及 RoutingCatalog 的存储期不变量；拒绝 Stage 1 尚不能兑现的 domain scope 与 continuation。
-- `internal/registry`：建立不可原地修改的 builtin Catalog、严格单文档 `sources.yaml` 导入、builtin 冲突保护、user overlay/Channel/Endpoint/Credential/Collection 装配和 imported Cookie Template 信任提升。
-- `internal/router`：实现过滤、preflight、确定性 priority 排序、每 Source 首选/聚合与基于当前 Plan 的无重复 fallback；selected 与 skipped 保存可解释 reason 和真实 preflight 状态。
-- `internal/readiness`：区分声明、配置、Endpoint、Credential、信任和依赖层；Stage 1 未执行真实 probe 时固定返回 `unknown/dependency_not_probed`，不伪报 ready。
-- `internal/store/sqlite` 与 `internal/repository`：增加 v1→v2 migration、RoutingCatalog 快照/CAS、Credential 列表供内部 preflight 使用、Run 终态 Envelope 校验和只读 `mode=ro` 打开；拒绝 future schema 前不持久修改数据库。
-- `cmd/omnihub`：增加 `sources/providers/route-templates/channels/doctor --json/plan`，严格读取单个 Operation；只读命令在 DB 缺失时不创建路径，对已有库不 migration、切 WAL 或 chmod；参数、配置和内部错误分别返回 3、4、1。
-- `internal/transport`、`shape/contract.md` 与 `README.md`：把局部合同约束投影到 Schema，修正可由 Router 产生的 Envelope 示例，并明确跨数组/聚合语义由 `Envelope.Validate()` 权威校验。
+- `internal/adapter/feed.go`：实现受限 HTTP client、redirect/URL credential guard、RSS/Atom/JSON Feed parse、HTML alternate discovery、10 MiB body 上限、Retry-After、Cache-Control/Expires/RSS TTL、ETag/Last-Modified、内存/文件 cache 与统一 AdapterResult。文件 cache key 绑定 Channel、RouteTemplate、参数与额外分区；只保存已成功解析的 body。
+- `internal/query/executor.go`：从 Catalog/Operation 构建 Router Plan，给每个 selected/fallback Channel 唯一终态；统一执行 Direct Feed、时间/本地 search 过滤、identity none/exact、Observation 合并、稳定排序、全局 limit/counts，再由 `core.BuildEnvelope` 聚合状态。
+- `internal/management/service.go`：实现 Direct Feed create/update/disable 的 Channel revision + Catalog revision CAS；实现受限 OPML 2.0 parse、非破坏性 merge、稳定 Source/Channel/Collection identity、标准 metadata 与 Collection membership import/export。OPML 不执行 include/link，也不携带本地执行凭据。
+- `cmd/omnihub/main.go`：增加 flag-based 与严格 JSON stdin 的 `latest/search`，以及 `channels apply/disable`、`opml import/export`。缺 DB 查询临时附加 Source/Channel，保存型命令使用 SQLite；参数、配置、执行失败和内部错误分别映射为 3/4/5/1。
+- `internal/core`、`registry`、`readiness` 与 SQLite：RoutingCatalog 增加 user Source 和 Direct Feed metadata；Registry 可不可变地附加一次性 Source/Channel；Feed dependency 可确定为 installed、真实 probe 仍为 unknown；SQLite routing payload 以 additive JSON 字段保存 Source，不新增 migration。
+- 公共合同和文档：明确 bounded local search、闭区间 TimeRange、exact identity 顺序、OPML merge/回导边界、URL credential guard、当前真实来源证据与尚未实现能力。
 
-## 偏离与决定
+## 承重语义
 
-- imported 配置采用严格的单一 `sources.yaml`，而不是宽松 JSON/YAML 多入口。Bundle 只含静态 Source/Provider/RouteTemplate；user Channel 与 Credential 仍由 SQLite 管理。
-- SQLite Schema 从 v1 迁移到 v2 保存完整 user routing snapshot。读取型 CLI 不自动初始化或迁移，避免一次诊断命令改写用户状态。
-- JSON Schema 约束字段结构、枚举、局部条件与非空集合；动态 Channel ID 跨数组对应、唯一运行终态、聚合 status 与 meta 一致性无法由通用 JSON Schema 完整表达，继续由 `Operation.Validate()` / `Envelope.Validate()` 在生产和持久化边界强制执行。
-- 评审发现的 priority 极值溢出、aggregate fallback 重复、future DB 拒绝前 WAL 改写、camelCase secret 键绕过、preflight 成功仍为 false、合同示例与退出码漂移均已沿原触发输入修复并重测。
+- Feed `search` 不是站内检索：query 经 Unicode lowercase 后按空白分词，在 title、经 HTML 可见文本处理的 summary、text 与 HTML 上做 AND 匹配，并披露 `local_feed_window_only`。
+- 显式 TimeRange 使用闭区间 `[from,to]`；优先 `PublishedAt`，缺失时 `ModifiedAt`，仍未知则排除并披露 `item_time_unknown_excluded`。
+- exact identity 优先使用同 Source 的稳定 upstream ID，再使用 canonical URL，最后使用有摘要/正文的精确内容 hash。Adapter 标记同一 Feed 内的重复 GUID 后，Query 改用 URL/content/rank，避免整批条目被吞。
+- 全局 limit 在 dedupe/排序后应用，并回写每个 Execution/Coverage 的 returned/truncated/exhaustive；Feed window 始终不冒充全站 exhaustive。
+- Adapter 业务失败进入 failed/partial Envelope；请求/Operation 错误不产生伪 Envelope。Stage 2 遇到非 `similarity_grouping=off` 会在调用上游前拒绝。
+- API Key/Token 仍按用户决定保存在 Credential 表，但 URL userinfo、credential-like query/fragment、RoutingCatalog 参数旁路、ImportReport 与 OPML export 都不能复制 secret。Direct Feed update/import 清空 Endpoint/Credential，保留合法 fallback 供后续 RSSHub 路线。
+
+## 已固化的不变量
+
+- Feed endpoint 只存在于 Observation，不冒充缺失的 item canonical URL；缺 item URL 明示 limitation。
+- stable upstream identity 只绑定 Source + upstream ID；重复 GUID 走 URL/content/rank 分支，避免整批误合并。
+- title、summary、text 与 HTML 使用同一可见文本边界，排除 hidden、aria-hidden 和 inline display/visibility；hidden-only 内容不能命中 search。
+- Direct Feed 管理清除 Credential/Endpoint；Core/Adapter 共用 URL credential key 判断，覆盖 camel acronym、userinfo、query 与结构化 fragment。
+- OPML import 始终 additive merge，报告路径使用稳定 digest，不回显不可信 title/text。
+- active WAL 的业务无写入以 DB/WAL、routing revision/JSON 和权限不变为准；`-shm` read-mark 属 SQLite 协调状态，不作为业务写入判据。
 
 ## 聚焦反馈
 
-- `go test ./... -count=1` 与 `go test -race ./... -count=1`：全部包通过；Core/Registry/Router/Readiness/SQLite/Transport 的新增行为均有回归覆盖。
-- `go vet ./...`、`gofmt -l cmd internal` 与 `git diff --check`：通过，无格式、静态检查或空白错误。
-- 编译后的本机 CLI：缺失 DB 时 `schema/paths/sources/providers/route-templates/channels/doctor` 返回有效 JSON且不创建配置/状态路径；README Bundle 可导入，未知字段等非法 Bundle 以配置错误拒绝。
-- SQLite v2 fixture：`channels/doctor/plan` 能读取 user Channel 与 Credential preflight，但输出不包含 Credential value；只读前后 DB 与活跃 WAL/SHM 的权限、大小、时间、inode 和哈希不变。
-- `CGO_ENABLED=0 GOOS=<darwin|linux|windows> GOARCH=<arm64|amd64> go build ./cmd/omnihub`：macOS arm64、Linux amd64、Windows amd64 均交叉构建成功；只证明编译，不证明异平台运行。
+- 长期回归只追加到既有 `internal/adapter/binding_test.go`、`internal/transport/examples_test.go` 与 `internal/store/sqlite/store_test.go`，没有新增测试文件。
+- 最终稳定快照的 `go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`git diff --check`、Schema 校验与 native/darwin-arm64/linux-amd64/windows-amd64 构建均通过。
+- 编译后的 CLI 已重放 RSS/Atom/JSON/discovery、200→304、visible/time search、Channel apply/update/disable、OPML import/export、缺 DB 无副作用与 active WAL 读取。
+- 2026-08-14 公开来源重放：V2EX 与 linux.do 成功返回真实 Item；NodeSeek 三个候选 URL 均返回 retryable `network_error`，没有被改写成已支持。
 
 ## 证据边界与交接
 
-- 尚未证明：真实 RSS/Atom/JSON Feed、RSSHub、GitHub、Tavily、X，上游执行 CLI，HTTP/MCP Server，Dashboard/Chrome Bridge，Linux/Windows 运行和 Windows 当前用户 ACL。
-- 剩余风险：Stage 1 还没有公开写入 Channel/Credential 的 CLI/API，SQLite 写入与 CAS 由 Repository contract test 证明；公共 CLI 只证明读取与诊断。Schema manifest 中的 `search/latest/fetch` 是后续出口合同，不表示真实命令已实现。
-- 下一入口：按 `plan.md` Stage 2 实现 Query Plane + Direct Feed 纵切，并从 V2EX Atom/linux.do RSS 的真实结果端验证 Item、Observation、Coverage、缓存与失败语义。
+- Linux/Windows 只做交叉构建，不宣称运行时已验证；Windows cache replace 使用 remove+rename 退化路径，未证明多进程竞争行为。
+- 一次公开来源成功不构成 SLA 或监控；NodeSeek 的当前失败也不证明所有用户网络都不可用。
+- 文件 cache 是 bounded response cache，不是历史索引、subscription state 或 continuation；CLI 的 Feed search 不能召回窗口外内容。
+- 下一入口是 Stage 3 RSSHub 多 Endpoint 纵切。进入 semantic grouping 前必须与项目 Owner 选择 Embedding Provider、Ollama/API、向量索引、阈值、误合并恢复和模型升级策略。

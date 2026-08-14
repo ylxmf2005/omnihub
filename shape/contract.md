@@ -40,11 +40,11 @@
 
 - `operation` 为 `search | latest | fetch`；`health` 通过 doctor/readiness 合同暴露，`refresh` 是 View 编排操作，不是 Provider Capability。
 - `search` 要求 `query`；`fetch` 要求 `target`；`latest` 不接受 query。
-- `scope` 至少给出 Channel、Source、Provider 或 Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。`domains` 字段为后续通用 Web Search 保留；Stage 1 尚无 domain→Channel 元数据，非空时在上游调用前返回参数错误。
+- `scope` 至少给出 Channel、Source、Provider 或 Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。`domains` 字段为后续通用 Web Search 保留；Stage 2 尚无 domain→Channel 元数据，非空时在上游调用前返回参数错误。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
-- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | title | content`，分组不删除不同 Item。
-- `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。
+- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 合同预留 `off | title | content`，分组不删除不同 Item。Stage 2 Query Plane 只接受 `off`，embedding/向量索引选型完成前不得伪装支持其他值。
+- `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。Stage 2 尚未签发 token，因此任何非 null continuation 都在上游调用前拒绝。
 
 ## 2. Result Envelope
 
@@ -222,7 +222,17 @@ Item 借用 JSON Feed 1.1 的内容语义，但保留搜索与聚合所需字段
   "language": "en",
   "attachments": [],
   "metrics": {"stars": 42},
-  "observations": [],
+  "observations": [{
+    "source": "example",
+    "provider": "direct-feed",
+    "channel_id": "channel_example_feed",
+    "route_template_id": "direct-feed-window",
+    "original_url": "https://example.com/post/123",
+    "canonical_url": "https://example.com/post/123",
+    "retrieved_at": "2026-08-13T10:00:01Z",
+    "rank": 1,
+    "verification": "body"
+  }],
   "identity": {
     "cluster_id": "idn_01...",
     "reason": "canonical_url"
@@ -240,7 +250,10 @@ Item 借用 JSON Feed 1.1 的内容语义，但保留搜索与聚合所需字段
 - 时间统一输出 RFC 3339 UTC，无法确定则省略。
 - `metrics` 是可扩展 map；语义不同的同名指标必须 namespaced。
 - `id` 是规范化对象 ID。相似报道仍有各自 Item ID，只共享 `similarity.group_id`。
+- 最终 Item 至少保留一条 Observation；Adapter 返回无 Observation 的 Item 属于内部合同错误，不能输出不可追溯链接。
 - `search` 默认按归一化 Channel rank 合并并稳定打破平局；`latest` 默认按时间排序。跨 Provider score 不被假设为同一量纲。
+
+Stage 2 Direct Feed 的 `search` 只在已取得的 bounded Feed window 内执行：query 经 Unicode lowercase 后按空白分词，在 title、summary、text 与可见 HTML text 上做 AND 匹配，并写入 `local_feed_window_only`。显式时间范围为闭区间 `[from,to]`；Item 优先使用 `published_at`，缺失时回退 `modified_at`，时间仍未知则排除并写入 `item_time_unknown_excluded`。这不等于源站全量 search。
 
 Observation 记录每条获取路径：
 
@@ -283,6 +296,8 @@ Observation 记录每条获取路径：
 ```
 
 Coverage 是观察事实，不是置信度。无法获知时间窗、examined 或 exhaustive 时省略字段并填写 limitation。Feed window、recent search、Web index 和本地 snapshot 使用不同的 `scope`。
+
+Stage 2 identity exact 的优先级为：同 Source 的稳定 upstream ID、canonical URL、最后才是有摘要/正文的规范化内容 hash。已确认同一 Feed 内重复使用的 GUID 不再作为稳定 ID；此时先使用条目 URL，否则以内容 hash 或 route+rank 保持条目独立。所有合并必须保留每条 Observation。
 
 ## 6. Error
 
@@ -412,6 +427,8 @@ spec:
 ```
 
 Direct Feed URL、RSSHub path/parameters、Endpoint、Credential、priority/fallback 与 Collection membership 都落在 user-owned Channel。参数必须按 RouteTemplate/RSSHub metadata 校验，不能从浏览器输入直接拼 URL。
+
+Direct Feed URL、Source canonical URL、Feed metadata URL 与 Endpoint base URL 只接受无 userinfo 的绝对 HTTP(S) URL；credential-like query/fragment key 必须在持久化或请求前拒绝。Direct Feed Channel 不使用 EndpointProfile/Credential，更新或 OPML 回导不得继承这两个字段；fallback 可以保留给后续 Direct Feed→RSSHub 路线。
 
 配置来源分为 `builtin | imported | user`：builtin RouteTemplate 只读，用户通过 Channel/overlay 个性化；imported 资源需审核后启用。远程查询结果不得指定 executable、login URL 或 Cookie scope。
 
@@ -547,9 +564,11 @@ Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 �
 
 ## 11. OPML 与 Source Bundle
 
-- OPML 2.0 import/export 只承诺保真保存 Direct Feed Channel 与 Collection 层级；未知 attribute 按标准忽略或保留扩展。
-- RSSHub、GitHub、Tavily、X 等非 Feed RouteTemplate/Channel 使用 OmniHub Source Bundle YAML。
-- 所有 export 只包含 credential reference，不导出 secret。
+- OPML 2.0 import/export 保存 Direct Feed subscription URL、稳定 Source/Channel extension ID、标准 Feed metadata、Collection 层级与 membership。普通 import 是非破坏性 merge，不把缺失项解释为退订；同一 URL 复用一个 Channel，并可属于多个 Collection。
+- OPML 不携带 enabled、priority、RouteTemplate、fallback、EndpointProfile 或 Credential 等本地执行策略；export 会先输出子 Collection，再按 membership 输出 Feed，因此不承诺混合 folder/feed sibling 的原始交错顺序。
+- 未知 attribute 进入脱敏 warning 后忽略；`include`/`link` 与外部实体不会执行。ImportReport 的 path 不回显原始 title/text，避免错误报告携带误填的 credential。
+- RSSHub、GitHub、Tavily、X 等非 Feed RouteTemplate/Channel 使用 OmniHub Source Bundle YAML 或后续专用管理资源，不冒充 OPML subscription。
+- OPML 和默认配置 export 不输出 Credential reference、EndpointProfile 或 secret；API Key/Token 只留在本机 Credential Repository。
 
 ## 12. Dashboard 管理合同
 

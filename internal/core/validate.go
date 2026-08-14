@@ -33,7 +33,7 @@ func (operation Operation) Validate() error {
 		if operation.Query != nil {
 			return fmt.Errorf("%w: fetch does not accept query", ErrInvalidOperation)
 		}
-		if parsed, err := url.Parse(*operation.Target); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		if parsed, err := url.Parse(*operation.Target); err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
 			return fmt.Errorf("%w: fetch target must be an http(s) URL", ErrInvalidOperation)
 		}
 	default:

@@ -304,6 +304,33 @@ func (catalog *Catalog) WithCredential(credential core.Credential) *Catalog {
 	return copy
 }
 
+// WithSourceAndChannel 为一次无状态查询附加调用方显式给出的 Direct Feed。
+// 它返回独立 Catalog，既不会把临时订阅写回 SQLite，也不会覆盖已注册资源。
+func (catalog *Catalog) WithSourceAndChannel(source core.Source, channel core.Channel) (*Catalog, error) {
+	if strings.TrimSpace(source.ID) == "" || strings.TrimSpace(channel.ID) == "" {
+		return nil, fmt.Errorf("%w: transient source and channel ids are required", ErrInvalidCatalog)
+	}
+	if channel.Source != source.ID {
+		return nil, fmt.Errorf("%w: transient channel source is inconsistent", ErrInvalidCatalog)
+	}
+	copy := catalog.Copy()
+	if existing, ok := copy.sources[source.ID]; ok {
+		if !existing.Enabled {
+			return nil, fmt.Errorf("%w: source %s is disabled", ErrInvalidCatalog, source.ID)
+		}
+	} else {
+		copy.sources[source.ID] = cloneSource(source)
+	}
+	if _, exists := copy.channels[channel.ID]; exists {
+		return nil, fmt.Errorf("%w: transient channel %s already exists", ErrInvalidCatalog, channel.ID)
+	}
+	copy.channels[channel.ID] = cloneChannel(channel)
+	if err := copy.Validate(); err != nil {
+		return nil, err
+	}
+	return copy, nil
+}
+
 func matchesConstraint(constraint core.SourceConstraint, source string) bool {
 	switch constraint.Kind {
 	case "exact":
@@ -381,6 +408,10 @@ func cloneRouteTemplate(value core.RouteTemplate) core.RouteTemplate {
 func cloneChannel(value core.Channel) core.Channel {
 	value.Parameters = cloneStringAnyMap(value.Parameters)
 	value.FallbackChannelIDs = slices.Clone(value.FallbackChannelIDs)
+	if value.FeedMetadata != nil {
+		metadata := *value.FeedMetadata
+		value.FeedMetadata = &metadata
+	}
 	return value
 }
 

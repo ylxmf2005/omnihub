@@ -239,8 +239,9 @@ func (store *Store) runMigration(ctx context.Context, version int, statements []
 }
 
 // routingCatalogPayload 只保存用户可编辑的 Registry 资源。聚合 revision 由表列独立维护，
-// builtin Source、Provider、RouteTemplate 和 Credential 因而不会混入可编辑 JSON。
+// builtin/imported 声明、Provider、RouteTemplate 和 Credential 不会混入可编辑 JSON。
 type routingCatalogPayload struct {
+	Sources     []core.Source          `json:"sources"`
 	Endpoints   []core.EndpointProfile `json:"endpoints"`
 	Channels    []core.Channel         `json:"channels"`
 	Collections []core.Collection      `json:"collections"`
@@ -255,6 +256,7 @@ func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.Sav
 		return core.RoutingCatalog{}, err
 	}
 	payload, err := json.Marshal(routingCatalogPayload{
+		Sources:     input.Catalog.Sources,
 		Endpoints:   input.Catalog.Endpoints,
 		Channels:    input.Catalog.Channels,
 		Collections: input.Catalog.Collections,
@@ -329,6 +331,7 @@ func scanRoutingCatalog(row rowScanner) (core.RoutingCatalog, error) {
 	}
 	return core.RoutingCatalog{
 		Revision:    revision,
+		Sources:     payload.Sources,
 		Endpoints:   payload.Endpoints,
 		Channels:    payload.Channels,
 		Collections: payload.Collections,

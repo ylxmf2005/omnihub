@@ -9,15 +9,31 @@ import (
 // BuiltinCatalog 是运行时内建的静态能力声明。Channel、Endpoint 和
 // Credential 都是用户配置，不会因为安装了二进制就被伪报为已配置。
 func BuiltinCatalog() *Catalog {
-	sources := []core.Source{{ID: "v2ex", Origin: "builtin", Enabled: true}, {ID: "github", Origin: "builtin", Enabled: true}, {ID: "x", Origin: "builtin", Enabled: true}}
+	sources := []core.Source{
+		{ID: "github", Origin: "builtin", Enabled: true},
+		{ID: "linux.do", Origin: "builtin", Enabled: true},
+		{ID: "nodeseek", Origin: "builtin", Enabled: true},
+		{ID: "v2ex", Origin: "builtin", Enabled: true},
+		{ID: "x", Origin: "builtin", Enabled: true},
+	}
 	providers := []core.Provider{
-		{ID: "direct-feed", Capabilities: []string{"latest"}, Enabled: true},
+		{ID: "direct-feed", Capabilities: []string{"latest", "search"}, Enabled: true},
 		{ID: "rsshub", Capabilities: []string{"latest"}, Enabled: true},
 		{ID: "github-api", Capabilities: []string{"search", "fetch"}, Enabled: true},
 		{ID: "xurl", Capabilities: []string{"search"}, Enabled: true},
 	}
 	templates := []core.RouteTemplate{
-		{RouteTemplateID: "v2ex-direct-latest", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"v2ex"}}, Provider: "direct-feed", Adapter: "feed", Capabilities: []string{"latest"}, ContentLevel: "body", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "feed_window"}, Auth: core.AuthDescriptor{Kind: "none"}, Cost: "free", Trust: "remote_public"},
+		{
+			RouteTemplateID: "direct-feed-window", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
+			Provider: "direct-feed", Adapter: "feed", Capabilities: []string{"latest", "search"}, ContentLevel: "body",
+			Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "feed_window"},
+			Auth: core.AuthDescriptor{Kind: "none"}, ParametersSchema: map[string]any{
+				"type": "object", "additionalProperties": false, "required": []any{"url"},
+				"properties": map[string]any{"url": map[string]any{"type": "string", "format": "uri"}},
+			},
+			Cost: "free", Trust: "remote_public", Limitations: []string{"upstream_retention_unknown"},
+		},
+		{RouteTemplateID: "v2ex-direct-latest", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"v2ex"}}, Provider: "direct-feed", Adapter: "feed", Capabilities: []string{"latest"}, ContentLevel: "body", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "feed_window"}, Auth: core.AuthDescriptor{Kind: "none"}, ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"url"}, "properties": map[string]any{"url": map[string]any{"type": "string", "format": "uri"}}}, Cost: "free", Trust: "remote_public", Limitations: []string{"upstream_retention_unknown"}},
 		{RouteTemplateID: "v2ex-rsshub-latest", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"v2ex"}}, Provider: "rsshub", Adapter: "rsshub", Capabilities: []string{"latest"}, ContentLevel: "body", Pagination: core.PaginationDescriptor{Kind: "none"}, TimeRange: core.TimeRangeDescriptor{Kind: "feed_window"}, Auth: core.AuthDescriptor{Kind: "none"}, Cost: "free", Trust: "configured_endpoint"},
 		{RouteTemplateID: "github-native-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "http-json", Capabilities: []string{"search", "fetch"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "provider_defined"}, Auth: core.AuthDescriptor{Kind: "token", Required: true}, Cost: "rate_limited", Trust: "official_api"},
 		{RouteTemplateID: "x-xurl-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "command", Capabilities: []string{"search"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "recent_window"}, Auth: core.AuthDescriptor{Kind: "x_developer_app", Required: true}, Cost: "metered", Trust: "local_executable"},

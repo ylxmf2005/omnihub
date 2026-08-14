@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,14 +10,20 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/ylxmf2005/omnihub/internal/adapter"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/management"
+	queryservice "github.com/ylxmf2005/omnihub/internal/query"
 	"github.com/ylxmf2005/omnihub/internal/readiness"
 	"github.com/ylxmf2005/omnihub/internal/registry"
+	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/router"
+	sqlitestore "github.com/ylxmf2005/omnihub/internal/store/sqlite"
 )
 
 func contractExample(t *testing.T, path string, block int) map[string]any {
@@ -341,4 +348,619 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	if plan, err := router.Build(trusted, operation); err != nil || len(plan.Selected) != 1 {
 		t.Fatalf("Build(trusted cookie) = %#v, %v", plan, err)
 	}
+}
+
+func TestStage2DirectFeedRegistryContracts(t *testing.T) {
+	builtin := registry.BuiltinCatalog()
+	provider, ok := builtin.Provider("direct-feed")
+	if !ok || !slices.Contains(provider.Capabilities, "latest") || !slices.Contains(provider.Capabilities, "search") {
+		t.Fatalf("direct-feed provider = %#v, %v", provider, ok)
+	}
+	template, ok := builtin.RouteTemplate("direct-feed-window")
+	if !ok || template.Adapter != "feed" || template.SourceConstraint.Kind != "any_registered" {
+		t.Fatalf("generic direct-feed template = %#v, %v", template, ok)
+	}
+
+	transient, err := builtin.WithSourceAndChannel(
+		core.Source{ID: "example.org", DisplayName: "Example", Origin: "user", Enabled: true},
+		core.Channel{
+			ID: "channel_example_feed", Source: "example.org", RouteTemplateID: template.RouteTemplateID,
+			Parameters: map[string]any{"url": "https://example.org/feed.json"}, Priority: 100, Enabled: true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := builtin.Channel("channel_example_feed"); ok {
+		t.Fatal("WithSourceAndChannel mutated the original catalog")
+	}
+	query := "agent"
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationSearch, Query: &query,
+		Scope: core.Scope{Channels: []string{"channel_example_feed"}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
+		Limit: 20, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
+	}
+	plan, err := router.Build(transient, operation)
+	if err != nil || len(plan.Selected) != 1 || plan.Selected[0].Channel.ID != "channel_example_feed" {
+		t.Fatalf("Build(transient feed search) = %#v, %v", plan, err)
+	}
+
+	health := readiness.Doctor(transient, time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC))
+	for _, channel := range health.Channels {
+		if channel.ChannelID != "channel_example_feed" {
+			continue
+		}
+		if channel.Readiness != readiness.StateDegraded {
+			t.Fatalf("feed readiness = %q, want degraded", channel.Readiness)
+		}
+		var dependencyPassed, probeUnknown bool
+		for _, check := range channel.Checks {
+			dependencyPassed = dependencyPassed || check.Kind == "dependency_installed" && check.Status == readiness.CheckPassed
+			probeUnknown = probeUnknown || check.Kind == "channel_probe" && check.Status == readiness.CheckUnknown && check.Code != nil && *check.Code == "upstream_not_probed"
+		}
+		if !dependencyPassed || !probeUnknown {
+			t.Fatalf("feed health checks = %#v", channel.Checks)
+		}
+		return
+	}
+	t.Fatal("transient feed health is missing")
+}
+
+type fakeFeedExecutor struct {
+	results map[string]core.AdapterResult
+	calls   []string
+}
+
+func (executor *fakeFeedExecutor) Execute(_ context.Context, request adapter.FeedRequest) core.AdapterResult {
+	executor.calls = append(executor.calls, request.Channel.ID)
+	return executor.results[request.Channel.ID]
+}
+
+func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog {
+	t.Helper()
+	sources := make([]core.Source, 0, len(channels))
+	seenSources := make(map[string]bool)
+	for index := range channels {
+		channels[index].RouteTemplateID = "fixture-feed-window"
+		if seenSources[channels[index].Source] {
+			continue
+		}
+		seenSources[channels[index].Source] = true
+		sources = append(sources, core.Source{ID: channels[index].Source, Origin: "user", Enabled: true})
+	}
+	catalog, err := registry.NewCatalog(
+		sources,
+		[]core.Provider{{ID: "fixture-feed", Capabilities: []string{"search", "latest"}, Enabled: true}},
+		[]core.RouteTemplate{{
+			RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
+			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search", "latest"},
+		}},
+		channels, nil, nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return catalog
+}
+
+func stage2Operation(kind core.OperationKind, channelIDs []string, limit int) core.Operation {
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: kind, Scope: core.Scope{Channels: slices.Clone(channelIDs)},
+		RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto}, Limit: limit,
+		IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30_000,
+	}
+	if kind == core.OperationSearch {
+		query := "needle"
+		operation.Query = &query
+	}
+	return operation
+}
+
+func successfulFeedResult(items ...core.Item) core.AdapterResult {
+	examined, exhaustive := len(items), true
+	return core.AdapterResult{
+		Items: items,
+		Coverage: []core.Coverage{{
+			Scope: "fixture-window", Examined: &examined, Exhaustive: &exhaustive,
+		}},
+	}
+}
+
+func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+
+	t.Run("fallback failure then success", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{
+			{ID: "primary", Source: "source", Priority: 200, FallbackChannelIDs: []string{"fallback"}, Enabled: true},
+			{ID: "fallback", Source: "source", Priority: 100, Enabled: true},
+		})
+		upstreamID := "fallback-item"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"primary": {Errors: []core.Error{{Code: core.ErrorUpstream, Message: "fixture upstream failure", Retryable: true}}},
+			"fallback": successfulFeedResult(core.Item{
+				Title: "Recovered", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}},
+			}),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"primary", "fallback"}, 10)
+		operation.RoutePolicy.AllowFallback = true
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(feed.calls, []string{"primary", "fallback"}) {
+			t.Fatalf("feed calls = %v", feed.calls)
+		}
+		if envelope.Status != core.StatusPartial || !slices.Equal(envelope.SelectedChannelIDs, []string{"primary", "fallback"}) || len(envelope.Items) != 1 {
+			t.Fatalf("fallback envelope = %#v", envelope)
+		}
+		if len(envelope.Executions) != 2 || envelope.Executions[0].Status != core.ExecutionFailed || envelope.Executions[1].Selection != core.SelectionFallback || envelope.Executions[1].Status != core.ExecutionCompleted {
+			t.Fatalf("fallback executions = %#v", envelope.Executions)
+		}
+		if envelope.Items[0].Similarity.Strategy != string(core.SimilarityOff) {
+			t.Fatalf("fallback item similarity = %#v", envelope.Items[0].Similarity)
+		}
+	})
+
+	t.Run("aggregate exact dedupe by same source and upstream id", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{
+			{ID: "aggregate-a", Source: "same-source", Priority: 200, Enabled: true},
+			{ID: "aggregate-b", Source: "same-source", Priority: 100, Enabled: true},
+		})
+		upstreamID := "same-guid-without-url"
+		rankA, rankB := 2, 1
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"aggregate-a": successfulFeedResult(core.Item{
+				Title: "First observation", Observations: []core.Observation{{UpstreamID: &upstreamID, Rank: &rankA, Verification: core.VerificationMetadata}},
+			}),
+			"aggregate-b": successfulFeedResult(core.Item{
+				Title: "Second observation", Observations: []core.Observation{{UpstreamID: &upstreamID, Rank: &rankB, Verification: core.VerificationMetadata}},
+			}),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"aggregate-a", "aggregate-b"}, 10)
+		operation.RoutePolicy.Aggregate = true
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Status != core.StatusComplete || len(envelope.Items) != 1 || envelope.Meta.ResultCount != 1 {
+			t.Fatalf("aggregate envelope = %#v", envelope)
+		}
+		item := envelope.Items[0]
+		if item.URL != "" || item.Identity.Reason != "upstream_id" || len(item.Observations) != 2 || item.Similarity.Strategy != string(core.SimilarityOff) {
+			t.Fatalf("deduplicated item = %#v", item)
+		}
+		if item.Observations[0].ChannelID != "aggregate-a" || item.Observations[1].ChannelID != "aggregate-b" {
+			t.Fatalf("merged observations = %#v", item.Observations)
+		}
+		for _, execution := range envelope.Executions {
+			if execution.Returned != 1 {
+				t.Fatalf("execution %s returned = %d", execution.ChannelID, execution.Returned)
+			}
+		}
+	})
+
+	t.Run("stable upstream id outranks changing canonical URL", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{
+			{ID: "identity-a", Source: "same-source", Priority: 200, Enabled: true},
+			{ID: "identity-b", Source: "same-source", Priority: 100, Enabled: true},
+		})
+		upstreamID := "stable-guid"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"identity-a": successfulFeedResult(core.Item{
+				URL: "https://example.com/old", Observations: []core.Observation{{UpstreamID: &upstreamID, CanonicalURL: "https://example.com/old", Verification: core.VerificationMetadata}},
+			}),
+			"identity-b": successfulFeedResult(core.Item{
+				URL: "https://example.com/new", Observations: []core.Observation{{UpstreamID: &upstreamID, CanonicalURL: "https://example.com/new", Verification: core.VerificationMetadata}},
+			}),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"identity-a", "identity-b"}, 10)
+		operation.RoutePolicy.Aggregate = true
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 1 || envelope.Items[0].Identity.Reason != "upstream_id" || len(envelope.Items[0].Observations) != 2 {
+			t.Fatalf("stable upstream identity envelope = %#v", envelope)
+		}
+	})
+
+	t.Run("identity none keeps duplicate observations as separate items", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{
+			{ID: "none-a", Source: "same-source", Priority: 200, Enabled: true},
+			{ID: "none-b", Source: "same-source", Priority: 100, Enabled: true},
+		})
+		upstreamID := "same-guid"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"none-a": successfulFeedResult(core.Item{Title: "A", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}}}),
+			"none-b": successfulFeedResult(core.Item{Title: "B", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}}}),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"none-a", "none-b"}, 10)
+		operation.RoutePolicy.Aggregate = true
+		operation.IdentityDedupe = core.IdentityNone
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 2 || envelope.Executions[0].Returned != 1 || envelope.Executions[1].Returned != 1 {
+			t.Fatalf("identity none envelope = %#v", envelope)
+		}
+	})
+
+	t.Run("duplicate upstream id limitation does not collapse distinct URLs", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "broken-guid", Source: "source", Enabled: true}})
+		upstreamID := "broken-guid"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"broken-guid": successfulFeedResult(
+				core.Item{URL: "https://example.com/one", Observations: []core.Observation{{UpstreamID: &upstreamID, CanonicalURL: "https://example.com/one", Verification: core.VerificationMetadata, Limitations: []string{"upstream_id_not_unique_in_feed"}}}},
+				core.Item{URL: "https://example.com/two", Observations: []core.Observation{{UpstreamID: &upstreamID, CanonicalURL: "https://example.com/two", Verification: core.VerificationMetadata, Limitations: []string{"upstream_id_not_unique_in_feed"}}}},
+			),
+		}}
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationLatest, []string{"broken-guid"}, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 2 || envelope.Items[0].Identity.Reason != "canonical_url" || envelope.Items[1].Identity.Reason != "canonical_url" {
+			t.Fatalf("duplicate upstream id envelope = %#v", envelope)
+		}
+	})
+
+	t.Run("search only uses visible HTML", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "search", Source: "source", Enabled: true}})
+		hiddenHTML := `<script>needle</script><div hidden>needle</div><p>ordinary text</p>`
+		visibleHTML := `<style>.hidden{display:none}</style><span aria-hidden="true">needle</span><p>Visible needle</p>`
+		hiddenID, visibleID := "hidden", "visible"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"search": successfulFeedResult(
+				core.Item{Title: "Hidden only", Summary: &hiddenHTML, Content: core.Content{HTML: &hiddenHTML}, Observations: []core.Observation{{UpstreamID: &hiddenID, Verification: core.VerificationBody}}},
+				core.Item{Title: "Visible", Summary: &visibleHTML, Content: core.Content{HTML: &visibleHTML}, Observations: []core.Observation{{UpstreamID: &visibleID, Verification: core.VerificationBody}}},
+			),
+		}}
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationSearch, []string{"search"}, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 1 || envelope.Items[0].Title != "Visible" || !slices.Contains(envelope.Executions[0].Limitations, "local_feed_window_only") {
+			t.Fatalf("visible HTML search envelope = %#v", envelope)
+		}
+	})
+
+	t.Run("time range is closed and latest falls back to modified time", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "latest", Source: "source", Enabled: true}})
+		from, to := fixedNow.Add(-2*time.Hour), fixedNow.Add(-time.Hour)
+		outside := from.Add(-time.Nanosecond)
+		fromID, toID, unknownID, outsideID := "published-from", "modified-to", "unknown", "outside"
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"latest": successfulFeedResult(
+				core.Item{Title: "published-from", PublishedAt: &from, Observations: []core.Observation{{UpstreamID: &fromID, Verification: core.VerificationMetadata}}},
+				core.Item{Title: "modified-to", ModifiedAt: &to, Observations: []core.Observation{{UpstreamID: &toID, Verification: core.VerificationMetadata}}},
+				core.Item{Title: "unknown", Observations: []core.Observation{{UpstreamID: &unknownID, Verification: core.VerificationMetadata}}},
+				core.Item{Title: "outside", PublishedAt: &outside, Observations: []core.Observation{{UpstreamID: &outsideID, Verification: core.VerificationMetadata}}},
+			),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"latest"}, 10)
+		operation.TimeRange = core.TimeRange{From: &from, To: &to}
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 2 || envelope.Items[0].Title != "modified-to" || envelope.Items[1].Title != "published-from" {
+			t.Fatalf("closed range items = %#v", envelope.Items)
+		}
+		if len(envelope.Coverage) != 1 || envelope.Coverage[0].Exhaustive == nil || *envelope.Coverage[0].Exhaustive || !slices.Contains(envelope.Coverage[0].Limitations, "item_time_unknown_excluded") {
+			t.Fatalf("time range coverage = %#v", envelope.Coverage)
+		}
+		if !slices.Contains(envelope.Executions[0].Limitations, "item_time_unknown_excluded") {
+			t.Fatalf("time range execution = %#v", envelope.Executions[0])
+		}
+	})
+
+	t.Run("global limit reports per-channel returned counts", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{
+			{ID: "limit-a", Source: "source", Priority: 200, Enabled: true},
+			{ID: "limit-b", Source: "source", Priority: 100, Enabled: true},
+		})
+		times := []time.Time{fixedNow, fixedNow.Add(-time.Minute), fixedNow.Add(-2 * time.Minute), fixedNow.Add(-3 * time.Minute)}
+		ids := []string{"a-new", "a-old", "b-mid", "b-old"}
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"limit-a": successfulFeedResult(
+				core.Item{Title: "a-new", PublishedAt: &times[0], Observations: []core.Observation{{UpstreamID: &ids[0], Verification: core.VerificationMetadata}}},
+				core.Item{Title: "a-old", PublishedAt: &times[2], Observations: []core.Observation{{UpstreamID: &ids[1], Verification: core.VerificationMetadata}}},
+			),
+			"limit-b": successfulFeedResult(
+				core.Item{Title: "b-mid", PublishedAt: &times[1], Observations: []core.Observation{{UpstreamID: &ids[2], Verification: core.VerificationMetadata}}},
+				core.Item{Title: "b-old", PublishedAt: &times[3], Observations: []core.Observation{{UpstreamID: &ids[3], Verification: core.VerificationMetadata}}},
+			),
+		}}
+		operation := stage2Operation(core.OperationLatest, []string{"limit-a", "limit-b"}, 2)
+		operation.RoutePolicy.Aggregate = true
+
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(envelope.Items) != 2 || envelope.Items[0].Title != "a-new" || envelope.Items[1].Title != "b-mid" {
+			t.Fatalf("globally limited items = %#v", envelope.Items)
+		}
+		for _, execution := range envelope.Executions {
+			if execution.Returned != 1 {
+				t.Fatalf("execution %s returned = %d", execution.ChannelID, execution.Returned)
+			}
+		}
+		for _, coverage := range envelope.Coverage {
+			if coverage.Returned == nil || *coverage.Returned != 1 || !coverage.Truncated || coverage.Exhaustive == nil || *coverage.Exhaustive {
+				t.Fatalf("coverage %s = %#v", coverage.ChannelID, coverage)
+			}
+		}
+	})
+
+	t.Run("unsupported similarity never calls upstream", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "similarity", Source: "source", Enabled: true}})
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{}}
+		operation := stage2Operation(core.OperationLatest, []string{"similarity"}, 10)
+		operation.SimilarityGrouping = core.SimilarityTitle
+
+		_, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, operation)
+		if !errors.Is(err, core.ErrInvalidOperation) || len(feed.calls) != 0 {
+			t.Fatalf("Execute(similarity title) error = %v, calls = %v", err, feed.calls)
+		}
+	})
+
+	t.Run("item without observation is rejected", func(t *testing.T) {
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "missing-observation", Source: "source", Enabled: true}})
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
+			"missing-observation": successfulFeedResult(core.Item{Title: "invalid"}),
+		}}
+
+		_, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationLatest, []string{"missing-observation"}, 10))
+		if !errors.Is(err, queryservice.ErrInvalidExecutor) || !slices.Equal(feed.calls, []string{"missing-observation"}) {
+			t.Fatalf("Execute(missing observation) error = %v, calls = %v", err, feed.calls)
+		}
+	})
+}
+
+func stage2ManagementService(t *testing.T) (management.Service, *sqlitestore.Store) {
+	t.Helper()
+	store, err := sqlitestore.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return management.Service{Store: store, Catalog: registry.BuiltinCatalog()}, store
+}
+
+func TestStage2ManagementSQLiteContracts(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("apply update CAS disable and preserve fallback", func(t *testing.T) {
+		service, store := stage2ManagementService(t)
+		created, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "source_management", ChannelID: "channel_primary", ChannelDisplayName: "Primary",
+			URL: "https://feeds.example.com/primary.xml", Priority: 200,
+		})
+		if err != nil || created.Revision != 1 || !created.Enabled {
+			t.Fatalf("ApplyDirectFeed(create) = %#v, %v", created, err)
+		}
+		fallback, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "source_management", ChannelID: "channel_fallback", ChannelDisplayName: "Fallback",
+			URL: "https://feeds.example.com/fallback.xml", Priority: 100,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "source_management", ChannelID: created.ID, URL: "https://feeds.example.com/stale.xml",
+			ExpectedRevision: 0,
+		}); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("ApplyDirectFeed(stale update) error = %v, want ErrConflict", err)
+		}
+
+		routing, err := store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for index := range routing.Channels {
+			if routing.Channels[index].ID != created.ID {
+				continue
+			}
+			routing.Channels[index].EndpointProfileID = "legacy-endpoint"
+			routing.Channels[index].CredentialID = "legacy-credential"
+			routing.Channels[index].FallbackChannelIDs = []string{fallback.ID}
+		}
+		if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: routing.Revision, Catalog: routing}); err != nil {
+			t.Fatal(err)
+		}
+
+		updated, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "source_management", ChannelID: created.ID, ChannelDisplayName: "Primary updated",
+			URL: "https://feeds.example.com/primary-v2.xml", Priority: 0, ExpectedRevision: created.Revision,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.Revision != 2 || updated.EndpointProfileID != "" || updated.CredentialID != "" || !slices.Equal(updated.FallbackChannelIDs, []string{fallback.ID}) {
+			t.Fatalf("ApplyDirectFeed(update) = %#v", updated)
+		}
+		if value, ok := updated.Parameters["url"].(string); !ok || value != "https://feeds.example.com/primary-v2.xml" {
+			t.Fatalf("updated parameters = %#v", updated.Parameters)
+		}
+		if _, err := service.DisableChannel(ctx, updated.ID, created.Revision); !errors.Is(err, repository.ErrConflict) {
+			t.Fatalf("DisableChannel(stale) error = %v, want ErrConflict", err)
+		}
+		disabled, err := service.DisableChannel(ctx, updated.ID, updated.Revision)
+		if err != nil || disabled.Enabled || disabled.Revision != 3 {
+			t.Fatalf("DisableChannel() = %#v, %v", disabled, err)
+		}
+	})
+
+	t.Run("nested OPML merge export and re-import", func(t *testing.T) {
+		service, store := stage2ManagementService(t)
+		preserved, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "source_preserved", ChannelID: "channel_preserved", ChannelDisplayName: "Preserved",
+			URL: "https://preserve.example.com/feed.xml", Priority: 50,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing, err := store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing.Collections = append(routing.Collections, core.Collection{
+			ID: "child", Title: "Old child", ChannelIDs: []string{preserved.ID}, Enabled: true, Revision: 1,
+		})
+		seeded, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: routing.Revision, Catalog: routing})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		const document = `<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0" xmlns:omnihub="https://omnihub.dev/ns/opml">
+  <body>
+    <outline text="Top" title="Top" omnihub:collection_id="top">
+      <outline text="Child" title="Child" omnihub:collection_id="child">
+        <outline text="Shared subscription" title="Shared source" type="rss"
+          xmlUrl="https://feeds.example.com/shared.xml" htmlUrl="https://www.example.com/shared"
+          description="Shared description" language="en" version="RSS2"
+          omnihub:source_id="source_shared" omnihub:channel_id="channel_shared"/>
+      </outline>
+      <outline text="Sibling" title="Sibling" omnihub:collection_id="sibling">
+        <outline text="Shared alias" title="Shared source" type="rss"
+          xmlUrl="HTTPS://FEEDS.EXAMPLE.COM:443/shared.xml#ignored"/>
+      </outline>
+    </outline>
+  </body>
+</opml>`
+		report, err := service.ImportOPML(ctx, strings.NewReader(document))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.CatalogRevision != seeded.Revision+1 || len(report.Created) == 0 || len(report.Updated) == 0 || len(report.Reused) == 0 {
+			t.Fatalf("first ImportOPML report = %#v", report)
+		}
+		imported, err := store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		channels := make(map[string]core.Channel, len(imported.Channels))
+		for _, channel := range imported.Channels {
+			channels[channel.ID] = channel
+		}
+		collections := make(map[string]core.Collection, len(imported.Collections))
+		for _, collection := range imported.Collections {
+			collections[collection.ID] = collection
+		}
+		if len(channels) != 2 || channels["channel_shared"].Parameters["url"] != "https://feeds.example.com/shared.xml" {
+			t.Fatalf("imported channels = %#v", imported.Channels)
+		}
+		if collections["child"].ParentID != "top" || !slices.Equal(collections["child"].ChannelIDs, []string{preserved.ID, "channel_shared"}) {
+			t.Fatalf("child collection = %#v", collections["child"])
+		}
+		if collections["sibling"].ParentID != "top" || !slices.Equal(collections["sibling"].ChannelIDs, []string{"channel_shared"}) {
+			t.Fatalf("sibling collection = %#v", collections["sibling"])
+		}
+
+		repeated, err := service.ImportOPML(ctx, strings.NewReader(document))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if repeated.CatalogRevision != report.CatalogRevision || len(repeated.Created) != 0 || len(repeated.Updated) != 0 {
+			t.Fatalf("idempotent ImportOPML report = %#v", repeated)
+		}
+
+		secretValue := "secret-must-not-echo"
+		now := time.Date(2026, 8, 14, 13, 0, 0, 0, time.UTC)
+		if _, err := store.CreateCredential(ctx, core.Credential{
+			ID: "credential-must-not-echo", Provider: "direct-feed", AuthKind: "token", Label: "private",
+			Value: &secretValue, Enabled: true, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		routing, err = store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routing.Endpoints = append(routing.Endpoints, core.EndpointProfile{
+			ID: "endpoint-must-not-echo", Provider: "direct-feed", BaseURL: "https://endpoint.example.com", Trust: "remote", Enabled: true, Revision: 1,
+		})
+		for index := range routing.Channels {
+			if routing.Channels[index].ID == "channel_shared" {
+				routing.Channels[index].EndpointProfileID = "endpoint-must-not-echo"
+				routing.Channels[index].CredentialID = "credential-must-not-echo"
+			}
+		}
+		if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: routing.Revision, Catalog: routing}); err != nil {
+			t.Fatal(err)
+		}
+
+		var exported bytes.Buffer
+		if err := service.ExportOPML(ctx, &exported); err != nil {
+			t.Fatal(err)
+		}
+		exportedText := exported.String()
+		for _, field := range []string{
+			`text="Shared subscription"`, `title="Shared source"`, `type="rss"`,
+			`xmlUrl="https://feeds.example.com/shared.xml"`, `htmlUrl="https://www.example.com/shared"`,
+			`description="Shared description"`, `language="en"`, `version="RSS2"`,
+			`omnihub:source_id="source_shared"`, `omnihub:channel_id="channel_shared"`, `omnihub:collection_id="top"`,
+		} {
+			if !strings.Contains(exportedText, field) {
+				t.Fatalf("exported OPML is missing %s:\n%s", field, exportedText)
+			}
+		}
+		for _, forbidden := range []string{"secret-must-not-echo", "credential-must-not-echo", "endpoint-must-not-echo", "credential_id", "endpoint_profile_id"} {
+			if strings.Contains(strings.ToLower(exportedText), forbidden) {
+				t.Fatalf("exported OPML contains %q:\n%s", forbidden, exportedText)
+			}
+		}
+
+		reimportService, reimportStore := stage2ManagementService(t)
+		if _, err := reimportService.ImportOPML(ctx, bytes.NewReader(exported.Bytes())); err != nil {
+			t.Fatal(err)
+		}
+		reimported, err := reimportStore.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reimportedChannels := make(map[string]core.Channel, len(reimported.Channels))
+		for _, channel := range reimported.Channels {
+			reimportedChannels[channel.ID] = channel
+			if channel.EndpointProfileID != "" || channel.CredentialID != "" {
+				t.Fatalf("re-imported channel contains execution secrets = %#v", channel)
+			}
+		}
+		reimportedCollections := make(map[string]core.Collection, len(reimported.Collections))
+		for _, collection := range reimported.Collections {
+			reimportedCollections[collection.ID] = collection
+		}
+		shared := reimportedChannels["channel_shared"]
+		if shared.FeedMetadata == nil || shared.FeedMetadata.HTMLURL != "https://www.example.com/shared" || shared.FeedMetadata.Description != "Shared description" || shared.FeedMetadata.Language != "en" || shared.FeedMetadata.Version != "RSS2" {
+			t.Fatalf("re-imported shared feed = %#v", shared)
+		}
+		if reimportedCollections["child"].ParentID != "top" || !slices.Equal(reimportedCollections["child"].ChannelIDs, []string{preserved.ID, "channel_shared"}) || reimportedCollections["sibling"].ParentID != "top" || !slices.Equal(reimportedCollections["sibling"].ChannelIDs, []string{"channel_shared"}) {
+			t.Fatalf("re-imported collections = %#v", reimported.Collections)
+		}
+	})
+
+	t.Run("import report never echoes untrusted feed labels", func(t *testing.T) {
+		service, _ := stage2ManagementService(t)
+		const malicious = `<opml version="2.0"><body><outline type="rss" text="token=must-not-echo" title="token=must-not-echo" xmlUrl="https://evil.example/feed?token=must-not-echo"/></body></opml>`
+		report, err := service.ImportOPML(ctx, strings.NewReader(malicious))
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Skipped) != 1 || bytes.Contains(encoded, []byte("must-not-echo")) || bytes.Contains(encoded, []byte("token=")) {
+			t.Fatalf("unsafe ImportOPML report = %s", encoded)
+		}
+	})
 }
