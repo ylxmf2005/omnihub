@@ -1,140 +1,153 @@
-# TestPlan：Stage 3 RSSHub 多 Endpoint 纵切
+# TestPlan：Stage A 可信出站与主动分层 Probe
 
 ## 计划状态
 
-- 被测对象：相对基线 `788a2021820b53269770106b4acda1019cb4b2f5` 的 Stage 3 交付 diff；完整对象摘要记录在 Test Report。
+- 被测对象：`/private/tmp/omnihub-stage-a` 相对 baseline `4c4b08d` 的完整 Stage A diff 与本轮构建的 native CLI。
 - 计划状态：`completed`
-- 任务承诺：`context.md`、`shape/contract.md`、`shape/design.md` 与 `plan.md` 的 Stage 3。
-- 结论边界：证明 RSSHub 是用户显式配置的可选 Provider，具备 Endpoint/Channel/Credential 管理、Route metadata 与实际 Feed 分层探测、统一 Query/fallback 与脱敏边界；不证明 managed RSSHub、长期监控、NodeSeek、其他非 Feed Provider、HTTP/MCP/Skill、Dashboard、Chrome、MySQL 或语义向量去重。
+- 任务承诺：`context.md`、`shape/requirements.md` REQ-029/030、`shape/contract.md` 7.6、`plan.md` Stage A。
+- 结论边界：证明固定 Egress 绑定、四种 transport、分层主动 Probe、普通 Query 成本、迁移/CAS/脱敏和 CLI 入口；不证明真实公网代理 SLA、System Proxy/PAC、VPN/TUN、自动线路选择或持续监控。
 
 ## 测试事实账本
 
-- 环境与路由：macOS arm64、Go 1.26.4；确定性上游使用一次性 loopback RSSHub fixture；所有 SQLite/cache 位于独立临时目录。RSSHub 不由 OmniHub 安装、启动或默认选择。
-- 身份与权限：本地 CLI 用户；fixture 默认匿名。Owner 已授权只向用户显式配置的 RSSHub Endpoint 发送派生 `code`，本轮只使用假 key 与 loopback Endpoint 验证，不向公网发送。
-- 数据与清理责任：只修改当前隔离工作树和 `/private/tmp` 测试资源；loopback fixture 已停止并以 curl exit 7 复核端口拒绝连接。二进制、数据库、输出与 cache 暂保留到当前对象完成最终构建/复核，随后由主 Agent 清理。
-- 观察面：CLI exit/stdout/stderr、Envelope、Endpoint/Channel Probe JSON、Doctor/Plan、SQLite routing/credential snapshot、HTTP 请求 path/query/header、cache 文件、全量 Go gate 与跨平台产物。
-- 已知限制：Linux/Windows 只交叉构建；公网 RSSHub 实例不是默认依赖，也不用于替代确定性 fixture。授权只覆盖显式 Endpoint 的受限 credential transport，不证明任意反向代理或公网实例策略。
+- 环境与路由：macOS arm64、Go 1.26.4；自动回归使用 loopback HTTP/TLS/HTTP CONNECT/SOCKS relay；CLI E2E 使用 `127.0.0.1:59623` 静态 RSS fixture 与隔离 SQLite/cache。
+- 身份与权限：当前本机用户；只使用假 RSSHub key 与假代理 Basic Credential，不向公网代理发送。
+- 数据与清理责任：仓库只修改既有测试文件；临时 DB、fixture、二进制和跨平台构建物位于 `/private/tmp`，阶段提交前停止进程并删除。
+- 观察面：CLI exit/stdout/stderr、Envelope/Execution、Probe checks、fixture 请求计数、SQLite Catalog/Credential、Go test/race/vet、Schema 和二进制格式。
+- 已知限制：Linux/Windows 仅交叉构建；Endpoint Probe 只证明 health，完整网络层由 Channel Probe 证明。
 
 ## 风险与覆盖
 
 | 风险或承诺 | 来源 | 失败后果 | 覆盖用例 |
 | --- | --- | --- | --- |
-| 未配置 RSSHub 时 Direct Feed 仍可用，且只读命令无副作用 | plan Stage 3 目标与完成证据 | 可选 Provider 反变成系统硬依赖 | TC-301 |
-| user-owned Endpoint/Channel/Credential 的 typed 配置、Collection 与 revision CAS | plan.md:53-55；shape/design.md:210-215 | 错误配置持久化、并发覆盖或 secret 泄露 | TC-302 |
-| Endpoint health、Route metadata 与实际 Feed 必须是三个独立事实 | plan.md:53,57-59 | 首页 200 被误报成 Channel ready | TC-303 |
-| V2EX Direct Feed 与 RSSHub 的 prefer/only/fallback 必须服从统一 Router/Envelope | plan.md:56；shape/design.md:130-136 | Agent 得到错误路线、重复执行或虚假成功 | TC-304 |
-| access key 只能按明确授权发往显式 Endpoint，且 revision 隔离 cache、全过程不泄露 | plan.md:53,55；shape/design.md:212,215 | secret 外泄或旧账号状态复用 | TC-305 |
-| 四种现实与机器出口必须可区分 | plan.md:57；CLI contract | 未配置、不可达、缺配置和上游失败混成一种状态 | TC-306 |
-| Stage 1/2 回归、race/vet/schema/跨平台构建保持成立 | 真实 diff 影响 Core/Router/CLI/Adapter | Stage 3 局部成功掩盖基础合同退化 | TC-307 |
+| EgressProfile 资源、固定绑定、CAS 与旧资源 fail-closed | REQ-029；contract 7.6 | 隐式直连、并发覆盖或错误出口 | TC-A01、TC-A02 |
+| 四种 mode 必须走用户明确出口且不隐式 fallback | plan Stage A | 绕过安全边界或虚报代理使用 | TC-A03 |
+| Probe 必须按真实拓扑分层并保留下游 not_run | REQ-030 | `network_error` 仍不可行动或伪造层级 | TC-A04 |
+| 普通 Query 不增加 Probe 请求；cache hit 不虚报代理 | contract 7.6 | 隐藏延迟/请求或错误审计事实 | TC-A05 |
+| 代理/RSSHub Credential 不进入 URL、输出或 cache | context Acceptance Evidence | secret 泄漏 | TC-A06 |
+| 一次性 Feed 与 OPML 不得创建无出口 Channel | plan Stage A | 旁路持久绑定合同 | TC-A07 |
+| 公共 Schema、race、全量回归和发布构建保持成立 | 全 Stage A diff | 局部成功掩盖系统退化 | TC-A08 |
 
 ## 用例
 
-### TC-301 — RSSHub 可选且缺配置无副作用
+### TC-A01 — EgressProfile 管理、持久化与 CAS
 
-- 背景与风险：证明安装 OmniHub 不会隐式要求本机 RSSHub 或创建用户状态。
+- 背景与风险：出口是用户管理资源，不能只是一次请求参数。
 - 优先级：P1
-- 环境与身份：不存在的 config/database/cache 根；当前 native 二进制。
-- 前置数据：无 SQLite、无 sources.yaml、无 RSSHub Endpoint。
-- 实际动作：执行 `endpoints`、`channels`、`doctor --json`、RSSHub Channel scoped `plan`，再用 loopback Direct Feed 执行 `latest --feed-url`。
-- 预期：只读命令不创建目录或 DB；RSSHub 为未配置/无路由；Direct Feed 返回可验证 Envelope。
-- 观察面与窗口：命令退出后立即检查输出 JSON、stderr、目录树和文件 stat。
-- 证据：命令/退出码/JSON 摘要与前后文件清单。
-- 失败处理：阻断交付。
-- 清理：fixture 已停止；临时根在最终交付后由主 Agent 删除。
-- 证据边界：不证明任何用户自建 RSSHub 的可用性。
+- 环境与身份：隔离 SQLite；真实 CLI 与 Repository 回归。
+- 前置数据：direct/environment/http_proxy/socks5(local/proxy DNS) Profile，proxy Basic Credential。
+- 实际动作：CLI apply/list/disable；重放 stale revision；重启加载；验证 Endpoint 与 Direct Feed 新建必须引用 enabled Profile。
+- 预期：revision 单调、stale 写 exit 4、不保存双绑定；列表只返回代理地址/凭据的安全摘要。
+- 观察面与窗口：CLI 输出、SQLite routing JSON、重启后 Catalog。
+- 证据：`internal/transport/examples_test.go`、`internal/store/sqlite/store_test.go` 与 CLI transcript。
+- 失败处理：阻断 Stage A。
+- 清理：删除隔离 SQLite。
+- 证据边界：v1 不实现 MySQL Store。
 
-### TC-302 — Endpoint/Channel/Credential 管理与 CAS
+### TC-A02 — 固定绑定、旧资源与 Adapter fail-closed
 
-- 背景与风险：管理入口必须把 RSSHub 配置写成可执行且可并发保护的 user-owned 资源。
+- 背景与风险：Router preflight 不能成为唯一安全门；真实 I/O 边界也必须拒绝空 Egress。
 - 优先级：P1
-- 环境与身份：临时 SQLite；真实 CLI 与 Repository contract 回归。
-- 前置数据：V2EX Source、builtin RSSHub RouteTemplate、一个 Direct Feed fallback、一个 Collection。
-- 实际动作：创建/更新/旧 revision 更新/禁用 Endpoint；创建 Credential 并只列掩码；创建 RSSHub Channel，填写 path、typed limit、Endpoint/Credential、priority/fallback/Collection；尝试 limit=101、secret-like 参数和 stale revision。
-- 预期：合法资源落库且 revision 单调；stale 写不覆盖；非法 schema/secret 在写前拒绝；列表、错误、Catalog/OPML 不出现 secret 原值。
-- 观察面与窗口：CLI stdout/stderr、SQLite routing JSON/credential rows、重启后 Catalog。
-- 证据：既有 `examples_test.go` 回归、真实 CLI 输出与 secret 全文扫描。
-- 失败处理：阻断交付。
-- 清理：临时 SQLite 暂保留到最终交付后清理。
-- 证据边界：本机 MVP 允许 API key 原值存在 Credential 表；不证明 Keychain 或远程 secret store。
+- 环境与身份：Catalog/Router/Query/Adapter 回归；loopback server 记录请求数。
+- 前置数据：Endpoint-backed、endpointless、缺失/禁用/悬挂/双绑定 Channel，以及空 Egress Feed/RSSHub 请求。
+- 实际动作：运行 Router/Doctor/Query 组合；直接调用 Feed/RSSHub Execute/Probe 的空 Egress 负例。
+- 预期：Endpoint 只继承 Endpoint Profile，Direct 只取 Channel Profile；Operation/Probe 无覆盖；旧缺绑定为 config/not_configured；Adapter 返回 `config_error` 且请求数 0。
+- 观察面与窗口：plan/readiness reason、AdapterResult、fixture counter。
+- 证据：`TestAdaptersRejectMissingEgressBeforeNetwork` 与 transport/Core 回归。
+- 失败处理：任何隐式网络请求阻断交付。
+- 清理：fixture 随测试退出。
+- 证据边界：不承诺把旧资源自动迁移为某个出口。
 
-### TC-303 — Endpoint、metadata 与 Feed 分层 Probe
+### TC-A03 — direct、environment、HTTP proxy 与 SOCKS5
 
-- 背景与风险：任何单层 200 都不能扩散成 Channel ready。
+- 背景与风险：Profile 声明不能冒充实际 transport。
 - 优先级：P1
-- 环境与身份：loopback RSSHub fixture；无鉴权。
-- 前置数据：`/healthz`、`/api/namespace/v2ex` 的真实 `/topics/:type` + example metadata、`/v2ex/topics/latest` RSS；另准备 health-only、metadata-missing 和 feed-failed 变体。
-- 实际动作：执行 `endpoints probe ID` 与 `channels probe ID`，并运行 Adapter Probe 回归。
-- 预期：Endpoint Probe 只说明 health；Channel Probe 分别报告 endpoint/metadata/feed；三层成功为 ready，Feed 成功但 metadata/health 不兼容为 degraded，Feed 失败为 failed。
-- 观察面与窗口：Probe JSON、HTTP 请求计数/path、exit 0/5。
-- 证据：fixture transcript 与 `binding_test.go`。
-- 失败处理：阻断依赖 probe 的交付结论，其余测试继续。
-- 清理：fixture 在本轮结束时停止。
-- 证据边界：一次 Probe 不是监控或 SLA。
+- 环境与身份：真实 loopback origin、HTTP proxy、CONNECT tunnel 和 SOCKS5 relay。
+- 前置数据：四种 Profile；SOCKS local/proxy DNS；HTTP proxy Basic Credential。
+- 实际动作：执行 Feed Query/Probe；environment 子进程分别验证无 proxy/实际 proxy；HTTP proxy 验证认证与 cache；SOCKS relay记录收到的 target。
+- 预期：direct 不代理；environment 按当前环境决定；HTTP proxy 经指定代理；SOCKS local 传 IP、proxy DNS 传 FQDN；不存在自动直连 fallback。
+- 观察面与窗口：origin/proxy request count、SOCKS target、Execution/ProviderState `proxied`。
+- 证据：`internal/adapter/binding_test.go` 四 mode fixture。
+- 失败处理：阻断 Stage A。
+- 清理：所有 listener 由 test cleanup 回收。
+- 证据边界：不证明真实公网或企业代理。
 
-### TC-304 — V2EX prefer/only/fallback Query
+### TC-A04 — 分层 Probe 成功与故障定位
 
-- 背景与风险：RSSHub 必须复用统一 Router/Query，而不是形成旁路。
+- 背景与风险：单个 `network_error` 不能指出用户该修哪一层。
 - 优先级：P1
-- 环境与身份：同一临时 Catalog 下配置 V2EX RSSHub 与 Direct Feed Channel。
-- 前置数据：RSSHub 可成功/失败切换；Direct Feed 始终返回确定性 RSS。
-- 实际动作：用严格 JSON 分别执行 prefer RSSHub、only RSSHub、RSSHub 失败且 allow_fallback=true、Direct-only；检查 selected/skipped/executions。
-- 预期：prefer 先执行 RSSHub；only 不越界；fallback 只执行一次且保留失败/成功事实；Direct-only 不访问 RSSHub；最终 Item provenance 指向实际执行 Channel/Endpoint。
-- 观察面与窗口：Envelope、fixture 请求日志、执行计数。
-- 证据：公共 Query 回归与真实 CLI transcript。
-- 失败处理：阻断交付。
-- 清理：fixture 已停止；临时 DB/cache 暂保留到最终交付后清理。
-- 证据边界：只证明 `latest` Feed window，不等价于 V2EX 全站搜索。
+- 环境与身份：真实 direct、CONNECT 407、不可达代理、TLS 自签名、HTTP 403、坏 Feed fixture。
+- 前置数据：Direct/HTTP/SOCKS Channel。
+- 实际动作：执行 Feed/RSSHub Channel Probe；逐层断言 DNS、TCP、proxy_connect、TLS、HTTP、feed_parse。
+- 预期：成功层为 passed；IP literal/not-required/delegated 明确 not_run；前置失败后的依赖层为 `not_run/prerequisite_failed`；CONNECT 407 为 proxy auth；SOCKS DNS 归因符合 mode。
+- 观察面与窗口：Probe `checks[]`、HTTP/SOCKS 请求计数。
+- 证据：自动 fixture；真实 CLI Direct 成功及 HTTP/SOCKS port 9 失败输出。
+- 失败处理：错误层或虚假 passed 阻断交付。
+- 清理：CLI fixture 停止并确认无进程。
+- 证据边界：Endpoint health 不冒充完整分层事实。
 
-### TC-305 — access-key 受限传输与脱敏
+### TC-A05 — Query 成本、缓存与实际 proxied 事实
 
-- 背景与风险：RSSHub access key 的派生 `code` 是 request-time secret material，不能进入配置、日志、Envelope、Probe 或 cache。
+- 背景与风险：正常搜索不能暗中执行重型 Probe，缓存也不能继承历史代理事实。
 - 优先级：P1
-- 环境与身份：Owner 已明确授权；使用假 key 的 loopback Endpoint，不向公网发送。
-- 前置数据：Endpoint revision 4；启用 Credential revision 3（v1）/4（v2）；fixture 验证 `code=md5(path+key)`，并提供同源/跨域 redirect、cache、环境 proxy 与外部 transport 负例。
-- 实际动作：执行匿名 Endpoint Probe、credentialed Channel Probe/Query、同请求 cache hit、Credential 轮换；检查 redirect、cache key/文件与全部输出；断言 proxy resolver 只看到 clean request clone；对命中 proxy 和注入外部 `http.Transport` 的请求验证发网前 fail-closed。
-- 预期：只向用户显式 Endpoint 的同 origin、分段 base-path 路径发送派生 code；跨域、越界、编码 traversal、double slash 与 HTML alternate 不传播。proxy resolver 在注入 code 前只接收清除 `key/code` 与受限 headers 的 clone；命中 proxy 时 callback 1 次但无 access material，Endpoint/proxy 网络请求均为 0、`auth.used=false`。任何外部 transport 都返回 `config_error`，custom DialContext/DialTLS 不调用；确认不命中 proxy 后才由 OmniHub 自建 transport 注入 code 并直连。RoundTrip 有 response 才记录 `auth.used=true`，无 response 与 cache hit 为 `false`。原 key/code 不写入 URL 输出、cache、Catalog、日志、Error/Envelope/Probe；Credential revision 产生不同 cache partition。
-- 观察面与窗口：fixture 收到的 query、stdout/stderr、cache/SQLite 全文扫描。
-- 证据：授权记录、fixture transcript 与回归。
-- 失败处理：任何越过显式 Endpoint、跨域/base-path 传播、泄密或认证失败都阻断交付。
-- 清理：fixture 已停止，端口已确认拒绝连接；假 key 数据与 cache 暂保留到最终交付后清理。
-- 证据边界：不证明真实公网 RSSHub key 或任意反向代理策略。
+- 环境与身份：计数 fixture、内存/文件 cache。
+- 前置数据：同一 Direct Channel 与 HTTP proxy Channel。
+- 实际动作：分别执行 Query 和显式 Probe；重复命中新鲜 cache；修改 Profile/Credential revision。
+- 预期：Query 与 Probe 各一条自身请求；Query 不多发 DNS/HTTP 诊断请求；fresh cache 不发网且 `proxied=false`；revision 变化 cache miss。
+- 观察面与窗口：fixture log、ProviderState、Execution Egress、cache key。
+- 证据：`TestFeedProbeUsesOneRealDirectRequest`、proxy cache 回归与 CLI 请求日志。
+- 失败处理：阻断 Stage A。
+- 清理：删除临时 cache。
+- 证据边界：条件重验证 304 仍是一条正常 Query 请求，不是 Probe。
 
-### TC-306 — 四种现实与机器出口
+### TC-A06 — Credential 与网络信息脱敏
 
-- 背景与风险：Agent 依赖稳定状态和 exit code 决定下一步。
+- 背景与风险：代理密码、代理 URL 与 RSSHub 派生 code 不能从诊断面回流。
 - 优先级：P1
-- 环境与身份：TC-301/303 的缺 DB、临时 DB 与 fixture。
-- 前置数据：未配置、不可达 Endpoint、缺 Endpoint/Credential/参数 Channel、真实成功 Channel。
-- 实际动作：重放 doctor/plan/endpoint probe/channel probe/latest，以及严格 JSON 负例。
-- 预期：参数错误 3；配置/无路由 4；上游/Probe 失败 5 且结构化结果仍可读；成功 0；未执行 Probe 的 doctor 保持 unknown/degraded，不虚报 ready。
-- 观察面与窗口：exit、stdout JSON、stderr、readiness reason。
-- 证据：退出码矩阵与 JSON 摘要。
-- 失败处理：阻断交付。
-- 清理：fixture 已停止；其余临时证据暂保留到最终交付后清理。
-- 证据边界：不实现持续健康历史或告警。
+- 环境与身份：假 `username:password`、假 RSSHub key；loopback proxy/Endpoint。
+- 前置数据：credentialed Egress 与 RSSHub Channel。
+- 实际动作：apply/list/query/probe/cache/revision；扫描 Catalog、cache、输出、Error 与日志；验证明文 RSSHub 边界。
+- 预期：Credential list 仅 mask；Profile summary 只有 `has_endpoint/credential_id`；非 loopback HTTP 或明文代理在签名前失败；任何公共面无原值/code/proxy URL。
+- 观察面与窗口：CLI JSON、SQLite routing JSON、cache、fixture request。
+- 证据：RSSHub/HTTP proxy 安全回归与 CLI redaction 检查。
+- 失败处理：任何泄漏阻断交付。
+- 清理：删除假 Credential DB。
+- 证据边界：本地 MVP 按决策允许 Credential 原值存在 SQLite Credential 记录。
 
-### TC-307 — 全量回归与可构建性
+### TC-A07 — 一次性 Feed 与 OPML 的显式出口
 
-- 背景与风险：Stage 3 触及公共模型、Registry/Router/Readiness、Query 与 CLI。
+- 背景与风险：两个便利入口不能绕过固定绑定。
 - 优先级：P1
-- 环境与身份：最终稳定工作树；独立 GOCACHE；允许 loopback listener。
-- 前置数据：所有既有测试与本轮修改的既有测试文件。
-- 实际动作：`gofmt`、`go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`git diff --check`；构建 native/darwin-arm64/linux-amd64/windows-amd64；运行 `omnihub schema`。
-- 预期：全部 exit 0；四平台产物格式/架构正确；无新增 `*_test.go`；Schema 投影 `endpoint_required`。
-- 观察面与窗口：命令终态、产物 file 信息与 schema JSON。
-- 证据：质量闸执行记录。
-- 失败处理：阻断交付。
-- 清理：构建物和独立 cache 在当前对象完成最终构建/复核后清理。
-- 证据边界：交叉构建不等于 Linux/Windows 运行或 Windows ACL 验证。
+- 环境与身份：native CLI、隔离 SQLite、静态 RSS/OPML。
+- 前置数据：已保存 direct/environment Profile。
+- 实际动作：运行带/不带 `--egress-mode` 的一次性 latest；运行带/不带/未知 `--egress-profile` 的 OPML import；export/re-import。
+- 预期：仅接受 transient direct/environment；缺 mode exit 3；缺 import flag exit 3；未知 Profile exit 4；新 Channel 带选择的 Profile，已有 Channel 不被改写；OPML 不导出 Egress ID。
+- 观察面与窗口：CLI exit/JSON、Catalog 回读、OPML 文本。
+- 证据：真实 CLI 与 `nested OPML merge export and re-import` 回归。
+- 失败处理：阻断 Stage A。
+- 清理：删除临时 OPML/DB。
+- 证据边界：临时 Feed 不接受临时代理 URL，代理必须引用已保存 Profile。
+
+### TC-A08 — 全量质量闸、Schema 与发布构建
+
+- 背景与风险：Stage A 横跨 Core、Store、Router、Adapter、CLI 和公共合同。
+- 优先级：P1
+- 环境与身份：最终工作树、允许 loopback 的本机环境。
+- 前置数据：全部既有测试和本轮在既有文件追加的回归。
+- 实际动作：`gofmt`、全量 test/race/vet、`git diff --check`；native/darwin-arm64/linux-amd64/windows-amd64 build；运行 `schema`。
+- 预期：全部 exit 0；Schema 的 Execution Egress 枚举为四 mode，direct 强制 `proxied=false`；四平台格式正确；无新增测试文件。
+- 观察面与窗口：命令终态、Schema JSON、`file` 与 SHA-256。
+- 证据：最终 gate 输出和 Test Report。
+- 失败处理：阻断提交。
+- 清理：删除 `/private/tmp` 构建物。
+- 证据边界：交叉构建不等于 Linux/Windows 运行测试。
 
 ## 执行顺序与依赖
 
-- 先完成 TC-302 的写入事实与 TC-303 fixture；随后并行执行 TC-301/304/306。
-- TC-305 已在当前 proxy-fail-closed 对象上完成：authenticated Probe/Query、cache hit、Credential rotation、隐式 proxy/外部 transport 阻断与全文脱敏均有证据。
-- 受影响的全量 test/race/vet、四平台构建、Schema 与 diff check 已重跑并 exit 0；独立复核由 Review 产物单独裁决。
+- 先验证 TC-A01/A02 的固定绑定，再运行真实 transport/Probe；安全负例失败时停止依赖的成功声明。
+- TC-A03/A04/A05/A06 可由自动 fixture 并行；TC-A07 使用最终 native CLI；最后对稳定对象执行 TC-A08。
 
 ## 计划攻击与开放缺口
 
-- 仍可能全绿但产品错误的路径：只跑 Adapter fake 会漏掉 CLI/SQLite/Router，因此 TC-303/304 必须使用真实二进制；只看 healthz 会漏掉 Route/Feed，因此三层分别断言。
-- 仍需现场发明的输入或步骤：none；credential 用例的权限和测试方案均已确定。
-- 下一步：Test 与独立 Review 均已完成；后续能力从 Stage 4 的 Owner decisions 继续，不把它们反向算入本轮验收。
+- 仍可能全绿但产品错误的路径：若只测 Router，Adapter 仍可能默认直连；已由 TC-A02 的直接 Adapter 零请求负例关闭。若只看 JSON，Probe 可能伪造网络层；已由真实 CONNECT/SOCKS/TLS fixture 与请求计数关闭。
+- 仍需现场发明的输入或步骤：none。
+- 下一步：完成 Test Report 与最终独立 Review。

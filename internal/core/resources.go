@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -68,6 +69,7 @@ type Channel struct {
 	Source             string         `json:"source"`
 	RouteTemplateID    string         `json:"route_template_id"`
 	EndpointProfileID  string         `json:"endpoint_profile_id,omitempty"`
+	EgressProfileID    string         `json:"egress_profile_id,omitempty"`
 	CredentialID       string         `json:"credential_id,omitempty"`
 	Parameters         map[string]any `json:"parameters,omitempty"`
 	Priority           int            `json:"priority"`
@@ -103,13 +105,57 @@ type Provider struct {
 }
 
 type EndpointProfile struct {
-	ID       string         `json:"id"`
-	Provider string         `json:"provider"`
-	BaseURL  string         `json:"base_url,omitempty"`
-	Trust    string         `json:"trust"`
-	Options  map[string]any `json:"options,omitempty"`
-	Enabled  bool           `json:"enabled"`
-	Revision int64          `json:"revision"`
+	ID              string         `json:"id"`
+	Provider        string         `json:"provider"`
+	BaseURL         string         `json:"base_url,omitempty"`
+	EgressProfileID string         `json:"egress_profile_id,omitempty"`
+	Trust           string         `json:"trust"`
+	Options         map[string]any `json:"options,omitempty"`
+	Enabled         bool           `json:"enabled"`
+	Revision        int64          `json:"revision"`
+}
+
+type EgressMode string
+
+const (
+	EgressModeEnvironment EgressMode = "environment"
+	EgressModeDirect      EgressMode = "direct"
+	EgressModeHTTPProxy   EgressMode = "http_proxy"
+	EgressModeSOCKS5      EgressMode = "socks5"
+)
+
+type Socks5DNSMode string
+
+const (
+	Socks5DNSLocal Socks5DNSMode = "local"
+	Socks5DNSProxy Socks5DNSMode = "proxy"
+)
+
+// EgressProfile 是用户显式选择的出站路径。ProxyEndpoint 只进入受信任
+// transport 构造，普通列表和执行结果必须使用 EgressProfileSummary。
+type EgressProfile struct {
+	ID            string        `json:"id"`
+	DisplayName   string        `json:"display_name,omitempty"`
+	Mode          EgressMode    `json:"mode"`
+	ProxyEndpoint string        `json:"proxy_endpoint,omitempty"`
+	CredentialID  string        `json:"credential_id,omitempty"`
+	Socks5DNS     Socks5DNSMode `json:"socks5_dns,omitempty"`
+	Enabled       bool          `json:"enabled"`
+	Revision      int64         `json:"revision"`
+}
+
+// EgressProfileSummary 是管理面可安全返回的视图。HasEndpoint 只表达
+// 已配置代理地址，不回显地址本身；Proxied 表达静态代理模式，不猜测
+// environment 对某次请求是否实际命中代理。
+type EgressProfileSummary struct {
+	ID           string     `json:"id"`
+	DisplayName  string     `json:"display_name,omitempty"`
+	Mode         EgressMode `json:"mode"`
+	Proxied      bool       `json:"proxied"`
+	HasEndpoint  bool       `json:"has_endpoint"`
+	CredentialID string     `json:"credential_id,omitempty"`
+	Enabled      bool       `json:"enabled"`
+	Revision     int64      `json:"revision"`
 }
 
 type Collection struct {
@@ -130,12 +176,13 @@ type TemplateOverlay struct {
 }
 
 type RoutingCatalog struct {
-	Revision    int64             `json:"revision"`
-	Sources     []Source          `json:"sources"`
-	Endpoints   []EndpointProfile `json:"endpoints"`
-	Channels    []Channel         `json:"channels"`
-	Collections []Collection      `json:"collections"`
-	Overlays    []TemplateOverlay `json:"overlays"`
+	Revision       int64             `json:"revision"`
+	Sources        []Source          `json:"sources"`
+	Endpoints      []EndpointProfile `json:"endpoints"`
+	EgressProfiles []EgressProfile   `json:"egress_profiles"`
+	Channels       []Channel         `json:"channels"`
+	Collections    []Collection      `json:"collections"`
+	Overlays       []TemplateOverlay `json:"overlays"`
 }
 
 // ValidateForStorage 保护 SQLite user snapshot 的自包含不变量。Source、
@@ -158,6 +205,9 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 	if err != nil {
 		return err
 	}
+	if _, err := uniqueIDs("egress profile", len(catalog.EgressProfiles), func(index int) string { return catalog.EgressProfiles[index].ID }); err != nil {
+		return err
+	}
 	channels, err := uniqueIDs("channel", len(catalog.Channels), func(index int) string { return catalog.Channels[index].ID })
 	if err != nil {
 		return err
@@ -175,10 +225,18 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 			return fmt.Errorf("%w: endpoint %s is incomplete or contains credential material", ErrInvalidRoutingCatalog, endpoint.ID)
 		}
 	}
+	for _, profile := range catalog.EgressProfiles {
+		if err := profile.Validate(); err != nil {
+			return err
+		}
+	}
 	for _, channel := range catalog.Channels {
 		metadataURLValid := channel.FeedMetadata == nil || validOptionalPublicHTTPURL(channel.FeedMetadata.HTMLURL)
 		if strings.TrimSpace(channel.Source) == "" || strings.TrimSpace(channel.RouteTemplateID) == "" || !metadataURLValid || containsSensitiveConfig(channel.Parameters) {
 			return fmt.Errorf("%w: channel %s is incomplete or contains credential material", ErrInvalidRoutingCatalog, channel.ID)
+		}
+		if channel.EndpointProfileID != "" && channel.EgressProfileID != "" {
+			return fmt.Errorf("%w: channel %s cannot bind endpoint and egress together", ErrInvalidRoutingCatalog, channel.ID)
 		}
 		seenFallback := make(map[string]bool)
 		for _, fallbackID := range channel.FallbackChannelIDs {
@@ -210,6 +268,43 @@ func (catalog RoutingCatalog) ValidateForStorage() error {
 		return fmt.Errorf("%w: collection hierarchy contains a cycle", ErrInvalidRoutingCatalog)
 	}
 	return nil
+}
+
+// Validate 校验 EgressProfile 自身的可持久化组合。资源引用可以悬挂，
+// 因此 CredentialID 与 Endpoint/Channel 的关联由管理写入和运行时裁决。
+func (profile EgressProfile) Validate() error {
+	if strings.TrimSpace(profile.ID) == "" {
+		return fmt.Errorf("%w: egress profile id is required", ErrInvalidRoutingCatalog)
+	}
+	switch profile.Mode {
+	case EgressModeEnvironment, EgressModeDirect:
+		if profile.ProxyEndpoint != "" || profile.CredentialID != "" || profile.Socks5DNS != "" {
+			return fmt.Errorf("%w: egress profile %s mode %s cannot contain proxy configuration", ErrInvalidRoutingCatalog, profile.ID, profile.Mode)
+		}
+	case EgressModeHTTPProxy:
+		if profile.Socks5DNS != "" || !validProxyEndpoint(profile.ProxyEndpoint, "http") {
+			return fmt.Errorf("%w: egress profile %s must contain an http proxy host and port", ErrInvalidRoutingCatalog, profile.ID)
+		}
+	case EgressModeSOCKS5:
+		if profile.Socks5DNS != Socks5DNSLocal && profile.Socks5DNS != Socks5DNSProxy || !validProxyEndpoint(profile.ProxyEndpoint, "socks5") {
+			return fmt.Errorf("%w: egress profile %s must contain a socks5 proxy host, port, and DNS mode", ErrInvalidRoutingCatalog, profile.ID)
+		}
+	default:
+		return fmt.Errorf("%w: egress profile %s has invalid mode %q", ErrInvalidRoutingCatalog, profile.ID, profile.Mode)
+	}
+	return nil
+}
+
+func validProxyEndpoint(value, scheme string) bool {
+	if value == "" || value != strings.TrimSpace(value) {
+		return false
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || !strings.EqualFold(parsed.Scheme, scheme) || parsed.User != nil || parsed.Hostname() == "" || parsed.Port() == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
+		return false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	return err == nil && port > 0 && port <= 65535
 }
 
 func uniqueIDs[T ~string](kind string, count int, id func(int) T) (map[string]int, error) {

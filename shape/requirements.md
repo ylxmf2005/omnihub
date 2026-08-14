@@ -58,7 +58,7 @@ v1 只连接用户显式配置的一个或多个本地/远程 RSSHub Endpoint；
 
 ### REQ-006：RSSHub 鉴权与诊断
 
-RSSHub key 可通过环境变量或 Dashboard 写入的 SQLite Credential 读取，不进入命令历史、Run、Error 或普通日志。执行时按实际 URL pathname 计算派生 `code`，只允许用户显式 Endpoint 的同 origin、分段 base-path 内请求；redirect 每跳清除旧 `key/code` 后重签，跨域、越界、编码 traversal、double slash 与认证 HTML discovery 都在下一跳发网前失败。Stage 3 尚无 EgressProfile：认证链只使用 OmniHub 自建受信任 transport，不继承外部 `http.Transport`、DialContext/DialTLS、TLS 或 protocol 设置；存在外部 transport 时必须在发网前 `config_error`。proxy resolver 只接收已清 `key/code` 和受限 headers 的 clean request clone；若会命中 proxy，Endpoint 与 proxy 都不能收到网络请求；只有确认不命中 proxy 后才向网络请求注入 code 并直连。
+RSSHub key 可通过环境变量或 Dashboard 写入的 SQLite Credential 读取，不进入命令历史、Run、Error 或普通日志。执行时按实际 URL pathname 计算派生 `code`，只允许用户显式 Endpoint 的同 origin、分段 base-path 内请求；redirect 每跳清除旧 `key/code` 后重签，跨域、越界、编码 traversal、double slash 与认证 HTML discovery 都在下一跳发网前失败。认证链必须使用 Endpoint 固定绑定的 EgressProfile，并只由 OmniHub 构造 transport；缺 Profile、Profile 不匹配或外部 Client/transport 都在发网前 `config_error`。带 key 的 HTTP 只允许 literal loopback 且本次实际未使用代理；非 loopback HTTP 或任何明文代理路径在签名前失败。HTTPS 可使用显式 environment/HTTP proxy/SOCKS5，仍严格校验证书且不做出口 fallback。
 
 Endpoint Probe 匿名，Channel Probe 使用 Channel Credential。只有带签名的 RoundTrip 得到 response 才能记录 `auth.used=true`；无 response 或 cache hit 都记录 `false`。cache 按 Endpoint/Credential revision 隔离。诊断分开报告 Endpoint 配置、可达性、上游 Route 元数据、Channel 依赖与一次真实 Feed 解析；Endpoint 健康不能推导所有 Channel 健康。
 
@@ -199,7 +199,7 @@ Probe、readiness 与 Execution 必须绑定具体 Endpoint×Egress；无 Endpoi
 
 显式 `channels probe` 必须按实际出口拆分 observation，而不是把代理伪装成一条 target 直连链。Direct 观察 target DNS→target TCP→TLS→HTTP→Feed parse；HTTP CONNECT 至少区分 proxy DNS/TCP、CONNECT 与 tunnel 内 target TLS；SOCKS5 local DNS 才能报告本地 target DNS 结果，proxy DNS 时 target resolution 必须为 `not_run/delegated_to_egress` 或等价 limitation，不能编造 resolved IP。每个实际层输出 `passed | degraded | failed | not_run`、耗时、可行动 reason 与 `retryable`，并关联具体 Egress/target 或 proxy subject；前一层阻断时，未运行的下游层统一保持 `not_run`。正常 Query 复用同一 Endpoint×Egress transport 与错误分类，但不得自动执行这条重型分层 Probe。
 
-当 direct 绑定失败、另一个用户显式 proxy 绑定成功时，各绑定的事实必须分别保留。单 Channel 只按自己的固定绑定裁决；跨多个显式绑定聚合时，至少一个成功且存在其他失败呈现 `ready_dependent`，并披露所依赖的 profile ID。
+当 direct 绑定失败、另一个用户显式 proxy 绑定成功时，各绑定的事实必须分别保留。单 Channel 只按自己的固定绑定裁决；Stage C 持久化 Probe health 并提供 Dashboard aggregate consumer 后，跨多个显式绑定聚合时至少一个成功且存在其他失败才呈现 `ready_dependent`，并披露所依赖的 profile ID。
 
 ### REQ-031：本地 semantic grouping
 
@@ -257,7 +257,7 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 15. **显式出站方向**：EgressProfile 支持 environment/direct/http_proxy/socks5 与 SOCKS5 local/proxy DNS；有 Endpoint 时绑定在 EndpointProfile，无 Endpoint 时绑定在 Channel；Operation/Probe 不覆盖，代理认证引用 Credential 且不在 URL 中携带。
 16. **出站 fail-closed**：不隐式 fallback、直连、公共 DoH、公共代理或关闭 TLS；真正 System Proxy/PAC、VPN/TUN 与最快线路不在 Stage A。Probe/readiness/Execution 绑定 Endpoint×Egress，输出脱敏的 profile 事实。
 17. **主动 Probe 成本**：只有显式 Channel Probe 执行 DNS→TCP→TLS→HTTP→Feed parse 分层诊断；正常 Query 不自动运行。
-18. **迁移与 readiness**：已有资源缺 Egress 绑定即 fail-closed，不自动补 direct/environment；单 Channel 按固定绑定裁决，跨绑定可用但依赖特定出口时为 `ready_dependent`。
+18. **迁移与 readiness**：已有资源缺 Egress 绑定即 fail-closed，不自动补 direct/environment；单 Channel 按固定绑定裁决。Stage C 有持久 Probe facts 与聚合消费者后，跨绑定可用但依赖特定出口时为 `ready_dependent`。
 19. **semantic MVP**：复用 SQLite BLOB + 精确 cosine，支持用户显式配置的本地 Ollama/OpenAI-compatible embedding；默认关闭、只分组不删除，不引入 CGO、第二数据库或外部向量服务。
 
 ## 7. 决策收口

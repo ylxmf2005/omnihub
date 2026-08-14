@@ -90,6 +90,11 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	if err := searchSchema.Validate(&validSearch); err != nil {
 		t.Fatalf("valid search schema input failed: %v", err)
 	}
+	for _, forbidden := range []string{"egress", "egress_profile_id", "proxy", "proxy_url"} {
+		if _, exists := schemaObject(t, artifacts.CLI.Commands[0].InputSchema)["properties"].(map[string]any)[forbidden]; exists {
+			t.Fatalf("search input exposes forbidden egress override %q", forbidden)
+		}
+	}
 	for name, mutate := range map[string]func(map[string]any){
 		"wrong version":   func(value map[string]any) { value["schema_version"] = "2.0" },
 		"empty query":     func(value map[string]any) { value["query"] = "" },
@@ -147,6 +152,14 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	if err := envelopeSchema.Validate(&validEnvelope); err != nil {
 		t.Fatalf("contract envelope failed generated schema: %v", err)
 	}
+	withSkipped := cloneJSONMap(t, validEnvelope)
+	skipped := cloneJSONMap(t, withSkipped["executions"].([]any)[0].(map[string]any))
+	skipped["status"], skipped["selection"], skipped["started_at"], skipped["duration_ms"] = "skipped", "candidate", "0001-01-01T00:00:00Z", float64(0)
+	delete(skipped, "egress")
+	withSkipped["executions"] = append(withSkipped["executions"].([]any), skipped)
+	if err := envelopeSchema.Validate(&withSkipped); err != nil {
+		t.Fatalf("skipped execution without runtime egress failed schema: %v", err)
+	}
 	for name, mutate := range map[string]func(map[string]any){
 		"bad request id": func(value map[string]any) { value["request_id"] = "req_01" },
 		"null selected":  func(value map[string]any) { value["selected_channel_ids"] = nil },
@@ -159,6 +172,22 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 		"continuation token":  func(value map[string]any) { value["continuation"].(map[string]any)["token"] = "cursor" },
 		"continuation mode":   func(value map[string]any) { value["continuation"].(map[string]any)["mode"] = "opaque" },
 		"nested continuation": func(value map[string]any) { value["request"].(map[string]any)["continuation"] = "cursor" },
+		"null execution egress": func(value map[string]any) {
+			value["executions"].([]any)[0].(map[string]any)["egress"] = nil
+		},
+		"missing egress profile": func(value map[string]any) {
+			delete(value["executions"].([]any)[0].(map[string]any)["egress"].(map[string]any), "profile_id")
+		},
+		"blank egress profile": func(value map[string]any) {
+			value["executions"].([]any)[0].(map[string]any)["egress"].(map[string]any)["profile_id"] = " "
+		},
+		"invalid egress mode": func(value map[string]any) {
+			value["executions"].([]any)[0].(map[string]any)["egress"].(map[string]any)["mode"] = "automatic"
+		},
+		"direct reported proxied": func(value map[string]any) {
+			egress := value["executions"].([]any)[0].(map[string]any)["egress"].(map[string]any)
+			egress["mode"], egress["proxied"] = "direct", true
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := cloneJSONMap(t, validEnvelope)
@@ -247,6 +276,19 @@ func TestFrozenContractFieldsAreProjected(t *testing.T) {
 	}
 	assertProperties(t, artifacts.Schemas.RouteTemplate, "route_template_id", "origin", "source_constraint", "provider", "adapter", "capabilities", "content_level", "pagination", "time_range", "auth", "cost", "trust", "limitations")
 	assertProperties(t, artifacts.Schemas.Envelope, "schema_version", "request_id", "status", "request", "selected_channel_ids", "executions", "items", "coverage", "errors", "continuation", "meta")
+	envelopeProperties := schemaObject(t, artifacts.Schemas.Envelope)["properties"].(map[string]any)
+	executionProperties := envelopeProperties["executions"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	egressProperties := executionProperties["egress"].(map[string]any)["properties"].(map[string]any)
+	for _, name := range []string{"profile_id", "mode", "proxied"} {
+		if _, ok := egressProperties[name]; !ok {
+			t.Errorf("execution egress schema misses property %s", name)
+		}
+	}
+	for _, forbidden := range []string{"proxy_endpoint", "credential_id", "username", "password"} {
+		if _, ok := egressProperties[forbidden]; ok {
+			t.Errorf("execution egress schema exposes %s", forbidden)
+		}
+	}
 	assertProperties(t, artifacts.Schemas.Item, "id", "url", "external_url", "title", "content", "summary", "image", "banner_image", "published_at", "modified_at", "authors", "tags", "language", "attachments", "metrics", "observations", "identity", "similarity")
 	assertProperties(t, artifacts.Schemas.Run, "id", "kind", "resource", "status", "request_id", "idempotency_key", "created_at", "started_at", "finished_at", "claimed_by", "lease_expires_at", "attempt", "progress", "result", "last_error", "revision")
 	assertProperties(t, artifacts.Schemas.Coverage, "source", "channel_id", "route_template_id", "scope", "from", "to", "examined", "returned", "exhaustive", "truncated", "limitations")

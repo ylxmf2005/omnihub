@@ -50,7 +50,7 @@ func BuiltinCatalog() *Catalog {
 		{RouteTemplateID: "github-native-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "http-json", Capabilities: []string{"search", "fetch"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "provider_defined"}, Auth: core.AuthDescriptor{Kind: "token", Required: true}, Cost: "rate_limited", Trust: "official_api"},
 		{RouteTemplateID: "x-xurl-search", Origin: "builtin", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "command", Capabilities: []string{"search"}, ContentLevel: "metadata", Pagination: core.PaginationDescriptor{Kind: "cursor"}, TimeRange: core.TimeRangeDescriptor{Kind: "recent_window"}, Auth: core.AuthDescriptor{Kind: "x_developer_app", Required: true}, Cost: "metered", Trust: "local_executable"},
 	}
-	catalog, err := NewCatalog(sources, providers, templates, nil, nil, nil, nil, nil)
+	catalog, err := NewCatalog(sources, providers, templates, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -63,20 +63,21 @@ func BuiltinFixture() *Catalog {
 	now := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
 	builtin := BuiltinCatalog()
 	channels := []core.Channel{
-		{ID: "channel_v2ex_direct", Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", Priority: 100, Enabled: true, Revision: 1},
+		{ID: "channel_v2ex_direct", Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", EgressProfileID: "egress-direct", Priority: 100, Enabled: true, Revision: 1},
 		{ID: "channel_v2ex_rsshub", Source: "v2ex", RouteTemplateID: "v2ex-rsshub-latest", EndpointProfileID: "rsshub-local", Parameters: map[string]any{"path": "/v2ex/topics/latest"}, Priority: 50, FallbackChannelIDs: []string{"channel_v2ex_direct"}, Enabled: true, Revision: 1},
 		{ID: "channel_github_official", Source: "github", RouteTemplateID: "github-native-search", EndpointProfileID: "github-official", CredentialID: "cred_github", Priority: 100, Enabled: true, Revision: 1},
-		{ID: "channel_x_official", Source: "x", RouteTemplateID: "x-xurl-search", CredentialID: "cred_x", Priority: 100, Enabled: true, Revision: 1},
+		{ID: "channel_x_official", Source: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-direct", CredentialID: "cred_x", Priority: 100, Enabled: true, Revision: 1},
 	}
 	endpoints := []core.EndpointProfile{
-		{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", Trust: "local", Enabled: true, Revision: 1},
-		{ID: "github-official", Provider: "github-api", BaseURL: "https://api.github.com", Trust: "official", Enabled: true, Revision: 1},
+		{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", EgressProfileID: "egress-direct", Trust: "local", Enabled: true, Revision: 1},
+		{ID: "github-official", Provider: "github-api", BaseURL: "https://api.github.com", EgressProfileID: "egress-direct", Trust: "official", Enabled: true, Revision: 1},
 	}
+	egressProfiles := []core.EgressProfile{{ID: "egress-direct", DisplayName: "Direct", Mode: core.EgressModeDirect, Enabled: true, Revision: 1}}
 	credentials := []core.Credential{
 		{ID: "cred_github", Provider: "github-api", AuthKind: "token", Label: "GitHub fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
 		{ID: "cred_x", Provider: "xurl", AuthKind: "api_key", Label: "X fixture", Enabled: false, Revision: 1, CreatedAt: now, UpdatedAt: now},
 	}
-	catalog, err := NewCatalog(builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(), channels, endpoints, credentials, nil, nil)
+	catalog, err := NewCatalog(builtin.Sources(), builtin.Providers(), builtin.RouteTemplates(), channels, endpoints, egressProfiles, credentials, nil, nil)
 	if err != nil {
 		panic(err)
 	}

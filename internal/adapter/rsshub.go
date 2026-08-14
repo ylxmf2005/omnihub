@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 )
 
 const rssHubMetadataPrefix = "/api/namespace/"
@@ -24,21 +26,25 @@ const maxRSSHubMetadataBytes int64 = 1 << 20
 // RSSHubRequest 将 Endpoint、Route 实例与可选 Credential 限制在一次 Adapter
 // 调用内；Credential 不会进入 Channel Parameters 或任何输出 URL。
 type RSSHubRequest struct {
-	Operation     core.Operation
-	Channel       core.Channel
-	RouteTemplate core.RouteTemplate
-	Endpoint      core.EndpointProfile
-	Credential    *core.Credential
+	Operation        core.Operation
+	Channel          core.Channel
+	RouteTemplate    core.RouteTemplate
+	Endpoint         core.EndpointProfile
+	Credential       *core.Credential
+	Egress           core.EgressProfile
+	EgressCredential *core.Credential
 }
 
 // RSSHubProbeReport 保留 metadata 与实际 Feed 两个独立事实。Endpoint 或 metadata
 // 的成功都不足以把 Channel 标成 ready。
 type RSSHubProbeReport struct {
-	CheckedAt time.Time           `json:"checked_at"`
-	Endpoint  RSSHubEndpointProbe `json:"endpoint"`
-	Metadata  RSSHubMetadataProbe `json:"metadata"`
-	Feed      RSSHubFeedFacts     `json:"feed"`
-	Readiness string              `json:"readiness"`
+	CheckedAt time.Time            `json:"checked_at"`
+	Egress    core.ExecutionEgress `json:"egress"`
+	Checks    []egress.Check       `json:"checks"`
+	Endpoint  RSSHubEndpointProbe  `json:"endpoint"`
+	Metadata  RSSHubMetadataProbe  `json:"metadata"`
+	Feed      RSSHubFeedFacts      `json:"feed"`
+	Readiness string               `json:"readiness"`
 }
 
 type RSSHubEndpointProbe struct {
@@ -99,6 +105,7 @@ type rssHubCredentialPolicy struct {
 type rssHubCredentialTransport struct {
 	base   http.RoundTripper
 	policy *rssHubCredentialPolicy
+	egress *egress.Client
 }
 
 type rssHubCredentialTransportRejected struct{}
@@ -185,6 +192,25 @@ func (transport *rssHubCredentialTransport) RoundTrip(request *http.Request) (*h
 	if err != nil {
 		return nil, err
 	}
+	if cleanURL.Scheme == "http" {
+		address := net.ParseIP(cleanURL.Hostname())
+		if address == nil || !address.IsLoopback() {
+			return nil, egress.ErrCleartextCredential
+		}
+		if transport.egress != nil {
+			cleanRequest := request.Clone(request.Context())
+			cleanRequest.URL = cleanURL
+			cleanRequest.Header = request.Header.Clone()
+			clearRSSHubRestrictedHeaders(cleanRequest.Header)
+			proxied, proxyErr := transport.egress.ProxyFor(cleanRequest)
+			if proxyErr != nil {
+				return nil, egress.ErrUntrustedTransport
+			}
+			if proxied {
+				return nil, egress.ErrCleartextCredential
+			}
+		}
+	}
 	signed := request.Clone(request.Context())
 	signedURL := *cleanURL
 	signed.URL = &signedURL
@@ -232,29 +258,6 @@ func (transport *rssHubCredentialTransport) RoundTrip(request *http.Request) (*h
 
 func (rssHubCredentialTransportRejected) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errRSSHubExplicitEgressRequired
-}
-
-func restrictedRSSHubTransport(proxy func(*http.Request) (*url.URL, error), policy *rssHubCredentialPolicy) http.RoundTripper {
-	// 认证请求使用新的零值 Transport，不继承调用方可注入的 DialContext、
-	// DialTLS、TLSClientConfig 或协议 handler。Operation context 继续负责总
-	// deadline，标准 Transport 继续严格校验证书。
-	direct := &http.Transport{}
-	direct.Proxy = func(request *http.Request) (*url.URL, error) {
-		cleanURL, err := policy.cleanURL(request.URL)
-		if err != nil {
-			return nil, err
-		}
-		cleanRequest := request.Clone(request.Context())
-		cleanRequest.URL = cleanURL
-		cleanRequest.Header = request.Header.Clone()
-		clearRSSHubRestrictedHeaders(cleanRequest.Header)
-		proxyURL, err := proxy(cleanRequest)
-		if err != nil || proxyURL != nil {
-			return nil, errRSSHubExplicitEgressRequired
-		}
-		return nil, nil
-	}
-	return &rssHubCredentialTransport{base: direct, policy: policy}
 }
 
 func clearRSSHubRestrictedHeaders(header http.Header) {
@@ -339,8 +342,10 @@ func rssHubFeedRequest(request RSSHubRequest, feedURL string) FeedRequest {
 	return FeedRequest{
 		Operation: request.Operation,
 		Channel: core.Channel{ID: request.Channel.ID, Source: request.Channel.Source,
-			RouteTemplateID: request.RouteTemplate.RouteTemplateID, Parameters: map[string]any{"url": feedURL}},
-		RouteTemplate: core.RouteTemplate{RouteTemplateID: request.RouteTemplate.RouteTemplateID, Provider: "rsshub", Adapter: "feed"},
+			RouteTemplateID: request.RouteTemplate.RouteTemplateID, EgressProfileID: request.Egress.ID, Parameters: map[string]any{"url": feedURL}},
+		RouteTemplate:    core.RouteTemplate{RouteTemplateID: request.RouteTemplate.RouteTemplateID, Provider: "rsshub", Adapter: "feed"},
+		Egress:           request.Egress,
+		EgressCredential: request.EgressCredential,
 		CacheKey: strings.Join([]string{
 			"rsshub", request.Endpoint.ID, strconv.FormatInt(request.Endpoint.Revision, 10),
 			credentialID, strconv.FormatInt(credentialRevision, 10),
@@ -360,10 +365,10 @@ func (adapter RSSHubAdapter) Probe(ctx context.Context, request RSSHubRequest) R
 			Readiness: "failed",
 		}
 	}
-	endpoint := adapter.probeEndpoint(ctx, request.Endpoint, request.Credential)
-	metadata := adapter.probeMetadata(ctx, request.Endpoint, request.Channel, request.Credential)
-	feedResult := adapter.probeFeed(ctx, request)
-	feed := rssHubFeedFacts(feedResult)
+	endpoint := adapter.probeEndpoint(ctx, request.Endpoint, request.Credential, request.Egress, request.EgressCredential)
+	metadata := adapter.probeMetadata(ctx, request.Endpoint, request.Channel, request.Credential, request.Egress, request.EgressCredential)
+	feedReport := adapter.probeFeed(ctx, request)
+	feed := rssHubFeedFacts(feedReport.Result)
 	readiness := "failed"
 	if feed.FeedParsed {
 		readiness = "ready"
@@ -371,16 +376,19 @@ func (adapter RSSHubAdapter) Probe(ctx context.Context, request RSSHubRequest) R
 			readiness = "degraded"
 		}
 	}
-	return RSSHubProbeReport{CheckedAt: checkedAt, Endpoint: endpoint, Metadata: metadata, Feed: feed, Readiness: readiness}
+	return RSSHubProbeReport{CheckedAt: checkedAt, Egress: feedReport.Egress, Checks: feedReport.Checks, Endpoint: endpoint, Metadata: metadata, Feed: feed, Readiness: readiness}
 }
 
-// ProbeEndpoint probes only the documented RSSHub health endpoint. It is a
-// bounded endpoint-level fact and must not be used as evidence for a route.
-func (adapter RSSHubAdapter) ProbeEndpoint(ctx context.Context, endpoint core.EndpointProfile) RSSHubEndpointProbe {
-	return adapter.probeEndpoint(ctx, endpoint, nil)
+// ProbeEndpoint probes only the documented RSSHub health endpoint through the
+// Endpoint's fixed egress. It is a bounded endpoint fact, not route evidence.
+func (adapter RSSHubAdapter) ProbeEndpoint(ctx context.Context, endpoint core.EndpointProfile, profile core.EgressProfile, credential *core.Credential) RSSHubEndpointProbe {
+	return adapter.probeEndpoint(ctx, endpoint, nil, profile, credential)
 }
 
-func (adapter RSSHubAdapter) probeEndpoint(ctx context.Context, endpoint core.EndpointProfile, credential *core.Credential) RSSHubEndpointProbe {
+func (adapter RSSHubAdapter) probeEndpoint(ctx context.Context, endpoint core.EndpointProfile, credential *core.Credential, profile core.EgressProfile, egressCredential *core.Credential) RSSHubEndpointProbe {
+	if endpoint.EgressProfileID == "" || endpoint.EgressProfileID != profile.ID {
+		return RSSHubEndpointProbe{Error: rssHubProbeError(core.ErrorConfig, "RSSHub endpoint egress is invalid", false)}
+	}
 	base, err := rssHubBaseURL(endpoint)
 	if err != nil {
 		return RSSHubEndpointProbe{Error: rssHubProbeError(core.ErrorConfig, "RSSHub endpoint probe is invalid", false)}
@@ -388,7 +396,7 @@ func (adapter RSSHubAdapter) probeEndpoint(ctx context.Context, endpoint core.En
 	target := *base
 	target.Path = strings.TrimRight(target.Path, "/") + "/healthz"
 	target.RawPath = ""
-	response, credentialPolicy, requestErr := adapter.rssHubGET(ctx, target.String(), endpoint, credential)
+	response, credentialPolicy, requestErr := adapter.rssHubGET(ctx, target.String(), endpoint, credential, profile, egressCredential)
 	if requestErr != nil {
 		return RSSHubEndpointProbe{Error: requestErr}
 	}
@@ -415,12 +423,11 @@ func (adapter RSSHubAdapter) probeEndpoint(ctx context.Context, endpoint core.En
 	return probe
 }
 
-func (adapter RSSHubAdapter) ProbeMetadata(ctx context.Context, endpoint core.EndpointProfile, channel core.Channel) RSSHubMetadataProbe {
-	return adapter.probeMetadata(ctx, endpoint, channel, nil)
-}
-
-func (adapter RSSHubAdapter) probeMetadata(ctx context.Context, endpoint core.EndpointProfile, channel core.Channel, credential *core.Credential) RSSHubMetadataProbe {
+func (adapter RSSHubAdapter) probeMetadata(ctx context.Context, endpoint core.EndpointProfile, channel core.Channel, credential *core.Credential, profile core.EgressProfile, egressCredential *core.Credential) RSSHubMetadataProbe {
 	namespace := rssHubNamespace(channel)
+	if endpoint.EgressProfileID == "" || endpoint.EgressProfileID != profile.ID {
+		return RSSHubMetadataProbe{Namespace: namespace, Error: rssHubProbeError(core.ErrorConfig, "RSSHub metadata egress is invalid", false)}
+	}
 	base, err := rssHubBaseURL(endpoint)
 	if err != nil || namespace == "" || strings.Contains(namespace, "/") {
 		return RSSHubMetadataProbe{Namespace: namespace, Error: rssHubProbeError(core.ErrorConfig, "RSSHub metadata probe is invalid", false)}
@@ -428,7 +435,7 @@ func (adapter RSSHubAdapter) probeMetadata(ctx context.Context, endpoint core.En
 	target := *base
 	target.Path = strings.TrimRight(target.Path, "/") + rssHubMetadataPrefix + url.PathEscape(namespace)
 	target.RawPath = ""
-	response, credentialPolicy, requestErr := adapter.rssHubGET(ctx, target.String(), endpoint, credential)
+	response, credentialPolicy, requestErr := adapter.rssHubGET(ctx, target.String(), endpoint, credential, profile, egressCredential)
 	if requestErr != nil {
 		return RSSHubMetadataProbe{Namespace: namespace, Error: requestErr}
 	}
@@ -465,14 +472,30 @@ func (adapter RSSHubAdapter) probeMetadata(ctx context.Context, endpoint core.En
 	return probe
 }
 
-func (adapter RSSHubAdapter) probeFeed(ctx context.Context, request RSSHubRequest) core.AdapterResult {
+func (adapter RSSHubAdapter) probeFeed(ctx context.Context, request RSSHubRequest) FeedProbeReport {
 	// Probe 必须发起一次真实 Feed 请求，不能因 Execute 的本地新鲜缓存而误报。
 	feed := adapter.Feed
 	feed.Cache = nil
-	return RSSHubAdapter{Feed: feed}.Execute(ctx, request)
+	feedURL, err := BuildRSSHubFeedURL(request.Endpoint, request.Channel)
+	if err != nil {
+		return FeedProbeReport{Result: rssHubFailure(request, core.ErrorConfig, "RSSHub Channel is invalid", false)}
+	}
+	var credentialPolicy *rssHubCredentialPolicy
+	if request.Credential != nil {
+		credentialPolicy, err = newRSSHubCredentialPolicy(request.Endpoint, request.Credential)
+		if err != nil {
+			return FeedProbeReport{Result: rssHubFailure(request, core.ErrorConfig, "RSSHub access credential is invalid", false)}
+		}
+		feed.rssHubCredential = credentialPolicy
+	}
+	report := feed.Probe(ctx, rssHubFeedRequest(request, feedURL))
+	if credentialPolicy != nil && credentialPolicy.authUsed.Load() {
+		report.Result.ProviderState["auth_used"] = "true"
+	}
+	return report
 }
 
-func (adapter RSSHubAdapter) rssHubGET(ctx context.Context, target string, endpoint core.EndpointProfile, credential *core.Credential) (*http.Response, *rssHubCredentialPolicy, *core.Error) {
+func (adapter RSSHubAdapter) rssHubGET(ctx context.Context, target string, endpoint core.EndpointProfile, credential *core.Credential, profile core.EgressProfile, egressCredential *core.Credential) (*http.Response, *rssHubCredentialPolicy, *core.Error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, nil, rssHubProbeError(core.ErrorConfig, "construct RSSHub probe request", false)
@@ -480,6 +503,13 @@ func (adapter RSSHubAdapter) rssHubGET(ctx context.Context, target string, endpo
 	request.Header.Set("Accept", "application/json, application/rss+xml;q=0.9, */*;q=0.1")
 	request.Header.Set("User-Agent", "OmniHub/1.0")
 	feed := adapter.Feed
+	if endpoint.EgressProfileID == "" || endpoint.EgressProfileID != profile.ID {
+		return nil, nil, rssHubProbeError(core.ErrorConfig, "RSSHub probe egress is invalid", false)
+	}
+	feed.trusted, err = egress.Build(profile, egressCredential, nil)
+	if err != nil {
+		return nil, nil, rssHubProbeError(core.ErrorConfig, "RSSHub probe egress is invalid", false)
+	}
 	var credentialPolicy *rssHubCredentialPolicy
 	if credential != nil {
 		credentialPolicy, err = newRSSHubCredentialPolicy(endpoint, credential)
@@ -495,6 +525,8 @@ func (adapter RSSHubAdapter) rssHubGET(ctx context.Context, target string, endpo
 		}
 		code := core.ErrorNetwork
 		if errors.Is(err, errRSSHubExplicitEgressRequired) {
+			code = core.ErrorConfig
+		} else if errors.Is(err, egress.ErrCleartextCredential) || errors.Is(err, egress.ErrUntrustedTransport) {
 			code = core.ErrorConfig
 		} else if errors.Is(err, ErrInvalidFeedURL) {
 			code = core.ErrorProtocol
@@ -684,6 +716,9 @@ func ValidateRSSHubRequest(request RSSHubRequest) error {
 	}
 	if request.Channel.EndpointProfileID != request.Endpoint.ID {
 		return fmt.Errorf("RSSHub Channel and EndpointProfile do not match")
+	}
+	if request.Endpoint.EgressProfileID == "" || request.Endpoint.EgressProfileID != request.Egress.ID {
+		return fmt.Errorf("RSSHub EndpointProfile and EgressProfile do not match")
 	}
 	if _, err := rssHubBaseURL(request.Endpoint); err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/registry"
+	"github.com/ylxmf2005/omnihub/internal/router"
 )
 
 type DesiredState string
@@ -24,6 +25,7 @@ const (
 	StateNeedsLogin      State = "needs_login"
 	StateBlocked         State = "blocked"
 	StateReady           State = "ready"
+	StateReadyDependent  State = "ready_dependent"
 	StateDegraded        State = "degraded"
 )
 
@@ -142,6 +144,29 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 			configured = false
 		default:
 			addCheck("endpoint_configured", CheckPassed, nil)
+		}
+	}
+
+	egress, _, egressReason := router.ResolveEgress(catalog, channel)
+	if egressReason == "" {
+		addCheck("egress_configured", CheckPassed, nil)
+		if egress.CredentialID != "" {
+			addCheck("egress_credential_resolved", CheckPassed, nil)
+		}
+	} else if strings.HasPrefix(egressReason, "preflight_egress_credential_") {
+		addCheck("egress_configured", CheckPassed, nil)
+		code := strings.TrimPrefix(egressReason, "preflight_")
+		addCheck("egress_credential_resolved", CheckFailed, &code)
+		configured = false
+		if egressReason == "preflight_egress_credential_unresolved" {
+			result.Readiness = StateBlocked
+		}
+	} else {
+		code := strings.TrimPrefix(egressReason, "preflight_")
+		addCheck("egress_configured", CheckFailed, &code)
+		configured = false
+		if egressReason == "preflight_egress_disabled" {
+			result.Readiness = StateBlocked
 		}
 	}
 	if template.Auth.Required && channel.CredentialID == "" {

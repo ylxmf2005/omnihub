@@ -211,7 +211,7 @@ spec:
 - Endpoint 只是连接配置；用户还需显式创建 Channel，引用 RSSHub RouteTemplate，填写 path、typed parameters、Credential、priority/fallback 和 Collection。每个人的 RSSHub Channel 集合保存在 user-owned config，不由内建清单替代。
 - access key 只从 Channel 引用的 Credential 进入当前执行内存。Adapter 按实际 outbound URL 的 pathname（包含 Endpoint base path，不含 query）计算 `code=md5(pathname+accessKey)`；原 key 与派生 code 都不进入 Channel 参数、cache key/value、ProviderState、日志、trace、Error、Envelope 或 Probe 输出。
 - 认证请求只允许留在用户显式 Endpoint 的同 origin 与分段 base-path 边界内；未越界 redirect 清除旧 `key/code` 后按新 pathname 重算，跨 origin、越界、编码 traversal 或 double slash 在目标发网前失败。认证 Feed 禁止 HTML alternate discovery，避免凭据材料扩散到第二个 URL。
-- Stage 3 尚无 EgressProfile：认证链只构造 OmniHub 自有受信任 transport，不继承外部注入的 `http.Transport` 及其 DialContext/DialTLS、TLS 或 protocol 设置；任何外部 transport 都在发网前 `config_error`。proxy resolver 在签名前只观察已清 `key/code` 与受限 headers 的 clean request clone；命中 proxy 时 Endpoint/proxy 均不发网络请求，确认不命中后才向真实请求注入 code 并直连。Stage A 通过显式 profile 才允许 environment/direct/http_proxy/socks5。
+- 认证链只使用 Endpoint 固定绑定的 EgressProfile，并由 OmniHub 构造 transport，不继承外部 `http.Client`、`http.Transport`、DialContext/DialTLS、TLS 或 protocol 设置。缺失/不匹配 Profile 在发网前 `config_error`；带 key 的 HTTP 只允许 literal loopback 且实际未使用代理，非 loopback HTTP 或明文代理路径在签名前失败。HTTPS 可使用显式 environment/direct/http_proxy/socks5，仍严格校验证书且不做隐式 fallback。
 - 优先读 RSSHub Route metadata；metadata 不可用时仍可实际请求 Feed，但 Channel readiness 记录为降级探测。
 - 独立 Endpoint Probe 没有 Channel Credential，受保护实例可以如实返回 auth required；Channel Probe 使用该 Channel 的 Credential 分别检查 health、Route metadata、实际 Feed、Content-Type、Feed parse、最新时间和已知 `requireConfig/requirePuppeteer/antiCrawler`。
 - readiness key 至少包含 Channel + RouteTemplate + Endpoint + Credential revision；Endpoint 200 不扩散为全局绿色。
@@ -228,7 +228,7 @@ Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder�
 
 主动 `channels probe` 复用已解析 transport，并按真实连接拓扑生成 observation：Direct 是 target DNS/TCP/TLS/HTTP/Feed；HTTP CONNECT 是 proxy DNS/TCP、CONNECT、tunnel 内 target TLS/HTTP/Feed；SOCKS5 local DNS 才记录本地 target resolution，proxy DNS 把该层标为 `not_run/delegated_to_egress`，不编造 resolved IP。每层关联 Egress 与 target/proxy subject，保存 `passed | degraded | failed | not_run`、duration、可行动 reason 与 retryable；某个实际前置层失败后，依赖它的下游层统一 `not_run`。普通 Query 只执行真实业务请求，不自动支付重型诊断链的额外 DNS/连接/握手/Feed 请求成本。
 
-真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不进入该 Stage。direct 失败而另一个显式 proxy 成功时，底层保存两个绑定各自的事实；单 Channel 按自己的绑定裁决，跨绑定聚合为 `ready_dependent` 并披露依赖的 profile。
+真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不进入该 Stage。direct 失败而另一个显式 proxy 成功时，Stage A 的单次 Probe 保留两个绑定各自的事实；单 Channel 按自己的绑定裁决。Stage C 有 Probe health 持久化和 Dashboard aggregate consumer 后，跨绑定才聚合为 `ready_dependent` 并披露依赖的 profile。
 
 ## 8. 统一格式与来源链路
 

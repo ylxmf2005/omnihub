@@ -354,6 +354,9 @@ func TestRoutingCatalogPersistsWithRevisionCAS(t *testing.T) {
 	if !reflect.DeepEqual(loaded, updated) {
 		t.Fatalf("reopened LoadRoutingCatalog() = %#v, want %#v", loaded, updated)
 	}
+	if len(loaded.EgressProfiles) != 4 || loaded.EgressProfiles[2].ProxyEndpoint != "http://127.0.0.1:8080" || loaded.EgressProfiles[2].CredentialID != "cred-proxy" || loaded.EgressProfiles[3].Socks5DNS != core.Socks5DNSProxy || loaded.Channels[0].EgressProfileID != "egress-direct" {
+		t.Fatalf("reopened egress binding = profiles %#v, channel %#v", loaded.EgressProfiles, loaded.Channels[0])
+	}
 
 	var encoded string
 	if err := reopened.db.QueryRowContext(ctx, `SELECT CAST(catalog_json AS TEXT) FROM routing_catalog WHERE id = 1`).Scan(&encoded); err != nil {
@@ -362,6 +365,21 @@ func TestRoutingCatalogPersistsWithRevisionCAS(t *testing.T) {
 	if strings.Contains(encoded, `"revision":999`) || strings.Contains(encoded, `"route_templates"`) || strings.Contains(encoded, `"providers"`) || strings.Contains(encoded, `"origin":"builtin"`) {
 		t.Fatalf("catalog JSON contains aggregate revision or builtin declarations: %s", encoded)
 	}
+
+	t.Run("legacy catalog JSON has no implicit egress", func(t *testing.T) {
+		legacy := openTestStore(t)
+		legacyJSON := `{"sources":[],"endpoints":[{"id":"legacy-endpoint","provider":"rsshub","base_url":"https://example.com","trust":"user","enabled":true,"revision":1}],"channels":[{"id":"legacy-channel","source":"v2ex","route_template_id":"v2ex-direct-latest","priority":100,"enabled":true,"revision":1}],"collections":[],"overlays":[]}`
+		if _, err := legacy.db.ExecContext(ctx, `INSERT INTO routing_catalog(id, revision, catalog_json, updated_at_ns) VALUES(1, 7, ?, 1)`, legacyJSON); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := legacy.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Revision != 7 || len(loaded.EgressProfiles) != 0 || loaded.Endpoints[0].EgressProfileID != "" || loaded.Channels[0].EgressProfileID != "" {
+			t.Fatalf("legacy LoadRoutingCatalog() invented egress: %#v", loaded)
+		}
+	})
 }
 
 func TestRoutingCatalogRejectsSecretsAndInvalidGraphs(t *testing.T) {
@@ -420,6 +438,24 @@ func TestRoutingCatalogRejectsSecretsAndInvalidGraphs(t *testing.T) {
 			secret := routingCatalogFixture("channel_" + strings.ReplaceAll(test.name, " ", "_"))
 			test.mutate(&secret)
 			if _, err := store.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: secret}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
+				t.Fatalf("SaveRoutingCatalog() error = %v, want ErrInvalidRoutingCatalog", err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name    string
+		profile core.EgressProfile
+	}{
+		{name: "direct with proxy", profile: core.EgressProfile{ID: "egress-bad", Mode: core.EgressModeDirect, ProxyEndpoint: "http://127.0.0.1:8080", Enabled: true, Revision: 1}},
+		{name: "http proxy without port", profile: core.EgressProfile{ID: "egress-bad", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://proxy.example", Enabled: true, Revision: 1}},
+		{name: "http proxy with userinfo", profile: core.EgressProfile{ID: "egress-bad", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://user:secret@proxy.example:8080", Enabled: true, Revision: 1}},
+		{name: "socks5 without DNS mode", profile: core.EgressProfile{ID: "egress-bad", Mode: core.EgressModeSOCKS5, ProxyEndpoint: "socks5://127.0.0.1:1080", Enabled: true, Revision: 1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalidStore := openTestStore(t)
+			catalog := routingCatalogFixture("channel_" + strings.ReplaceAll(test.name, " ", "_"))
+			catalog.EgressProfiles = []core.EgressProfile{test.profile}
+			if _, err := invalidStore.SaveRoutingCatalog(ctx, repository.SaveRoutingCatalog{ExpectedRevision: 0, Catalog: catalog}); !errors.Is(err, core.ErrInvalidRoutingCatalog) {
 				t.Fatalf("SaveRoutingCatalog() error = %v, want ErrInvalidRoutingCatalog", err)
 			}
 		})
@@ -577,8 +613,11 @@ func validRunEnvelope(t *testing.T, started time.Time) core.Envelope {
 	envelope, err := core.BuildEnvelope(core.EnvelopeInput{
 		RequestID: "req_123e4567-e89b-42d3-a456-426614174000", Request: operation,
 		RequiredChannelIDs: []string{"channel_fixture"},
-		Executions:         []core.Execution{{ChannelID: "channel_fixture", Selection: core.SelectionPrimary, Status: core.ExecutionCompleted, StartedAt: started}},
-		StartedAt:          started, FinishedAt: started.Add(time.Second),
+		Executions: []core.Execution{{
+			ChannelID: "channel_fixture", Selection: core.SelectionPrimary, Status: core.ExecutionCompleted, StartedAt: started,
+			Egress: &core.ExecutionEgress{ProfileID: "egress_direct", Mode: core.EgressModeDirect},
+		}},
+		StartedAt: started, FinishedAt: started.Add(time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -588,9 +627,15 @@ func validRunEnvelope(t *testing.T, started time.Time) core.Envelope {
 
 func routingCatalogFixture(channelID string) core.RoutingCatalog {
 	return core.RoutingCatalog{
-		Sources:     []core.Source{{ID: "feed:fixture", DisplayName: "Fixture", CanonicalURL: "https://example.com", Origin: "user", Enabled: true}},
-		Endpoints:   []core.EndpointProfile{{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", Trust: "local", Enabled: true, Revision: 1}},
-		Channels:    []core.Channel{{ID: channelID, Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", Priority: 100, Enabled: true, Revision: 1}},
+		Sources:   []core.Source{{ID: "feed:fixture", DisplayName: "Fixture", CanonicalURL: "https://example.com", Origin: "user", Enabled: true}},
+		Endpoints: []core.EndpointProfile{{ID: "rsshub-local", Provider: "rsshub", BaseURL: "http://127.0.0.1:1200", EgressProfileID: "egress-direct", Trust: "local", Enabled: true, Revision: 1}},
+		EgressProfiles: []core.EgressProfile{
+			{ID: "egress-direct", DisplayName: "Direct", Mode: core.EgressModeDirect, Enabled: true, Revision: 1},
+			{ID: "egress-environment", DisplayName: "Environment", Mode: core.EgressModeEnvironment, Enabled: true, Revision: 1},
+			{ID: "egress-http", DisplayName: "HTTP proxy", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:8080", CredentialID: "cred-proxy", Enabled: true, Revision: 1},
+			{ID: "egress-socks", DisplayName: "SOCKS5", Mode: core.EgressModeSOCKS5, ProxyEndpoint: "socks5://127.0.0.1:1080", Socks5DNS: core.Socks5DNSProxy, Enabled: true, Revision: 1},
+		},
+		Channels:    []core.Channel{{ID: channelID, Source: "v2ex", RouteTemplateID: "v2ex-direct-latest", EgressProfileID: "egress-direct", Priority: 100, Enabled: true, Revision: 1}},
 		Collections: []core.Collection{{ID: "daily", ChannelIDs: []string{channelID}, Enabled: true, Revision: 1}},
 		Overlays:    []core.TemplateOverlay{{RouteTemplateID: "v2ex-rsshub-latest", Enabled: false, Revision: 1}},
 	}

@@ -35,6 +35,7 @@ const (
 
 var (
 	ErrInvalidDirectFeed   = errors.New("invalid direct feed")
+	ErrInvalidEgress       = errors.New("invalid egress profile")
 	ErrInvalidRSSHub       = errors.New("invalid RSSHub configuration")
 	ErrRSSHubUnavailable   = errors.New("RSSHub resource unavailable")
 	ErrInvalidOPML         = errors.New("invalid OPML")
@@ -55,7 +56,7 @@ type credentialStore interface {
 	ListCredentials(context.Context) ([]core.Credential, error)
 }
 
-// Service 是 Direct Feed 管理与 OPML 导入导出的唯一写入口。Catalog 只用于
+// Service 是路由资源管理与 OPML 导入导出的唯一写入口。Catalog 只用于
 // 裁决静态 RouteTemplate/Source；可变用户状态始终以 Store 快照为准。
 type Service struct {
 	Store   routingStore
@@ -72,6 +73,7 @@ type ApplyDirectFeedInput struct {
 	ChannelID          string             `json:"channel_id,omitempty"`
 	ChannelDisplayName string             `json:"channel_display_name,omitempty"`
 	RouteTemplateID    string             `json:"route_template_id,omitempty"`
+	EgressProfileID    string             `json:"egress_profile_id"`
 	URL                string             `json:"url"`
 	Priority           int                `json:"priority"`
 	ExpectedRevision   int64              `json:"expected_revision"`
@@ -83,8 +85,22 @@ type ApplyDirectFeedInput struct {
 type ApplyEndpointProfileInput struct {
 	ID               string `json:"id"`
 	BaseURL          string `json:"base_url"`
+	EgressProfileID  string `json:"egress_profile_id"`
 	Trust            string `json:"trust"`
 	ExpectedRevision int64  `json:"expected_revision"`
+}
+
+// ApplyEgressProfileInput 接受完整代理地址；成功响应只返回脱敏摘要。
+// 代理账号通过 CredentialID 引用，不能写入 ProxyEndpoint userinfo。
+type ApplyEgressProfileInput struct {
+	ID               string             `json:"id"`
+	DisplayName      string             `json:"display_name,omitempty"`
+	Mode             core.EgressMode    `json:"mode"`
+	ProxyEndpoint    string             `json:"proxy_endpoint,omitempty"`
+	CredentialID     string             `json:"credential_id,omitempty"`
+	Socks5DNS        core.Socks5DNSMode `json:"socks5_dns,omitempty"`
+	Enabled          bool               `json:"enabled"`
+	ExpectedRevision int64              `json:"expected_revision"`
 }
 
 // ApplyRSSHubChannelInput 描述一个用户拥有的 RSSHub Route 实例。Parameters
@@ -104,8 +120,8 @@ type ApplyRSSHubChannelInput struct {
 	ExpectedRevision   int64          `json:"expected_revision"`
 }
 
-// ApplyCredentialInput 是 Stage 3 RSSHub access key 的最窄本机管理输入。
-// 仅服务 API key，不建立通用 secret API 或 value detail 回显路径。
+// ApplyCredentialInput 是 RSSHub API key 与 Egress basic auth 共用的最窄
+// 本机写入口；列表仍只返回掩码摘要，不提供 secret detail 回显路径。
 type ApplyCredentialInput struct {
 	ID               string `json:"id"`
 	Provider         string `json:"provider"`
@@ -116,34 +132,38 @@ type ApplyCredentialInput struct {
 	ExpectedRevision int64  `json:"expected_revision"`
 }
 
-// ApplyCredential 创建或更新 RSSHub API key，并始终只返回可安全展示的摘要。
+// ApplyCredential 创建或更新已支持的 Credential，并只返回脱敏摘要。
 func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentialInput) (core.CredentialSummary, error) {
 	store, err := service.credentialStore()
 	if err != nil {
 		return core.CredentialSummary{}, err
 	}
-	if input.ExpectedRevision < 0 || strings.TrimSpace(input.Provider) != "rsshub" || strings.TrimSpace(input.AuthKind) != "api_key" || strings.TrimSpace(input.Value) == "" {
-		return core.CredentialSummary{}, fmt.Errorf("%w: RSSHub API key input is invalid", ErrInvalidRSSHub)
+	provider, authKind := strings.TrimSpace(input.Provider), strings.TrimSpace(input.AuthKind)
+	if input.ExpectedRevision < 0 {
+		return core.CredentialSummary{}, fmt.Errorf("%w: expected revision must not be negative", managedCredentialError(provider, authKind))
+	}
+	if err := validateManagedCredential(provider, authKind, input.Value); err != nil {
+		return core.CredentialSummary{}, err
 	}
 	id := strings.TrimSpace(input.ID)
 	if err := validateResourceID(id); err != nil {
-		return core.CredentialSummary{}, fmt.Errorf("%w: credential id: %v", ErrInvalidRSSHub, err)
+		return core.CredentialSummary{}, fmt.Errorf("%w: credential id: %v", managedCredentialError(provider, authKind), err)
 	}
 	now := time.Now().UTC()
 	var credential core.Credential
 	if input.ExpectedRevision == 0 {
 		value := input.Value
-		credential, err = store.CreateCredential(ctx, core.Credential{ID: id, Provider: "rsshub", AuthKind: "api_key", Label: strings.TrimSpace(input.Label), Value: &value, Enabled: input.Enabled, CreatedAt: now, UpdatedAt: now})
+		credential, err = store.CreateCredential(ctx, core.Credential{ID: id, Provider: provider, AuthKind: authKind, Label: strings.TrimSpace(input.Label), Value: &value, Enabled: input.Enabled, CreatedAt: now, UpdatedAt: now})
 	} else {
 		existing, getErr := store.GetCredential(ctx, id)
 		if getErr != nil {
-			return core.CredentialSummary{}, fmt.Errorf("update RSSHub credential: %w", getErr)
+			return core.CredentialSummary{}, fmt.Errorf("update credential: %w", getErr)
 		}
-		if existing.Provider != "rsshub" || existing.AuthKind != "api_key" {
-			return core.CredentialSummary{}, fmt.Errorf("%w: credential is not an RSSHub API key", ErrInvalidRSSHub)
+		if existing.Provider != provider || existing.AuthKind != authKind {
+			return core.CredentialSummary{}, fmt.Errorf("%w: credential provider or auth kind cannot change", managedCredentialError(provider, authKind))
 		}
 		if label := strings.TrimSpace(input.Label); label != "" && label != existing.Label {
-			return core.CredentialSummary{}, fmt.Errorf("%w: credential label updates are not supported", ErrInvalidRSSHub)
+			return core.CredentialSummary{}, fmt.Errorf("%w: credential label updates are not supported", managedCredentialError(provider, authKind))
 		}
 		if existing.Revision != input.ExpectedRevision {
 			return core.CredentialSummary{}, fmt.Errorf("%w: credential %s revision is %d, expected %d", repository.ErrConflict, id, existing.Revision, input.ExpectedRevision)
@@ -152,12 +172,34 @@ func (service Service) ApplyCredential(ctx context.Context, input ApplyCredentia
 		credential, err = store.UpdateCredential(ctx, repository.UpdateCredential{ID: id, ExpectedRevision: input.ExpectedRevision, Value: &value, Enabled: input.Enabled, UpdatedAt: now})
 	}
 	if err != nil {
-		return core.CredentialSummary{}, fmt.Errorf("save RSSHub credential: %w", err)
+		return core.CredentialSummary{}, fmt.Errorf("save credential: %w", err)
 	}
 	return summarizeCredential(credential), nil
 }
 
-// ListCredentialSummaries 返回 RSSHub Credential 的掩码摘要。它不提供任何
+func managedCredentialError(provider, authKind string) error {
+	if provider == "egress" || authKind == "basic" {
+		return ErrInvalidEgress
+	}
+	return ErrInvalidRSSHub
+}
+
+func validateManagedCredential(provider, authKind, value string) error {
+	switch {
+	case provider == "rsshub" && authKind == "api_key":
+		if strings.TrimSpace(value) != "" {
+			return nil
+		}
+	case provider == "egress" && authKind == "basic":
+		username, password, found := strings.Cut(value, ":")
+		if found && username != "" && password != "" && strings.IndexFunc(username, unicode.IsControl) < 0 && strings.IndexFunc(password, unicode.IsControl) < 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: unsupported or incomplete credential", managedCredentialError(provider, authKind))
+}
+
+// ListCredentialSummaries 返回受支持 Credential 的掩码摘要。它不提供任何
 // include-value 分支，避免 Stage 3 管理面意外扩大为 secret read API。
 func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.CredentialSummary, error) {
 	store, err := service.credentialStore()
@@ -170,10 +212,137 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 	}
 	result := make([]core.CredentialSummary, 0, len(credentials))
 	for _, credential := range credentials {
-		if credential.Provider == "rsshub" && credential.AuthKind == "api_key" {
+		if credential.Provider == "rsshub" && credential.AuthKind == "api_key" || credential.Provider == "egress" && credential.AuthKind == "basic" {
 			result = append(result, summarizeCredential(credential))
 		}
 	}
+	return result, nil
+}
+
+// ApplyEgressProfile 创建或更新一个显式出口。Storage 允许引用在升级期间
+// 悬挂；管理写入收紧为 Credential 必须已经存在且启用。
+func (service Service) ApplyEgressProfile(ctx context.Context, input ApplyEgressProfileInput) (core.EgressProfileSummary, error) {
+	if err := service.requireStore(); err != nil {
+		return core.EgressProfileSummary{}, err
+	}
+	if input.ExpectedRevision < 0 {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidEgress)
+	}
+	profile := core.EgressProfile{
+		ID: strings.TrimSpace(input.ID), DisplayName: strings.TrimSpace(input.DisplayName), Mode: input.Mode,
+		ProxyEndpoint: strings.TrimSpace(input.ProxyEndpoint), CredentialID: strings.TrimSpace(input.CredentialID),
+		Socks5DNS: input.Socks5DNS, Enabled: input.Enabled,
+	}
+	if err := validateResourceID(profile.ID); err != nil {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: profile id: %v", ErrInvalidEgress, err)
+	}
+	if err := profile.Validate(); err != nil {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: %v", ErrInvalidEgress, err)
+	}
+	if profile.CredentialID != "" {
+		store, err := service.credentialStore()
+		if err != nil {
+			return core.EgressProfileSummary{}, err
+		}
+		credential, err := store.GetCredential(ctx, profile.CredentialID)
+		if err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return core.EgressProfileSummary{}, fmt.Errorf("%w: proxy credential %s", repository.ErrNotFound, profile.CredentialID)
+			}
+			return core.EgressProfileSummary{}, fmt.Errorf("load proxy credential: %w", err)
+		}
+		if !credential.Enabled || credential.Provider != "egress" || credential.AuthKind != "basic" || credential.Value == nil {
+			return core.EgressProfileSummary{}, fmt.Errorf("%w: proxy credential is incompatible or disabled", ErrInvalidEgress)
+		}
+		if err := validateManagedCredential(credential.Provider, credential.AuthKind, *credential.Value); err != nil {
+			return core.EgressProfileSummary{}, fmt.Errorf("%w: proxy credential is incomplete", ErrInvalidEgress)
+		}
+	}
+
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.EgressProfileSummary{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	index, exists := indexEgressProfiles(working.EgressProfiles)[profile.ID]
+	if exists && working.EgressProfiles[index].Revision != input.ExpectedRevision {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: egress profile %s revision is %d, expected %d", repository.ErrConflict, profile.ID, working.EgressProfiles[index].Revision, input.ExpectedRevision)
+	}
+	if !exists && input.ExpectedRevision != 0 {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: egress profile %s does not exist at revision %d", repository.ErrConflict, profile.ID, input.ExpectedRevision)
+	}
+	if exists {
+		profile.Revision = working.EgressProfiles[index].Revision + 1
+		working.EgressProfiles[index] = profile
+	} else {
+		profile.Revision = 1
+		working.EgressProfiles = append(working.EgressProfiles, profile)
+	}
+	sortRoutingResources(&working)
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.EgressProfileSummary{}, err
+	}
+	for _, value := range saved.EgressProfiles {
+		if value.ID == profile.ID {
+			return summarizeEgressProfile(value), nil
+		}
+	}
+	return core.EgressProfileSummary{}, fmt.Errorf("save routing catalog: egress profile %s missing from saved snapshot", profile.ID)
+}
+
+// DisableEgressProfile 只改变 desired state；引用它的 Endpoint/Channel 保留，
+// 由 readiness 与执行入口如实报告出口不可用。
+func (service Service) DisableEgressProfile(ctx context.Context, id string, expectedRevision int64) (core.EgressProfileSummary, error) {
+	if err := service.requireStore(); err != nil {
+		return core.EgressProfileSummary{}, err
+	}
+	id = strings.TrimSpace(id)
+	if err := validateResourceID(id); err != nil || expectedRevision < 1 {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: profile id or expected revision is invalid", ErrInvalidEgress)
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return core.EgressProfileSummary{}, fmt.Errorf("load routing catalog: %w", err)
+	}
+	working := cloneRoutingCatalog(routing)
+	index, exists := indexEgressProfiles(working.EgressProfiles)[id]
+	if !exists {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: egress profile %s", repository.ErrNotFound, id)
+	}
+	profile := working.EgressProfiles[index]
+	if profile.Revision != expectedRevision {
+		return core.EgressProfileSummary{}, fmt.Errorf("%w: egress profile %s revision is %d, expected %d", repository.ErrConflict, id, profile.Revision, expectedRevision)
+	}
+	profile.Enabled = false
+	profile.Revision++
+	working.EgressProfiles[index] = profile
+	saved, err := service.saveRoutingCatalog(ctx, routing.Revision, working)
+	if err != nil {
+		return core.EgressProfileSummary{}, err
+	}
+	for _, value := range saved.EgressProfiles {
+		if value.ID == id {
+			return summarizeEgressProfile(value), nil
+		}
+	}
+	return core.EgressProfileSummary{}, fmt.Errorf("save routing catalog: egress profile %s missing from saved snapshot", id)
+}
+
+// ListEgressProfileSummaries 从最新 Store 快照构造安全视图，不回显代理地址。
+func (service Service) ListEgressProfileSummaries(ctx context.Context) ([]core.EgressProfileSummary, error) {
+	if err := service.requireStore(); err != nil {
+		return nil, err
+	}
+	routing, err := service.Store.LoadRoutingCatalog(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load routing catalog: %w", err)
+	}
+	result := make([]core.EgressProfileSummary, len(routing.EgressProfiles))
+	for index, profile := range routing.EgressProfiles {
+		result[index] = summarizeEgressProfile(profile)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
 	return result, nil
 }
 
@@ -208,6 +377,10 @@ func (service Service) ApplyEndpointProfile(ctx context.Context, input ApplyEndp
 		return core.EndpointProfile{}, fmt.Errorf("load routing catalog: %w", err)
 	}
 	working := cloneRoutingCatalog(routing)
+	egressID := strings.TrimSpace(input.EgressProfileID)
+	if _, err := enabledEgressProfile(working, egressID); err != nil {
+		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint egress: %v", ErrInvalidRSSHub, err)
+	}
 	endpointIndex := indexEndpoints(working.Endpoints)
 	index, exists := endpointIndex[id]
 	if exists && working.Endpoints[index].Provider != "rsshub" {
@@ -220,7 +393,7 @@ func (service Service) ApplyEndpointProfile(ctx context.Context, input ApplyEndp
 		return core.EndpointProfile{}, fmt.Errorf("%w: endpoint %s does not exist at revision %d", repository.ErrConflict, id, input.ExpectedRevision)
 	}
 
-	endpoint := core.EndpointProfile{ID: id, Provider: "rsshub", BaseURL: baseURL, Trust: trust, Enabled: true}
+	endpoint := core.EndpointProfile{ID: id, Provider: "rsshub", BaseURL: baseURL, EgressProfileID: egressID, Trust: trust, Enabled: true}
 	if exists {
 		endpoint.Revision = working.Endpoints[index].Revision + 1
 		working.Endpoints[index] = endpoint
@@ -324,6 +497,10 @@ func (service Service) ApplyRSSHubChannel(ctx context.Context, input ApplyRSSHub
 	if working.Endpoints[endpointIndex].Provider != "rsshub" || !working.Endpoints[endpointIndex].Enabled {
 		return core.Channel{}, fmt.Errorf("%w: RSSHub endpoint is incompatible or disabled", ErrRSSHubUnavailable)
 	}
+	egressProfile, err := enabledEgressProfile(working, working.Endpoints[endpointIndex].EgressProfileID)
+	if err != nil {
+		return core.Channel{}, fmt.Errorf("%w: RSSHub endpoint egress is unavailable: %v", ErrRSSHubUnavailable, err)
+	}
 	var resolvedCredential *core.Credential
 	if credentialID := strings.TrimSpace(input.CredentialID); credentialID != "" {
 		credentialStore, storeErr := service.credentialStore()
@@ -367,7 +544,7 @@ func (service Service) ApplyRSSHubChannel(ctx context.Context, input ApplyRSSHub
 		RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpointID, CredentialID: strings.TrimSpace(input.CredentialID),
 		Parameters: parameters, Priority: input.Priority, FallbackChannelIDs: slices.Clone(input.FallbackChannelIDs), Enabled: input.Enabled}
 	if err := adapter.ValidateRSSHubRequest(adapter.RSSHubRequest{
-		Channel: channel, RouteTemplate: template, Endpoint: working.Endpoints[endpointIndex], Credential: resolvedCredential,
+		Channel: channel, RouteTemplate: template, Endpoint: working.Endpoints[endpointIndex], Credential: resolvedCredential, Egress: egressProfile,
 	}); err != nil {
 		return core.Channel{}, fmt.Errorf("%w: parameters do not match route template", ErrInvalidRSSHub)
 	}
@@ -433,6 +610,10 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 		return core.Channel{}, fmt.Errorf("load routing catalog: %w", err)
 	}
 	working := cloneRoutingCatalog(routing)
+	egressID := strings.TrimSpace(input.EgressProfileID)
+	if _, err := enabledEgressProfile(working, egressID); err != nil {
+		return core.Channel{}, fmt.Errorf("%w: egress: %v", ErrInvalidDirectFeed, err)
+	}
 	channelIndex := indexChannels(working.Channels)
 
 	channelID := strings.TrimSpace(input.ChannelID)
@@ -512,6 +693,7 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	channel.Source = sourceID
 	channel.RouteTemplateID = template.RouteTemplateID
 	channel.EndpointProfileID = ""
+	channel.EgressProfileID = egressID
 	channel.CredentialID = ""
 	channel.Parameters = map[string]any{"url": canonicalURL}
 	channel.Priority = input.Priority
@@ -588,9 +770,10 @@ func (service Service) DisableChannel(ctx context.Context, id string, expectedRe
 	return core.Channel{}, fmt.Errorf("save routing catalog: channel %s missing from saved snapshot", channelID)
 }
 
-// ImportOPML 导入 OPML 2.0 中的 folder 与 type=rss outline。它不会执行
-// include/link、不会 discover URL，也不会把持久化成功报告成真实 Feed probe。
-func (service Service) ImportOPML(ctx context.Context, reader io.Reader) (ImportReport, error) {
+// ImportOPML 导入 OPML 2.0 中的 folder 与 type=rss outline。新建 Feed
+// Channel 使用调用方显式选择的出口；已有 Channel 的出口保持不变。
+// 它不会执行 include/link、不会 discover URL，也不会把持久化成功报告成真实 Feed probe。
+func (service Service) ImportOPML(ctx context.Context, reader io.Reader, egressProfileID string) (ImportReport, error) {
 	var report ImportReport
 	if err := service.requireStore(); err != nil {
 		return report, err
@@ -610,8 +793,12 @@ func (service Service) ImportOPML(ctx context.Context, reader io.Reader) (Import
 	if err != nil {
 		return report, fmt.Errorf("load routing catalog: %w", err)
 	}
+	egressProfileID = strings.TrimSpace(egressProfileID)
+	if _, err := enabledEgressProfile(routing, egressProfileID); err != nil {
+		return report, fmt.Errorf("import OPML egress: %w", err)
+	}
 	working := cloneRoutingCatalog(routing)
-	state := newImportState(service, &working, &report)
+	state := newImportState(service, &working, &report, egressProfileID)
 	state.importOutlines(outlines)
 	report.CatalogRevision = routing.Revision
 	if !state.changed {
@@ -633,7 +820,7 @@ func (service Service) ImportOPML(ctx context.Context, reader io.Reader) (Import
 }
 
 // ExportOPML 导出 Direct Feed Channel 与 Collection 层级。CredentialID、
-// EndpointProfileID 及其他执行配置从不进入文档；扩展 ID 只用于稳定回导。
+// EndpointProfileID、EgressProfileID 等执行配置从不进入文档；扩展 ID 只用于稳定回导。
 func (service Service) ExportOPML(ctx context.Context, writer io.Writer) error {
 	if err := service.requireStore(); err != nil {
 		return err
@@ -786,7 +973,7 @@ func (service Service) rssHubTemplate(id string) (core.RouteTemplate, error) {
 func (service Service) credentialStore() (credentialStore, error) {
 	store, ok := service.Store.(credentialStore)
 	if !ok {
-		return nil, fmt.Errorf("%w: configured store does not support credential operations", ErrInvalidRSSHub)
+		return nil, errors.New("configured store does not support credential operations")
 	}
 	return store, nil
 }
@@ -805,6 +992,15 @@ func summarizeCredential(credential core.Credential) core.CredentialSummary {
 	visible := 4
 	result.ValueMasked = "••••" + string(characters[len(characters)-visible:])
 	return result
+}
+
+func summarizeEgressProfile(profile core.EgressProfile) core.EgressProfileSummary {
+	proxied := profile.Mode == core.EgressModeHTTPProxy || profile.Mode == core.EgressModeSOCKS5
+	return core.EgressProfileSummary{
+		ID: profile.ID, DisplayName: profile.DisplayName, Mode: profile.Mode,
+		Proxied: proxied, HasEndpoint: profile.ProxyEndpoint != "", CredentialID: profile.CredentialID,
+		Enabled: profile.Enabled, Revision: profile.Revision,
+	}
 }
 
 func (service Service) sourceExists(routing core.RoutingCatalog, id string) bool {
@@ -1141,6 +1337,29 @@ func indexEndpoints(endpoints []core.EndpointProfile) map[string]int {
 	return result
 }
 
+func indexEgressProfiles(profiles []core.EgressProfile) map[string]int {
+	result := make(map[string]int, len(profiles))
+	for index, profile := range profiles {
+		result[profile.ID] = index
+	}
+	return result
+}
+
+func enabledEgressProfile(catalog core.RoutingCatalog, id string) (core.EgressProfile, error) {
+	if id == "" {
+		return core.EgressProfile{}, errors.New("egress profile id is required")
+	}
+	index, exists := indexEgressProfiles(catalog.EgressProfiles)[id]
+	if !exists {
+		return core.EgressProfile{}, fmt.Errorf("egress profile %s does not exist", id)
+	}
+	profile := catalog.EgressProfiles[index]
+	if !profile.Enabled {
+		return core.EgressProfile{}, fmt.Errorf("egress profile %s is disabled", id)
+	}
+	return profile, nil
+}
+
 func cloneRoutingCatalog(value core.RoutingCatalog) core.RoutingCatalog {
 	result := value
 	result.Sources = slices.Clone(value.Sources)
@@ -1148,6 +1367,7 @@ func cloneRoutingCatalog(value core.RoutingCatalog) core.RoutingCatalog {
 	for index := range result.Endpoints {
 		result.Endpoints[index].Options = cloneAnyMap(result.Endpoints[index].Options)
 	}
+	result.EgressProfiles = slices.Clone(value.EgressProfiles)
 	result.Channels = make([]core.Channel, len(value.Channels))
 	for index, channel := range value.Channels {
 		result.Channels[index] = cloneChannel(channel)
@@ -1185,6 +1405,7 @@ func cloneAnyMap(value map[string]any) map[string]any {
 func sortRoutingResources(catalog *core.RoutingCatalog) {
 	sort.Slice(catalog.Sources, func(left, right int) bool { return catalog.Sources[left].ID < catalog.Sources[right].ID })
 	sort.Slice(catalog.Endpoints, func(left, right int) bool { return catalog.Endpoints[left].ID < catalog.Endpoints[right].ID })
+	sort.Slice(catalog.EgressProfiles, func(left, right int) bool { return catalog.EgressProfiles[left].ID < catalog.EgressProfiles[right].ID })
 	sort.Slice(catalog.Channels, func(left, right int) bool { return catalog.Channels[left].ID < catalog.Channels[right].ID })
 	sort.Slice(catalog.Collections, func(left, right int) bool { return catalog.Collections[left].ID < catalog.Collections[right].ID })
 }
@@ -1373,6 +1594,7 @@ type importState struct {
 	service            Service
 	catalog            *core.RoutingCatalog
 	report             *ImportReport
+	egressProfileID    string
 	sourceIndex        map[string]int
 	channelIndex       map[string]int
 	collectionIndex    map[string]int
@@ -1383,9 +1605,9 @@ type importState struct {
 	changed            bool
 }
 
-func newImportState(service Service, catalog *core.RoutingCatalog, report *ImportReport) *importState {
+func newImportState(service Service, catalog *core.RoutingCatalog, report *ImportReport, egressProfileID string) *importState {
 	state := &importState{
-		service: service, catalog: catalog, report: report,
+		service: service, catalog: catalog, report: report, egressProfileID: egressProfileID,
 		sourceIndex: make(map[string]int), channelIndex: make(map[string]int), collectionIndex: make(map[string]int),
 		urlChannels: make(map[string]string), touchedSources: make(map[string]bool), touchedChannels: make(map[string]string), touchedCollections: make(map[string]bool),
 	}
@@ -1601,6 +1823,9 @@ func (state *importState) importFeed(outline *parsedOPMLOutline, path string) (s
 	channel.RouteTemplateID = template.RouteTemplateID
 	channel.EndpointProfileID = ""
 	channel.CredentialID = ""
+	if !channelExists || channel.EgressProfileID == "" {
+		channel.EgressProfileID = state.egressProfileID
+	}
 	channel.Parameters = map[string]any{"url": canonicalURL}
 	if displayName := channelDisplayName(outline); displayName != "" {
 		channel.DisplayName = displayName

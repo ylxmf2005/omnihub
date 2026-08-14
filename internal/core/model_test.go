@@ -70,8 +70,11 @@ func TestEnvelopeValidateRejectsBypassedBuilder(t *testing.T) {
 	envelope, err := BuildEnvelope(EnvelopeInput{
 		RequestID: "req_123e4567-e89b-42d3-a456-426614174000", Request: validSearchOperation(),
 		RequiredChannelIDs: []string{"channel_primary"},
-		Executions:         []Execution{{ChannelID: "channel_primary", Selection: SelectionPrimary, Status: ExecutionCompleted, StartedAt: started}},
-		StartedAt:          started, FinishedAt: started.Add(time.Second),
+		Executions: []Execution{{
+			ChannelID: "channel_primary", Selection: SelectionPrimary, Status: ExecutionCompleted, StartedAt: started,
+			Egress: &ExecutionEgress{ProfileID: "egress_direct", Mode: EgressModeDirect},
+		}},
+		StartedAt: started, FinishedAt: started.Add(time.Second),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +93,13 @@ func TestEnvelopeValidateRejectsBypassedBuilder(t *testing.T) {
 		{name: "unknown error code", mutate: func(value *Envelope) { value.Errors = []Error{{Code: "mystery"}} }},
 		{name: "null items", mutate: func(value *Envelope) { value.Items = nil }},
 		{name: "missing selected execution", mutate: func(value *Envelope) { value.SelectedChannelIDs = append(value.SelectedChannelIDs, "channel_missing") }},
+		{name: "missing execution egress", mutate: func(value *Envelope) { value.Executions[0].Egress = nil }},
+		{name: "direct reported proxied", mutate: func(value *Envelope) {
+			value.Executions[0].Egress = &ExecutionEgress{ProfileID: "egress_direct", Mode: EgressModeDirect, Proxied: true}
+		}},
+		{name: "unsupported egress mode", mutate: func(value *Envelope) {
+			value.Executions[0].Egress = &ExecutionEgress{ProfileID: "egress_direct", Mode: "automatic"}
+		}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -165,8 +175,14 @@ func TestBuildEnvelopeAggregatesTerminalStatus(t *testing.T) {
 		StartedAt:          started,
 		FinishedAt:         started.Add(1500 * time.Millisecond),
 	}
-	completed := Execution{ChannelID: "channel_primary", Status: ExecutionCompleted, Selection: "primary", StartedAt: started, DurationMS: 100}
-	failed := Execution{ChannelID: "channel_failed", Status: ExecutionFailed, Selection: "aggregate", StartedAt: started, DurationMS: 80}
+	completed := Execution{
+		ChannelID: "channel_primary", Status: ExecutionCompleted, Selection: "primary", StartedAt: started, DurationMS: 100,
+		Egress: &ExecutionEgress{ProfileID: "egress_direct", Mode: EgressModeDirect},
+	}
+	failed := Execution{
+		ChannelID: "channel_failed", Status: ExecutionFailed, Selection: "aggregate", StartedAt: started, DurationMS: 80,
+		Egress: &ExecutionEgress{ProfileID: "egress_proxy", Mode: EgressModeHTTPProxy, Proxied: true},
+	}
 	skipped := Execution{ChannelID: "channel_skipped", Status: ExecutionSkipped, Selection: "candidate"}
 	exhaustive := true
 	gap := false
@@ -179,6 +195,11 @@ func TestBuildEnvelopeAggregatesTerminalStatus(t *testing.T) {
 		{name: "complete including skipped", mutate: func(input *EnvelopeInput) {
 			input.Executions = []Execution{completed, skipped}
 			input.Coverage = []Coverage{{Exhaustive: &exhaustive}}
+		}, want: StatusComplete},
+		{name: "complete proxy cache hit reports not proxied", mutate: func(input *EnvelopeInput) {
+			cached := completed
+			cached.Egress = &ExecutionEgress{ProfileID: "egress_proxy", Mode: EgressModeHTTPProxy}
+			input.Executions = []Execution{cached}
 		}, want: StatusComplete},
 		{name: "partial failed channel", mutate: func(input *EnvelopeInput) {
 			input.RequiredChannelIDs = []string{"channel_primary", "channel_failed"}
@@ -247,7 +268,10 @@ func TestBuildEnvelopeAggregatesTerminalStatus(t *testing.T) {
 
 func TestBuildEnvelopeRejectsInvalidInput(t *testing.T) {
 	started := time.Date(2026, time.August, 13, 10, 0, 0, 0, time.UTC)
-	completed := Execution{ChannelID: "channel_primary", Status: ExecutionCompleted, Selection: SelectionPrimary, StartedAt: started}
+	completed := Execution{
+		ChannelID: "channel_primary", Status: ExecutionCompleted, Selection: SelectionPrimary, StartedAt: started,
+		Egress: &ExecutionEgress{ProfileID: "egress_environment", Mode: EgressModeEnvironment},
+	}
 	base := EnvelopeInput{
 		RequestID:          "req_123e4567-e89b-42d3-a456-426614174000",
 		Request:            validSearchOperation(),
@@ -269,6 +293,7 @@ func TestBuildEnvelopeRejectsInvalidInput(t *testing.T) {
 		{name: "unknown execution selection", mutate: func(input *EnvelopeInput) { input.Executions[0].Selection = "fallbak" }},
 		{name: "completed without start", mutate: func(input *EnvelopeInput) { input.Executions[0].StartedAt = time.Time{} }},
 		{name: "negative execution duration", mutate: func(input *EnvelopeInput) { input.Executions[0].DurationMS = -1 }},
+		{name: "missing execution egress", mutate: func(input *EnvelopeInput) { input.Executions[0].Egress = nil }},
 		{name: "timed skipped execution", mutate: func(input *EnvelopeInput) {
 			input.Executions[0].Status = ExecutionSkipped
 			input.Executions[0].StartedAt = started

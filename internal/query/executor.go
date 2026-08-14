@@ -186,6 +186,15 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 
 	execution := baseExecution(decision, run.operation)
 	execution.StartedAt = started.UTC()
+	egress, egressCredential, egressReason := router.ResolveEgress(run.catalog, decision.Channel)
+	if egressReason != "" {
+		return false, fmt.Errorf("%w: selected channel %s failed egress preflight: %s", ErrInvalidExecutor, decision.Channel.ID, egressReason)
+	}
+	execution.Egress = &core.ExecutionEgress{
+		ProfileID: egress.ID,
+		Mode:      egress.Mode,
+		Proxied:   false,
+	}
 	var result core.AdapterResult
 	switch decision.RouteTemplate.Adapter {
 	case "feed":
@@ -193,9 +202,11 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			return false, fmt.Errorf("%w: feed executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
 		}
 		result = run.service.Feed.Execute(childContext, adapter.FeedRequest{
-			Operation:     run.operation,
-			Channel:       decision.Channel,
-			RouteTemplate: decision.RouteTemplate,
+			Operation:        run.operation,
+			Channel:          decision.Channel,
+			RouteTemplate:    decision.RouteTemplate,
+			Egress:           egress,
+			EgressCredential: egressCredential,
 		})
 	case "rsshub":
 		if run.service.RSSHub == nil {
@@ -215,7 +226,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		}
 		result = run.service.RSSHub.Execute(childContext, adapter.RSSHubRequest{
 			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
-			Endpoint: endpoint, Credential: credential,
+			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
 		})
 	default:
 		reason := "unsupported_adapter"
@@ -235,6 +246,15 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 		return true, nil
 	}
 	execution.Auth.Used = result.ProviderState["auth_used"] == "true"
+	switch result.ProviderState["egress_proxied"] {
+	case "":
+	case "true":
+		execution.Egress.Proxied = true
+	case "false":
+		execution.Egress.Proxied = false
+	default:
+		return false, fmt.Errorf("%w: adapter channel %s returned invalid egress_proxied state", ErrInvalidExecutor, decision.Channel.ID)
+	}
 	result, normalizeErr := normalizeAdapterResult(result, decision, execution.StartedAt)
 	if normalizeErr != nil {
 		return false, normalizeErr

@@ -141,9 +141,15 @@ func (envelope Envelope) Validate() error {
 			if execution.StartedAt.IsZero() || execution.DurationMS < 0 {
 				return fmt.Errorf("%w: execution %d has invalid runtime timing", ErrInvalidEnvelope, index)
 			}
+			if execution.Egress == nil || !validExecutionEgress(*execution.Egress) {
+				return fmt.Errorf("%w: execution %d has invalid egress facts", ErrInvalidEnvelope, index)
+			}
 		case ExecutionSkipped:
 			if !execution.StartedAt.IsZero() || execution.DurationMS != 0 {
 				return fmt.Errorf("%w: skipped execution %d contains runtime timing", ErrInvalidEnvelope, index)
+			}
+			if execution.Egress != nil && !validExecutionEgress(*execution.Egress) {
+				return fmt.Errorf("%w: skipped execution %d has invalid egress facts", ErrInvalidEnvelope, index)
 			}
 		default:
 			return fmt.Errorf("%w: execution %d has unsupported status %q", ErrInvalidEnvelope, index, execution.Status)
@@ -209,9 +215,15 @@ func (input EnvelopeInput) validate() error {
 			if execution.StartedAt.IsZero() || execution.DurationMS < 0 {
 				return fmt.Errorf("%w: execution %d requires started_at and non-negative duration_ms", ErrInvalidEnvelope, index)
 			}
+			if execution.Egress == nil || !validExecutionEgress(*execution.Egress) {
+				return fmt.Errorf("%w: execution %d requires valid egress facts", ErrInvalidEnvelope, index)
+			}
 		case ExecutionSkipped:
 			if !execution.StartedAt.IsZero() || execution.DurationMS != 0 {
 				return fmt.Errorf("%w: skipped execution %d must not contain runtime timing", ErrInvalidEnvelope, index)
+			}
+			if execution.Egress != nil && !validExecutionEgress(*execution.Egress) {
+				return fmt.Errorf("%w: skipped execution %d has invalid egress facts", ErrInvalidEnvelope, index)
 			}
 		default:
 			return fmt.Errorf("%w: execution %d has unsupported status %q", ErrInvalidEnvelope, index, execution.Status)
@@ -269,6 +281,22 @@ func aggregateStatus(executions []Execution, coverage []Coverage, errors []Error
 func validSelection(selection Selection) bool {
 	switch selection {
 	case SelectionCandidate, SelectionPrimary, SelectionPreferred, SelectionAggregate, SelectionFallback:
+		return true
+	default:
+		return false
+	}
+}
+
+func validExecutionEgress(egress ExecutionEgress) bool {
+	if strings.TrimSpace(egress.ProfileID) == "" {
+		return false
+	}
+	switch egress.Mode {
+	case EgressModeEnvironment:
+		return true
+	case EgressModeDirect:
+		return !egress.Proxied
+	case EgressModeHTTPProxy, EgressModeSOCKS5:
 		return true
 	default:
 		return false

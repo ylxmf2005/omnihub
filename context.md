@@ -26,9 +26,9 @@
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
 - 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。MVP 复用现有 pure-Go SQLite，以 `float32` BLOB 缓存 embedding 并对单次最多 100 个结果做精确余弦比较；不引入第二数据库、CGO 或外部向量服务。Embedding 通过用户显式配置的本地 Ollama/OpenAI-compatible Endpoint 获取，不自动下载模型、不自动从本地回退云端。
-- 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0—2 已提交并推送，Stage 3 已完成用户自管 RSSHub Endpoint/Channel、三层 Probe、统一 Query/fallback、管理 CAS 与受限 access-key transport。最新 proxy-fail-closed E2E、全量 test/race/vet、四平台构建、Schema 与 diff check 已通过，独立全链复核 `approve` 且无未解决 P0–P2。NodeSeek 由独立 side 任务处理；Stage 3 授权未扩大到其他 Provider、Cookie、Dashboard 前端或 Chrome Extension 客户端。
+- 实施状态：Shape 与 Grill 已收口；Stage 0—3 已提交并推送。Stage A 已完成显式 EgressProfile、固定 Endpoint/Channel 绑定、四种可信 transport、Direct/RSSHub 分层 Channel Probe、CLI/OPML 显式出口与 Adapter fail-closed；全量 test/race/vet、真实 CLI E2E、四平台构建、Schema、Ponytail 与独立安全复核均已闭合。NodeSeek 由独立 side 任务处理；Stage B 以前仍不宣称 GitHub/Tavily/X、HTTP/MCP/Skill 或 Dashboard 已实现。
 - 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
-- Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决；跨多个显式绑定聚合时，一个成功而其他失败呈现 `ready_dependent` 并保留各绑定事实。
+- Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决并保留每次 Probe 的具体 Egress 事实；跨绑定 `ready_dependent` 等待 Stage C 的 Probe health 持久化与 Dashboard aggregate consumer，不能用无调用者 helper 或伪历史提前实现。
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
 
 ## Goal
@@ -91,8 +91,8 @@
 - `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
 - `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
 - `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`ready`，Stage 0—3 已完成，Stage A—E 待实施。
-- `dev/implementation.md`：`completed`，Stage 3 受限 credential transport 已实现并通过聚焦反馈。
-- `test/test-plan.md`：`completed`，TC-301—307 与全部质量闸已执行。
-- `test/test-report.md`：`passed`，authenticated/proxy/cache/revision、脱敏 E2E、四平台构建与 Schema 已闭合。
-- `review/review.md`：`approve`，当前 proxy-fail-closed 完整对象无未解决 P0–P2。
+- `plan.md`：`ready`，Stage 0—A 已完成，下一入口为 Stage B。
+- `dev/implementation.md`：`completed`，Stage A 固定出口与分层 Probe 已实现并通过聚焦反馈。
+- `test/test-plan.md`：`completed`，TC-A01—A08 已执行。
+- `test/test-report.md`：`passed`，四 mode、分层 Probe、fail-closed、脱敏 CLI E2E、四平台构建与 Schema 已闭合。
+- `review/review.md`：`approve`，Stage A 当前完整对象无未解决 P0–P2。

@@ -1,6 +1,6 @@
 # OmniHub Implementation Plan
 
-状态：`Stage A ready`
+状态：`Stage B ready`
 
 已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
@@ -56,9 +56,9 @@
 - 为 V2EX 同时配置 Direct Feed 与 RSSHub Channel，验证 prefer/only/fallback。
 - 验证四种现实：未配置 RSSHub、Endpoint 不可达、Channel 缺配置、Channel 真实成功。
 
-当前证据：本机不装 RSSHub 时 Direct Feed 正常；显式 Endpoint 可单独探测；Endpoint、Route metadata 与实际 Feed 不互相冒充；V2EX RSSHub 的 prefer/only/fallback 已通过真实 CLI 与 loopback 验收。受限 transport 按实际 pathname 派生 code，只允许显式 Endpoint 的同 origin、分段 base path，每跳清除并重签；越界、编码 traversal、double slash 与认证 HTML discovery fail-closed，cache 按 Endpoint/Credential revision 隔离，所有持久化与输出面脱敏。Stage 3 只用 OmniHub 自建 transport，拒绝所有外部 `http.Transport`；proxy resolver 只看 clean request clone，命中 proxy 时 Endpoint/proxy 网络请求为 0，确认不命中才注入 code 直连。authenticated/cache/rotation、proxy callback 无 access material、custom DialContext=0 的 E2E、全量 test/race/vet、四平台 build/schema 与 diff check 已通过；独立全链复核 `approve`，无未解决 P0–P2。
+当前证据：本机不装 RSSHub 时 Direct Feed 正常；显式 Endpoint 可单独探测；Endpoint、Route metadata 与实际 Feed 不互相冒充；V2EX RSSHub 的 prefer/only/fallback、access-key pathname 签名、cache/revision 与全链脱敏已通过真实 CLI 和 loopback 验收。Stage A 已把该执行链迁移到 Endpoint 固定 Egress，Stage 3 的无 Profile transport 不再是当前运行语义。
 
-## Stage A：可信出站与主动分层 Probe
+## Stage A：可信出站与主动分层 Probe（已完成）
 
 目标：所有真实 Provider 先共享一个可审计出口，主动诊断能指出故障层，普通 Query 不支付额外 Probe 成本。
 
@@ -68,7 +68,9 @@
 - 以一个内部 transport builder 构造可信 `http.Transport`；不新增单实现 Factory/interface，不隐式 fallback、公共 DoH/代理或关闭 TLS。
 - Probe 复用真实 transport、`httptrace`、HTTP CONNECT hook 与 Feed parser，按真实拓扑产生 DNS/TCP/proxy-connect/TLS/HTTP/Feed-parse observation；SOCKS proxy DNS 不伪造 target IP。
 
-完成证据：四种 mode 的配置、成功和 fail-closed fixture；下游 `not_run`、proxy 407、SOCKS local/FQDN、Credential 脱敏、Query 单请求与 Probe 分层请求均可重放；单 Channel 与跨绑定 `ready_dependent` 状态正确。
+完成证据：四种 mode 的配置、成功和 fail-closed fixture；下游 `not_run`、proxy 407、SOCKS local/FQDN、Credential 脱敏、Query 单请求与 Probe 分层请求均可重放；单 Channel 固定绑定正确且不会生成聚合态。跨绑定 `ready_dependent` 依赖 Stage C 的 Probe health 持久化与 Dashboard aggregate consumer，不在此处添加无调用者聚合器。
+
+当前证据：EgressProfile/代理 Credential 的 CLI 与 SQLite CAS、Endpoint/Channel 固定绑定、旧资源 fail-closed、四种真实 transport、Direct/RSSHub 分层 Channel Probe、一次性 Feed/OPML 显式出口均已实现。缺 Egress 的 Adapter Execute/Probe 请求数为 0；Direct Probe、不可达 HTTP/SOCKS 代理、CONNECT 407、SOCKS DNS、TLS/HTTP/Feed parse 分层均有 fixture。全量 test/race/vet/diff、真实 CLI E2E、Schema、四平台构建、Ponytail 与独立 Review 已闭合。
 
 ## Stage B：代表 Provider 与 Agent Query 发布面
 
@@ -87,6 +89,7 @@
 
 - 实现 View、Snapshot、Channel checkpoint、identity tombstone 与 Run 的最小 Repository/SQLite migration；补齐 Run 模型中当前未持久化的 resource/request/progress/error 字段。
 - View refresh 走 Create/Claim/Execute/Commit/Finish；Snapshot+checkpoint 原子提交，失败保留旧 Snapshot；支持 fresh/stale/empty、singleflight、显式 refresh 与外部 cron，不内置 scheduler。
+- 持久化有 TTL 的逐 Channel Probe health；Dashboard 聚合多个显式绑定时，一个成功且其他失败才输出 `ready_dependent`，并列出成功/失败 profile ID。单 Channel 永不使用该聚合态。
 - 一个 Snapshot renderer 投影 RSS/Atom/JSON Feed，并实现 ETag/Last-Modified 与 stale metadata。
 - `serve` 扩展为 loopback Dashboard Backend：summary、catalog/Channel/Endpoint/Egress/Credential/Collection/View/Run/readiness、Query Workbench；写入用 revision/If-Match 与 Idempotency-Key，预执行错误用 RFC9457。
 - Credential 列表只返回掩码，detail 仅 `include_value=true` 回显并设置 `Cache-Control: no-store`；Cookie 永不进入 HTTP。

@@ -123,7 +123,11 @@ func TestContractEnvelopeSelectionCanBeProducedByRouter(t *testing.T) {
 	templates := make([]core.RouteTemplate, 0, len(envelope.Executions))
 	channels := make([]core.Channel, 0, len(envelope.Executions))
 	credentials := make([]core.Credential, 0, len(envelope.Executions))
+	egressByID := make(map[string]core.EgressProfile)
 	for index, execution := range envelope.Executions {
+		if execution.Egress == nil {
+			t.Fatalf("contract execution %s misses egress", execution.ChannelID)
+		}
 		sourcesByID[execution.Source] = core.Source{ID: execution.Source, Enabled: true}
 		providersByID[execution.Provider] = core.Provider{ID: execution.Provider, Capabilities: []string{execution.Capability}, Enabled: true}
 		templates = append(templates, core.RouteTemplate{
@@ -134,8 +138,10 @@ func TestContractEnvelopeSelectionCanBeProducedByRouter(t *testing.T) {
 		})
 		channels = append(channels, core.Channel{
 			ID: execution.ChannelID, Source: execution.Source, RouteTemplateID: execution.RouteTemplateID,
-			CredentialID: execution.Auth.CredentialID, Priority: len(envelope.Executions) - index, Enabled: true,
+			EgressProfileID: execution.Egress.ProfileID, CredentialID: execution.Auth.CredentialID,
+			Priority: len(envelope.Executions) - index, Enabled: true,
 		})
+		egressByID[execution.Egress.ProfileID] = core.EgressProfile{ID: execution.Egress.ProfileID, Mode: execution.Egress.Mode, Enabled: true}
 		if execution.Auth.Required {
 			secret := "contract-fixture"
 			credentials = append(credentials, core.Credential{
@@ -152,7 +158,11 @@ func TestContractEnvelopeSelectionCanBeProducedByRouter(t *testing.T) {
 	for _, provider := range providersByID {
 		providers = append(providers, provider)
 	}
-	catalog, err := registry.NewCatalog(sources, providers, templates, channels, nil, credentials, nil, nil)
+	egressProfiles := make([]core.EgressProfile, 0, len(egressByID))
+	for _, profile := range egressByID {
+		egressProfiles = append(egressProfiles, profile)
+	}
+	catalog, err := registry.NewCatalog(sources, providers, templates, channels, nil, egressProfiles, credentials, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,10 +208,10 @@ func TestStage1RegistryContracts(t *testing.T) {
 		{ID: "a", Source: "source", RouteTemplateID: "template", FallbackChannelIDs: []string{"b"}, Enabled: true},
 		{ID: "b", Source: "source", RouteTemplateID: "template", FallbackChannelIDs: []string{"a"}, Enabled: true},
 	}
-	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{cycleTemplate}, cycle, nil, nil, nil, nil); !errors.Is(err, registry.ErrInvalidCatalog) {
+	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, []core.RouteTemplate{cycleTemplate}, cycle, nil, nil, nil, nil, nil); !errors.Is(err, registry.ErrInvalidCatalog) {
 		t.Fatalf("NewCatalog(fallback cycle) error = %v", err)
 	}
-	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, nil, []core.Channel{{ID: "dangling", Source: "source", RouteTemplateID: "removed", Enabled: true}}, nil, nil, nil, []core.TemplateOverlay{{RouteTemplateID: "removed", Enabled: false, Revision: 1}}); err != nil {
+	if _, err := registry.NewCatalog([]core.Source{source}, []core.Provider{provider}, nil, []core.Channel{{ID: "dangling", Source: "source", RouteTemplateID: "removed", Enabled: true}}, nil, nil, nil, nil, []core.TemplateOverlay{{RouteTemplateID: "removed", Enabled: false, Revision: 1}}); err != nil {
 		t.Fatalf("NewCatalog() rejected upgrade-preserved dangling references: %v", err)
 	}
 
@@ -266,9 +276,10 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 			{RouteTemplateID: "api-template", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "api", Capabilities: []string{"latest"}, Auth: core.AuthDescriptor{Required: true}},
 		},
 		[]core.Channel{
-			{ID: "lowest", Source: "source", RouteTemplateID: "direct-template", Priority: math.MinInt, Enabled: true},
-			{ID: "highest", Source: "source", RouteTemplateID: "api-template", CredentialID: "credential", Priority: math.MaxInt, FallbackChannelIDs: []string{"lowest"}, Enabled: true},
+			{ID: "lowest", Source: "source", RouteTemplateID: "direct-template", EgressProfileID: "egress-direct", Priority: math.MinInt, Enabled: true},
+			{ID: "highest", Source: "source", RouteTemplateID: "api-template", EgressProfileID: "egress-direct", CredentialID: "credential", Priority: math.MaxInt, FallbackChannelIDs: []string{"lowest"}, Enabled: true},
 		}, nil,
+		[]core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}},
 		[]core.Credential{{ID: "credential", Provider: "api", AuthKind: "token", Value: &secret, Enabled: true}}, nil, nil,
 	)
 	if err != nil {
@@ -301,19 +312,20 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 
 	report := readiness.Doctor(catalog, time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC))
 	for _, health := range report.Channels {
-		if health.Readiness == readiness.StateReady {
-			t.Fatalf("channel %s reported ready without probe", health.ChannelID)
+		if health.Readiness == readiness.StateReady || health.Readiness == readiness.StateReadyDependent {
+			t.Fatalf("channel %s inferred probe readiness from static configuration", health.ChannelID)
 		}
 		if health.ChannelID != "highest" {
 			continue
 		}
-		found := false
+		found, egressConfigured := false, false
 		for _, check := range health.Checks {
 			if check.Kind == "dependency_installed" && check.Status == readiness.CheckUnknown && check.Code != nil && *check.Code == "dependency_not_probed" {
 				found = true
 			}
+			egressConfigured = egressConfigured || check.Kind == "egress_configured" && check.Status == readiness.CheckPassed
 		}
-		if health.Readiness != readiness.StateDegraded || !found {
+		if health.Readiness != readiness.StateDegraded || !found || !egressConfigured {
 			t.Fatalf("configured health = %#v", health)
 		}
 	}
@@ -326,8 +338,9 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	}
 	cookieCatalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "source", Origin: "imported", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
-		[]core.RouteTemplate{cookieTemplate}, []core.Channel{{ID: "cookie", Source: "source", RouteTemplateID: "cookie-template", CredentialID: "cookie-credential", Enabled: true}},
-		nil, []core.Credential{{ID: "cookie-credential", Provider: "provider", AuthKind: "chrome_cookie", Enabled: true}}, nil, nil,
+		[]core.RouteTemplate{cookieTemplate}, []core.Channel{{ID: "cookie", Source: "source", RouteTemplateID: "cookie-template", EgressProfileID: "egress-direct", CredentialID: "cookie-credential", Enabled: true}},
+		nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}},
+		[]core.Credential{{ID: "cookie-credential", Provider: "provider", AuthKind: "chrome_cookie", Enabled: true}}, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -352,7 +365,7 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	endpointTemplate := core.RouteTemplate{RouteTemplateID: "endpoint-required", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"source"}}, Provider: "provider", Capabilities: []string{"latest"}, EndpointRequired: true}
 	endpointCatalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
-		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{ID: "endpointless", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID, Enabled: true}}, nil, nil, nil, nil,
+		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{ID: "endpointless", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID, Enabled: true}}, nil, nil, nil, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -371,11 +384,11 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	optionalAuthCatalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
 		[]core.RouteTemplate{optionalAuthTemplate}, []core.Channel{
-			{ID: "stale-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "missing", Enabled: true},
-			{ID: "disabled-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "disabled", Enabled: true},
-			{ID: "empty-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "empty", Enabled: true},
-			{ID: "blank-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, CredentialID: "blank", Enabled: true},
-		}, nil, []core.Credential{
+			{ID: "stale-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", CredentialID: "missing", Enabled: true},
+			{ID: "disabled-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", CredentialID: "disabled", Enabled: true},
+			{ID: "empty-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", CredentialID: "empty", Enabled: true},
+			{ID: "blank-credential", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", CredentialID: "blank", Enabled: true},
+		}, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, []core.Credential{
 			{ID: "disabled", Provider: "provider", AuthKind: "api_key", Enabled: false},
 			{ID: "empty", Provider: "provider", AuthKind: "api_key", Enabled: true},
 			{ID: "blank", Provider: "provider", AuthKind: "api_key", Value: &blankCredentialValue, Enabled: true},
@@ -387,6 +400,134 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 	optionalPlan, err := router.Build(optionalAuthCatalog, operation)
 	if !errors.Is(err, router.ErrNoRoute) || len(optionalPlan.Skipped) != 4 || optionalPlan.Skipped[0].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[1].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[2].Reason != "preflight_credential_unresolved" || optionalPlan.Skipped[3].Reason != "preflight_credential_missing" {
 		t.Fatalf("Build(optional auth stale credential) = %#v, %v", optionalPlan, err)
+	}
+
+	proxyBlank, proxyInvalid, proxyValid := "  ", "missing-colon", "user:password"
+	egressCatalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{optionalAuthTemplate}, []core.Channel{
+			{ID: "egress-disabled", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "disabled", Enabled: true},
+			{ID: "egress-missing", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, Enabled: true},
+			{ID: "egress-not-found", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "unknown", Enabled: true},
+			{ID: "endpoint-egress-disabled", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EndpointProfileID: "endpoint-disabled", Enabled: true},
+			{ID: "endpoint-egress-missing", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EndpointProfileID: "endpoint-missing", Enabled: true},
+			{ID: "endpoint-egress-not-found", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EndpointProfileID: "endpoint-not-found", Enabled: true},
+			{ID: "proxy-credential-blank", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-blank", Enabled: true},
+			{ID: "proxy-credential-disabled", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-disabled", Enabled: true},
+			{ID: "proxy-credential-empty", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-empty", Enabled: true},
+			{ID: "proxy-credential-format", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-format", Enabled: true},
+			{ID: "proxy-credential-kind", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-kind", Enabled: true},
+			{ID: "proxy-credential-missing", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-missing", Enabled: true},
+			{ID: "proxy-credential-provider", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "proxy-provider", Enabled: true},
+		}, []core.EndpointProfile{
+			{ID: "endpoint-disabled", Provider: "provider", EgressProfileID: "disabled", Enabled: true},
+			{ID: "endpoint-missing", Provider: "provider", Enabled: true},
+			{ID: "endpoint-not-found", Provider: "provider", EgressProfileID: "unknown", Enabled: true},
+		}, []core.EgressProfile{
+			{ID: "disabled", Mode: core.EgressModeDirect},
+			{ID: "proxy-blank", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-blank", Enabled: true},
+			{ID: "proxy-disabled", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-disabled", Enabled: true},
+			{ID: "proxy-empty", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-empty", Enabled: true},
+			{ID: "proxy-format", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-format", Enabled: true},
+			{ID: "proxy-kind", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-kind", Enabled: true},
+			{ID: "proxy-missing", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "unknown", Enabled: true},
+			{ID: "proxy-provider", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-provider", Enabled: true},
+		}, []core.Credential{
+			{ID: "proxy-blank", Provider: "egress", AuthKind: "basic", Value: &proxyBlank, Enabled: true},
+			{ID: "proxy-disabled", Provider: "egress", AuthKind: "basic", Enabled: false},
+			{ID: "proxy-empty", Provider: "egress", AuthKind: "basic", Enabled: true},
+			{ID: "proxy-format", Provider: "egress", AuthKind: "basic", Value: &proxyInvalid, Enabled: true},
+			{ID: "proxy-kind", Provider: "egress", AuthKind: "token", Value: &proxyValid, Enabled: true},
+			{ID: "proxy-provider", Provider: "proxy", AuthKind: "basic", Value: &proxyValid, Enabled: true},
+		}, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressPlan, err := router.Build(egressCatalog, operation)
+	if !errors.Is(err, router.ErrNoRoute) || len(egressPlan.Skipped) != 13 {
+		t.Fatalf("Build(egress preflight) = %#v, %v", egressPlan, err)
+	}
+	wantReasons := map[string]string{
+		"egress-disabled":           "preflight_egress_disabled",
+		"egress-missing":            "preflight_egress_missing",
+		"egress-not-found":          "preflight_egress_not_found",
+		"endpoint-egress-disabled":  "preflight_egress_disabled",
+		"endpoint-egress-missing":   "preflight_egress_missing",
+		"endpoint-egress-not-found": "preflight_egress_not_found",
+		"proxy-credential-blank":    "preflight_egress_credential_unresolved",
+		"proxy-credential-disabled": "preflight_egress_credential_unresolved",
+		"proxy-credential-empty":    "preflight_egress_credential_unresolved",
+		"proxy-credential-format":   "preflight_egress_credential_unresolved",
+		"proxy-credential-kind":     "preflight_egress_credential_unresolved",
+		"proxy-credential-missing":  "preflight_egress_credential_missing",
+		"proxy-credential-provider": "preflight_egress_credential_unresolved",
+	}
+	for _, skipped := range egressPlan.Skipped {
+		if skipped.Reason != wantReasons[skipped.Channel.ID] {
+			t.Fatalf("egress preflight %s = %q, want %q", skipped.Channel.ID, skipped.Reason, wantReasons[skipped.Channel.ID])
+		}
+	}
+	for _, channel := range readiness.Doctor(egressCatalog, time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)).Channels {
+		wantState := readiness.StateNotConfigured
+		if strings.HasSuffix(channel.ChannelID, "egress-disabled") || wantReasons[channel.ChannelID] == "preflight_egress_credential_unresolved" {
+			wantState = readiness.StateBlocked
+		}
+		if channel.Readiness != wantState {
+			t.Fatalf("egress readiness %s = %q, want %q", channel.ChannelID, channel.Readiness, wantState)
+		}
+		found, foundReason := false, false
+		wantCode := strings.TrimPrefix(wantReasons[channel.ChannelID], "preflight_")
+		for _, check := range channel.Checks {
+			found = found || check.Kind == "egress_configured" || check.Kind == "egress_credential_resolved"
+			foundReason = foundReason || check.Code != nil && *check.Code == wantCode
+		}
+		if !found || !foundReason {
+			t.Fatalf("egress readiness %s misses %s check: %#v", channel.ChannelID, wantCode, channel.Checks)
+		}
+	}
+
+	conflictCatalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{endpointTemplate}, []core.Channel{{
+			ID: "egress-conflict", Source: "source", RouteTemplateID: endpointTemplate.RouteTemplateID,
+			EndpointProfileID: "endpoint", EgressProfileID: "channel-egress", Enabled: true,
+		}}, []core.EndpointProfile{{ID: "endpoint", Provider: "provider", EgressProfileID: "endpoint-egress", Enabled: true}},
+		[]core.EgressProfile{
+			{ID: "channel-egress", Mode: core.EgressModeDirect, Enabled: true},
+			{ID: "endpoint-egress", Mode: core.EgressModeDirect, Enabled: true},
+		}, nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictPlan, err := router.Build(conflictCatalog, operation)
+	if !errors.Is(err, router.ErrNoRoute) || len(conflictPlan.Skipped) != 1 || conflictPlan.Skipped[0].Reason != "preflight_egress_conflict" {
+		t.Fatalf("Build(egress conflict) = %#v, %v", conflictPlan, err)
+	}
+	conflictHealth := readiness.Doctor(conflictCatalog, time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)).Channels[0]
+	if conflictHealth.Readiness != readiness.StateNotConfigured {
+		t.Fatalf("Doctor(egress conflict) = %#v", conflictHealth)
+	}
+
+	fallbackCatalog, err := registry.NewCatalog(
+		[]core.Source{{ID: "source", Enabled: true}}, []core.Provider{{ID: "provider", Capabilities: []string{"latest"}, Enabled: true}},
+		[]core.RouteTemplate{optionalAuthTemplate}, []core.Channel{
+			{ID: "primary", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, EgressProfileID: "egress-direct", FallbackChannelIDs: []string{"unconfigured-fallback"}, Priority: 100, Enabled: true},
+			{ID: "unconfigured-fallback", Source: "source", RouteTemplateID: optionalAuthTemplate.RouteTemplateID, Priority: 50, Enabled: true},
+		}, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackOperation := operation
+	fallbackOperation.RoutePolicy.AllowFallback = true
+	fallbackPlan, err := router.Build(fallbackCatalog, fallbackOperation)
+	if err != nil || len(fallbackPlan.Selected) != 1 || len(fallbackPlan.Skipped) != 1 || fallbackPlan.Skipped[0].Reason != "preflight_egress_missing" {
+		t.Fatalf("Build(unconfigured egress fallback) = %#v, %v", fallbackPlan, err)
+	}
+	if _, err := router.Fallback(fallbackCatalog, &fallbackPlan, "primary"); !errors.Is(err, router.ErrNoRoute) {
+		t.Fatalf("Fallback(unconfigured egress) error = %v", err)
 	}
 }
 
@@ -401,11 +542,15 @@ func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 		t.Fatalf("generic direct-feed template = %#v, %v", template, ok)
 	}
 
-	transient, err := builtin.WithSourceAndChannel(
+	withEgress, err := builtin.WithEgressProfile(core.EgressProfile{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transient, err := withEgress.WithSourceAndChannel(
 		core.Source{ID: "example.org", DisplayName: "Example", Origin: "user", Enabled: true},
 		core.Channel{
 			ID: "channel_example_feed", Source: "example.org", RouteTemplateID: template.RouteTemplateID,
-			Parameters: map[string]any{"url": "https://example.org/feed.json"}, Priority: 100, Enabled: true,
+			EgressProfileID: "egress-direct", Parameters: map[string]any{"url": "https://example.org/feed.json"}, Priority: 100, Enabled: true,
 		},
 	)
 	if err != nil {
@@ -447,8 +592,9 @@ func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 }
 
 type fakeFeedExecutor struct {
-	results map[string]core.AdapterResult
-	calls   []string
+	results  map[string]core.AdapterResult
+	calls    []string
+	requests []adapter.FeedRequest
 }
 
 type fakeRSSHubExecutor struct {
@@ -465,6 +611,7 @@ func (executor *fakeRSSHubExecutor) Execute(_ context.Context, request adapter.R
 
 func (executor *fakeFeedExecutor) Execute(_ context.Context, request adapter.FeedRequest) core.AdapterResult {
 	executor.calls = append(executor.calls, request.Channel.ID)
+	executor.requests = append(executor.requests, request)
 	return executor.results[request.Channel.ID]
 }
 
@@ -474,6 +621,9 @@ func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog
 	seenSources := make(map[string]bool)
 	for index := range channels {
 		channels[index].RouteTemplateID = "fixture-feed-window"
+		if channels[index].EgressProfileID == "" {
+			t.Fatalf("query fixture channel %s must explicitly bind egress", channels[index].ID)
+		}
 		if seenSources[channels[index].Source] {
 			continue
 		}
@@ -487,7 +637,7 @@ func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog
 			RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
 			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search", "latest"},
 		}},
-		channels, nil, nil, nil, nil,
+		channels, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -521,10 +671,86 @@ func successfulFeedResult(items ...core.Item) core.AdapterResult {
 func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	fixedNow := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 
+	t.Run("legacy channel without egress fails before adapter", func(t *testing.T) {
+		catalog, err := registry.NewCatalog(
+			[]core.Source{{ID: "source", Enabled: true}},
+			[]core.Provider{{ID: "fixture-feed", Capabilities: []string{"latest"}, Enabled: true}},
+			[]core.RouteTemplate{{
+				RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
+				Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"latest"},
+			}}, []core.Channel{{ID: "legacy", Source: "source", RouteTemplateID: "fixture-feed-window", Enabled: true}}, nil, nil, nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{}}
+		_, err = (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationLatest, []string{"legacy"}, 10))
+		if !errors.Is(err, router.ErrNoRoute) || len(feed.calls) != 0 {
+			t.Fatalf("Execute(legacy egress) error/calls = %v/%v", err, feed.calls)
+		}
+	})
+
+	t.Run("proxy credential is passed only to adapter", func(t *testing.T) {
+		secret := "proxy-user:secret-must-not-echo"
+		catalog, err := registry.NewCatalog(
+			[]core.Source{{ID: "source", Enabled: true}},
+			[]core.Provider{{ID: "fixture-feed", Capabilities: []string{"latest"}, Enabled: true}},
+			[]core.RouteTemplate{{
+				RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
+				Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"latest"},
+			}}, []core.Channel{{
+				ID: "proxy-feed", Source: "source", RouteTemplateID: "fixture-feed-window", EgressProfileID: "egress-proxy", Enabled: true,
+			}}, nil, []core.EgressProfile{{
+				ID: "egress-proxy", Mode: core.EgressModeHTTPProxy, ProxyEndpoint: "http://127.0.0.1:18080", CredentialID: "proxy-basic", Enabled: true,
+			}}, []core.Credential{{
+				ID: "proxy-basic", Provider: "egress", AuthKind: "basic", Value: &secret, Enabled: true,
+			}}, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upstreamID := "proxy-item"
+		result := successfulFeedResult(core.Item{
+			Title: "Proxy item", Observations: []core.Observation{{UpstreamID: &upstreamID, Verification: core.VerificationMetadata}},
+		})
+		result.ProviderState = map[string]string{
+			"egress_profile_id": "adapter-spoof", "egress_mode": "direct", "egress_proxied": "true",
+		}
+		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{"proxy-feed": result}}
+		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationLatest, []string{"proxy-feed"}, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(feed.requests) != 1 || feed.requests[0].EgressCredential == nil || feed.requests[0].EgressCredential.ID != "proxy-basic" || feed.requests[0].EgressCredential.Value == nil || *feed.requests[0].EgressCredential.Value != secret {
+			t.Fatalf("adapter egress credential = %#v", feed.requests)
+		}
+		if envelope.Executions[0].Egress == nil || *envelope.Executions[0].Egress != (core.ExecutionEgress{ProfileID: "egress-proxy", Mode: core.EgressModeHTTPProxy, Proxied: true}) {
+			t.Fatalf("proxy execution egress = %#v", envelope.Executions[0].Egress)
+		}
+		encoded, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{secret, "proxy-basic", "http://127.0.0.1:18080"} {
+			if bytes.Contains(encoded, []byte(forbidden)) {
+				t.Fatalf("Envelope leaked egress material %q: %s", forbidden, encoded)
+			}
+		}
+		result.ProviderState["egress_proxied"] = "false"
+		feed.results["proxy-feed"] = result
+		cached, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationLatest, []string{"proxy-feed"}, 10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cached.Executions[0].Egress == nil || cached.Executions[0].Egress.Proxied {
+			t.Fatalf("cached proxy execution egress = %#v", cached.Executions[0].Egress)
+		}
+	})
+
 	t.Run("fallback failure then success", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{
-			{ID: "primary", Source: "source", Priority: 200, FallbackChannelIDs: []string{"fallback"}, Enabled: true},
-			{ID: "fallback", Source: "source", Priority: 100, Enabled: true},
+			{ID: "primary", Source: "source", EgressProfileID: "egress-direct", Priority: 200, FallbackChannelIDs: []string{"fallback"}, Enabled: true},
+			{ID: "fallback", Source: "source", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 		})
 		upstreamID := "fallback-item"
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
@@ -549,6 +775,16 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 		if len(envelope.Executions) != 2 || envelope.Executions[0].Status != core.ExecutionFailed || envelope.Executions[1].Selection != core.SelectionFallback || envelope.Executions[1].Status != core.ExecutionCompleted {
 			t.Fatalf("fallback executions = %#v", envelope.Executions)
 		}
+		for _, execution := range envelope.Executions {
+			if execution.Egress == nil || *execution.Egress != (core.ExecutionEgress{ProfileID: "egress-direct", Mode: core.EgressModeDirect}) {
+				t.Fatalf("execution %s egress = %#v", execution.ChannelID, execution.Egress)
+			}
+		}
+		for _, request := range feed.requests {
+			if request.Egress.ID != "egress-direct" || request.EgressCredential != nil {
+				t.Fatalf("feed request egress = %#v/%#v", request.Egress, request.EgressCredential)
+			}
+		}
 		if envelope.Items[0].Similarity.Strategy != string(core.SimilarityOff) {
 			t.Fatalf("fallback item similarity = %#v", envelope.Items[0].Similarity)
 		}
@@ -556,8 +792,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 
 	t.Run("aggregate exact dedupe by same source and upstream id", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{
-			{ID: "aggregate-a", Source: "same-source", Priority: 200, Enabled: true},
-			{ID: "aggregate-b", Source: "same-source", Priority: 100, Enabled: true},
+			{ID: "aggregate-a", Source: "same-source", EgressProfileID: "egress-direct", Priority: 200, Enabled: true},
+			{ID: "aggregate-b", Source: "same-source", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 		})
 		upstreamID := "same-guid-without-url"
 		rankA, rankB := 2, 1
@@ -595,8 +831,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 
 	t.Run("stable upstream id outranks changing canonical URL", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{
-			{ID: "identity-a", Source: "same-source", Priority: 200, Enabled: true},
-			{ID: "identity-b", Source: "same-source", Priority: 100, Enabled: true},
+			{ID: "identity-a", Source: "same-source", EgressProfileID: "egress-direct", Priority: 200, Enabled: true},
+			{ID: "identity-b", Source: "same-source", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 		})
 		upstreamID := "stable-guid"
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
@@ -621,8 +857,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 
 	t.Run("identity none keeps duplicate observations as separate items", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{
-			{ID: "none-a", Source: "same-source", Priority: 200, Enabled: true},
-			{ID: "none-b", Source: "same-source", Priority: 100, Enabled: true},
+			{ID: "none-a", Source: "same-source", EgressProfileID: "egress-direct", Priority: 200, Enabled: true},
+			{ID: "none-b", Source: "same-source", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 		})
 		upstreamID := "same-guid"
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
@@ -643,7 +879,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 
 	t.Run("duplicate upstream id limitation does not collapse distinct URLs", func(t *testing.T) {
-		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "broken-guid", Source: "source", Enabled: true}})
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "broken-guid", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		upstreamID := "broken-guid"
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
 			"broken-guid": successfulFeedResult(
@@ -662,7 +898,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 
 	t.Run("search only uses visible HTML", func(t *testing.T) {
-		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "search", Source: "source", Enabled: true}})
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "search", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		hiddenHTML := `<script>needle</script><div hidden>needle</div><p>ordinary text</p>`
 		visibleHTML := `<style>.hidden{display:none}</style><span aria-hidden="true">needle</span><p>Visible needle</p>`
 		hiddenID, visibleID := "hidden", "visible"
@@ -683,7 +919,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 
 	t.Run("time range is closed and latest falls back to modified time", func(t *testing.T) {
-		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "latest", Source: "source", Enabled: true}})
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "latest", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		from, to := fixedNow.Add(-2*time.Hour), fixedNow.Add(-time.Hour)
 		outside := from.Add(-time.Nanosecond)
 		fromID, toID, unknownID, outsideID := "published-from", "modified-to", "unknown", "outside"
@@ -715,8 +951,8 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 
 	t.Run("global limit reports per-channel returned counts", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{
-			{ID: "limit-a", Source: "source", Priority: 200, Enabled: true},
-			{ID: "limit-b", Source: "source", Priority: 100, Enabled: true},
+			{ID: "limit-a", Source: "source", EgressProfileID: "egress-direct", Priority: 200, Enabled: true},
+			{ID: "limit-b", Source: "source", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 		})
 		times := []time.Time{fixedNow, fixedNow.Add(-time.Minute), fixedNow.Add(-2 * time.Minute), fixedNow.Add(-3 * time.Minute)}
 		ids := []string{"a-new", "a-old", "b-mid", "b-old"}
@@ -753,7 +989,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 
 	t.Run("unsupported similarity never calls upstream", func(t *testing.T) {
-		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "similarity", Source: "source", Enabled: true}})
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "similarity", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{}}
 		operation := stage2Operation(core.OperationLatest, []string{"similarity"}, 10)
 		operation.SimilarityGrouping = core.SimilarityTitle
@@ -765,7 +1001,7 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 	})
 
 	t.Run("item without observation is rejected", func(t *testing.T) {
-		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "missing-observation", Source: "source", Enabled: true}})
+		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "missing-observation", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
 		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
 			"missing-observation": successfulFeedResult(core.Item{Title: "invalid"}),
 		}}
@@ -790,13 +1026,17 @@ func TestStage3RSSHubQueryAndFallbackContracts(t *testing.T) {
 	}
 	channels := []core.Channel{
 		{ID: "rsshub", Source: "v2ex", RouteTemplateID: "rsshub", EndpointProfileID: "endpoint", Parameters: map[string]any{"path": "/v2ex/topics/latest"}, Priority: 200, FallbackChannelIDs: []string{"direct"}, Enabled: true},
-		{ID: "direct", Source: "v2ex", RouteTemplateID: "direct", Priority: 100, Enabled: true},
+		{ID: "direct", Source: "v2ex", RouteTemplateID: "direct", EgressProfileID: "egress-direct", Priority: 100, Enabled: true},
 	}
 	catalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "v2ex", Enabled: true}},
 		[]core.Provider{{ID: "direct-feed", Capabilities: []string{"latest"}, Enabled: true}, {ID: "rsshub", Capabilities: []string{"latest"}, Enabled: true}},
 		[]core.RouteTemplate{directTemplate, rssHubTemplate}, channels,
-		[]core.EndpointProfile{{ID: "endpoint", Provider: "rsshub", BaseURL: "https://rsshub.example", Enabled: true}}, nil, nil, nil,
+		[]core.EndpointProfile{{ID: "endpoint", Provider: "rsshub", BaseURL: "https://rsshub.example", EgressProfileID: "egress-environment", Enabled: true}},
+		[]core.EgressProfile{
+			{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true},
+			{ID: "egress-environment", Mode: core.EgressModeEnvironment, Enabled: true},
+		}, nil, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -823,15 +1063,23 @@ func TestStage3RSSHubQueryAndFallbackContracts(t *testing.T) {
 	if len(envelope.Executions) != 2 || envelope.Executions[0].Provider != "rsshub" || envelope.Executions[0].Status != core.ExecutionFailed || envelope.Executions[1].Selection != core.SelectionFallback || envelope.Executions[1].Status != core.ExecutionCompleted {
 		t.Fatalf("RSSHub fallback executions = %#v", envelope.Executions)
 	}
+	if envelope.Executions[0].Egress == nil || envelope.Executions[0].Egress.ProfileID != "egress-environment" || envelope.Executions[1].Egress == nil || envelope.Executions[1].Egress.ProfileID != "egress-direct" {
+		t.Fatalf("RSSHub fallback egress = %#v", envelope.Executions)
+	}
+	if rssHub.requests[0].Egress.ID != "egress-environment" || feed.requests[0].Egress.ID != "egress-direct" {
+		t.Fatalf("RSSHub fallback requests = %#v/%#v", rssHub.requests, feed.requests)
+	}
 
 	// A successful RSSHub execution receives the resolved Endpoint, and Query
 	// overwrites untrusted Adapter provenance with the selected route facts.
 	rssID := "rsshub-item"
-	rssHub.results["rsshub"] = successfulFeedResult(core.Item{
+	rssHubSuccess := successfulFeedResult(core.Item{
 		Title: "RSSHub", Observations: []core.Observation{{
 			Endpoint: "https://rsshub.example/v2ex/topics/latest", UpstreamID: &rssID, Verification: core.VerificationMetadata,
 		}},
 	})
+	rssHubSuccess.ProviderState = map[string]string{"egress_proxied": "true"}
+	rssHub.results["rsshub"] = rssHubSuccess
 	onlyRSSHub := stage2Operation(core.OperationLatest, []string{"rsshub"}, 10)
 	envelope, err = (queryservice.Service{Feed: feed, RSSHub: rssHub, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, onlyRSSHub)
 	if err != nil {
@@ -840,8 +1088,11 @@ func TestStage3RSSHubQueryAndFallbackContracts(t *testing.T) {
 	if envelope.Status != core.StatusComplete || len(envelope.Items) != 1 || envelope.Items[0].Observations[0].Provider != "rsshub" || envelope.Items[0].Observations[0].Endpoint != "endpoint" {
 		t.Fatalf("RSSHub success envelope = %#v", envelope)
 	}
+	if envelope.Executions[0].Egress == nil || *envelope.Executions[0].Egress != (core.ExecutionEgress{ProfileID: "egress-environment", Mode: core.EgressModeEnvironment, Proxied: true}) {
+		t.Fatalf("RSSHub execution egress = %#v", envelope.Executions[0].Egress)
+	}
 	lastRequest := rssHub.requests[len(rssHub.requests)-1]
-	if lastRequest.Endpoint.ID != "endpoint" || lastRequest.Credential != nil {
+	if lastRequest.Endpoint.ID != "endpoint" || lastRequest.Credential != nil || lastRequest.Egress.ID != "egress-environment" || lastRequest.EgressCredential != nil {
 		t.Fatalf("resolved RSSHub request = %#v", lastRequest)
 	}
 }
@@ -861,23 +1112,26 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 
 	t.Run("apply update CAS disable and preserve fallback", func(t *testing.T) {
 		service, store := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
 		created, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
 			SourceID: "source_management", ChannelID: "channel_primary", ChannelDisplayName: "Primary",
-			URL: "https://feeds.example.com/primary.xml", Priority: 200,
+			EgressProfileID: "egress-direct", URL: "https://feeds.example.com/primary.xml", Priority: 200,
 		})
 		if err != nil || created.Revision != 1 || !created.Enabled {
 			t.Fatalf("ApplyDirectFeed(create) = %#v, %v", created, err)
 		}
 		fallback, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
 			SourceID: "source_management", ChannelID: "channel_fallback", ChannelDisplayName: "Fallback",
-			URL: "https://feeds.example.com/fallback.xml", Priority: 100,
+			EgressProfileID: "egress-direct", URL: "https://feeds.example.com/fallback.xml", Priority: 100,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
 			SourceID: "source_management", ChannelID: created.ID, URL: "https://feeds.example.com/stale.xml",
-			ExpectedRevision: 0,
+			EgressProfileID: "egress-direct", ExpectedRevision: 0,
 		}); !errors.Is(err, repository.ErrConflict) {
 			t.Fatalf("ApplyDirectFeed(stale update) error = %v, want ErrConflict", err)
 		}
@@ -890,6 +1144,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 			if routing.Channels[index].ID != created.ID {
 				continue
 			}
+			routing.Channels[index].EgressProfileID = ""
 			routing.Channels[index].EndpointProfileID = "legacy-endpoint"
 			routing.Channels[index].CredentialID = "legacy-credential"
 			routing.Channels[index].FallbackChannelIDs = []string{fallback.ID}
@@ -900,12 +1155,12 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 
 		updated, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
 			SourceID: "source_management", ChannelID: created.ID, ChannelDisplayName: "Primary updated",
-			URL: "https://feeds.example.com/primary-v2.xml", Priority: 0, ExpectedRevision: created.Revision,
+			EgressProfileID: "egress-direct", URL: "https://feeds.example.com/primary-v2.xml", Priority: 0, ExpectedRevision: created.Revision,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if updated.Revision != 2 || updated.EndpointProfileID != "" || updated.CredentialID != "" || !slices.Equal(updated.FallbackChannelIDs, []string{fallback.ID}) {
+		if updated.Revision != 2 || updated.EndpointProfileID != "" || updated.EgressProfileID != "egress-direct" || updated.CredentialID != "" || !slices.Equal(updated.FallbackChannelIDs, []string{fallback.ID}) {
 			t.Fatalf("ApplyDirectFeed(update) = %#v", updated)
 		}
 		if value, ok := updated.Parameters["url"].(string); !ok || value != "https://feeds.example.com/primary-v2.xml" {
@@ -922,31 +1177,34 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 
 	t.Run("RSSHub endpoint and channel use Catalog CAS without Direct Feed or OPML semantics", func(t *testing.T) {
 		service, store := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
-			ID: "rsshub-secret", BaseURL: "https://rsshub.example.com/?access_key=must-not-echo", Trust: "remote",
+			ID: "rsshub-secret", BaseURL: "https://rsshub.example.com/?access_key=must-not-echo", EgressProfileID: "egress-direct", Trust: "remote",
 		}); err == nil || strings.Contains(err.Error(), "must-not-echo") {
 			t.Fatalf("ApplyEndpointProfile(secret URL) error = %v", err)
 		}
 		endpoint, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
-			ID: "rsshub-remote", BaseURL: "HTTPS://RSSHub.Example.com:443", Trust: "remote",
+			ID: "rsshub-remote", BaseURL: "HTTPS://RSSHub.Example.com:443", EgressProfileID: "egress-direct", Trust: "remote",
 		})
 		if err != nil || endpoint.Provider != "rsshub" || endpoint.BaseURL != "https://rsshub.example.com" || endpoint.Revision != 1 {
 			t.Fatalf("ApplyEndpointProfile(create) = %#v, %v", endpoint, err)
 		}
 		if _, err := service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
-			ID: endpoint.ID, BaseURL: endpoint.BaseURL, Trust: endpoint.Trust, ExpectedRevision: 0,
+			ID: endpoint.ID, BaseURL: endpoint.BaseURL, EgressProfileID: "egress-direct", Trust: endpoint.Trust, ExpectedRevision: 0,
 		}); !errors.Is(err, repository.ErrConflict) {
 			t.Fatalf("ApplyEndpointProfile(stale) error = %v, want ErrConflict", err)
 		}
 		endpoint, err = service.ApplyEndpointProfile(ctx, management.ApplyEndpointProfileInput{
-			ID: endpoint.ID, BaseURL: endpoint.BaseURL, Trust: "remote_configured", ExpectedRevision: endpoint.Revision,
+			ID: endpoint.ID, BaseURL: endpoint.BaseURL, EgressProfileID: "egress-direct", Trust: "remote_configured", ExpectedRevision: endpoint.Revision,
 		})
 		if err != nil || endpoint.Revision != 2 || endpoint.Trust != "remote_configured" {
 			t.Fatalf("ApplyEndpointProfile(update) = %#v, %v", endpoint, err)
 		}
 
 		fallback, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
-			SourceID: "v2ex", ChannelID: "channel_v2ex_direct", URL: "https://www.v2ex.com/index.xml", Priority: 100,
+			SourceID: "v2ex", ChannelID: "channel_v2ex_direct", EgressProfileID: "egress-direct", URL: "https://www.v2ex.com/index.xml", Priority: 100,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1007,9 +1265,12 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 
 	t.Run("nested OPML merge export and re-import", func(t *testing.T) {
 		service, store := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
 		preserved, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
 			SourceID: "source_preserved", ChannelID: "channel_preserved", ChannelDisplayName: "Preserved",
-			URL: "https://preserve.example.com/feed.xml", Priority: 50,
+			EgressProfileID: "egress-direct", URL: "https://preserve.example.com/feed.xml", Priority: 50,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1043,7 +1304,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
     </outline>
   </body>
 </opml>`
-		report, err := service.ImportOPML(ctx, strings.NewReader(document))
+		report, err := service.ImportOPML(ctx, strings.NewReader(document), "egress-direct")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1062,7 +1323,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		for _, collection := range imported.Collections {
 			collections[collection.ID] = collection
 		}
-		if len(channels) != 2 || channels["channel_shared"].Parameters["url"] != "https://feeds.example.com/shared.xml" {
+		if len(channels) != 2 || channels["channel_shared"].Parameters["url"] != "https://feeds.example.com/shared.xml" || channels["channel_shared"].EgressProfileID != "egress-direct" {
 			t.Fatalf("imported channels = %#v", imported.Channels)
 		}
 		if collections["child"].ParentID != "top" || !slices.Equal(collections["child"].ChannelIDs, []string{preserved.ID, "channel_shared"}) {
@@ -1072,7 +1333,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 			t.Fatalf("sibling collection = %#v", collections["sibling"])
 		}
 
-		repeated, err := service.ImportOPML(ctx, strings.NewReader(document))
+		repeated, err := service.ImportOPML(ctx, strings.NewReader(document), "egress-direct")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1097,6 +1358,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		})
 		for index := range routing.Channels {
 			if routing.Channels[index].ID == "channel_shared" {
+				routing.Channels[index].EgressProfileID = ""
 				routing.Channels[index].EndpointProfileID = "endpoint-must-not-echo"
 				routing.Channels[index].CredentialID = "credential-must-not-echo"
 			}
@@ -1120,14 +1382,17 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 				t.Fatalf("exported OPML is missing %s:\n%s", field, exportedText)
 			}
 		}
-		for _, forbidden := range []string{"secret-must-not-echo", "credential-must-not-echo", "endpoint-must-not-echo", "credential_id", "endpoint_profile_id"} {
+		for _, forbidden := range []string{"secret-must-not-echo", "credential-must-not-echo", "endpoint-must-not-echo", "credential_id", "endpoint_profile_id", "egress_profile_id"} {
 			if strings.Contains(strings.ToLower(exportedText), forbidden) {
 				t.Fatalf("exported OPML contains %q:\n%s", forbidden, exportedText)
 			}
 		}
 
 		reimportService, reimportStore := stage2ManagementService(t)
-		if _, err := reimportService.ImportOPML(ctx, bytes.NewReader(exported.Bytes())); err != nil {
+		if _, err := reimportService.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reimportService.ImportOPML(ctx, bytes.NewReader(exported.Bytes()), "egress-direct"); err != nil {
 			t.Fatal(err)
 		}
 		reimported, err := reimportStore.LoadRoutingCatalog(ctx)
@@ -1137,7 +1402,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		reimportedChannels := make(map[string]core.Channel, len(reimported.Channels))
 		for _, channel := range reimported.Channels {
 			reimportedChannels[channel.ID] = channel
-			if channel.EndpointProfileID != "" || channel.CredentialID != "" {
+			if channel.EndpointProfileID != "" || channel.CredentialID != "" || channel.EgressProfileID != "egress-direct" {
 				t.Fatalf("re-imported channel contains execution secrets = %#v", channel)
 			}
 		}
@@ -1154,10 +1419,30 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		}
 	})
 
+	t.Run("OPML import requires a saved enabled egress", func(t *testing.T) {
+		service, store := stage2ManagementService(t)
+		const document = `<opml version="2.0"><body><outline type="rss" xmlUrl="https://feeds.example.com/new.xml"/></body></opml>`
+		for _, egressID := range []string{"", "egress-missing"} {
+			if _, err := service.ImportOPML(ctx, strings.NewReader(document), egressID); err == nil {
+				t.Fatalf("ImportOPML(egress=%q) error = nil", egressID)
+			}
+		}
+		routing, err := store.LoadRoutingCatalog(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(routing.Channels) != 0 || len(routing.Sources) != 0 {
+			t.Fatalf("failed import persisted resources = %#v", routing)
+		}
+	})
+
 	t.Run("import report never echoes untrusted feed labels", func(t *testing.T) {
 		service, _ := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
 		const malicious = `<opml version="2.0"><body><outline type="rss" text="token=must-not-echo" title="token=must-not-echo" xmlUrl="https://evil.example/feed?token=must-not-echo"/></body></opml>`
-		report, err := service.ImportOPML(ctx, strings.NewReader(malicious))
+		report, err := service.ImportOPML(ctx, strings.NewReader(malicious), "egress-direct")
 		if err != nil {
 			t.Fatal(err)
 		}

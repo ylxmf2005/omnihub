@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 )
 
@@ -202,6 +203,9 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 	if template.EndpointRequired && channel.EndpointProfileID == "" {
 		return "preflight_endpoint_missing"
 	}
+	if channel.EndpointProfileID != "" && channel.EgressProfileID != "" {
+		return "preflight_egress_conflict"
+	}
 	if channel.EndpointProfileID != "" {
 		endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
 		if !ok {
@@ -210,6 +214,9 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 		if !endpoint.Enabled {
 			return "preflight_endpoint_disabled"
 		}
+	}
+	if _, _, reason := ResolveEgress(catalog, channel); reason != "" {
+		return reason
 	}
 	if template.Auth.Required && channel.CredentialID == "" {
 		return "preflight_credential_missing"
@@ -227,6 +234,47 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 		}
 	}
 	return ""
+}
+
+// ResolveEgress applies the single Stage A binding rule used by Router, Query
+// and readiness: Endpoint-backed Channels inherit the Endpoint profile, while
+// endpointless Channels use their own profile. It never invents a default.
+func ResolveEgress(catalog *registry.Catalog, channel core.Channel) (core.EgressProfile, *core.Credential, string) {
+	profileID := channel.EgressProfileID
+	if channel.EndpointProfileID != "" {
+		if channel.EgressProfileID != "" {
+			return core.EgressProfile{}, nil, "preflight_egress_conflict"
+		}
+		endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
+		if !ok {
+			return core.EgressProfile{}, nil, "preflight_endpoint_missing"
+		}
+		if !endpoint.Enabled {
+			return core.EgressProfile{}, nil, "preflight_endpoint_disabled"
+		}
+		profileID = endpoint.EgressProfileID
+	}
+	if profileID == "" {
+		return core.EgressProfile{}, nil, "preflight_egress_missing"
+	}
+	profile, ok := catalog.EgressProfile(profileID)
+	if !ok {
+		return core.EgressProfile{}, nil, "preflight_egress_not_found"
+	}
+	if !profile.Enabled {
+		return profile, nil, "preflight_egress_disabled"
+	}
+	if profile.CredentialID == "" {
+		return profile, nil, ""
+	}
+	credential, ok := catalog.Credential(profile.CredentialID)
+	if !ok {
+		return profile, nil, "preflight_egress_credential_missing"
+	}
+	if egress.ValidateCredential(profile, &credential) != nil {
+		return profile, nil, "preflight_egress_credential_unresolved"
+	}
+	return profile, &credential, ""
 }
 
 func matchesAny(selectors []core.RouteSelector, channel core.Channel, template core.RouteTemplate) bool {

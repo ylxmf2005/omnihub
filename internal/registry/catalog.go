@@ -22,12 +22,13 @@ type Catalog struct {
 	routeTemplates map[string]core.RouteTemplate
 	channels       map[string]core.Channel
 	endpoints      map[string]core.EndpointProfile
+	egressProfiles map[string]core.EgressProfile
 	credentials    map[string]core.Credential
 	collections    map[string]core.Collection
 	overlays       map[string]core.TemplateOverlay
 }
 
-func NewCatalog(sources []core.Source, providers []core.Provider, templates []core.RouteTemplate, channels []core.Channel, endpoints []core.EndpointProfile, credentials []core.Credential, collections []core.Collection, overlays []core.TemplateOverlay) (*Catalog, error) {
+func NewCatalog(sources []core.Source, providers []core.Provider, templates []core.RouteTemplate, channels []core.Channel, endpoints []core.EndpointProfile, egressProfiles []core.EgressProfile, credentials []core.Credential, collections []core.Collection, overlays []core.TemplateOverlay) (*Catalog, error) {
 	sourceIndex, err := index("source", sources, func(value core.Source) string { return value.ID }, cloneSource)
 	if err != nil {
 		return nil, err
@@ -48,6 +49,10 @@ func NewCatalog(sources []core.Source, providers []core.Provider, templates []co
 	if err != nil {
 		return nil, err
 	}
+	egressProfileIndex, err := index("egress profile", egressProfiles, func(value core.EgressProfile) string { return value.ID }, cloneEgressProfile)
+	if err != nil {
+		return nil, err
+	}
 	credentialIndex, err := index("credential", credentials, func(value core.Credential) string { return value.ID }, cloneCredential)
 	if err != nil {
 		return nil, err
@@ -63,7 +68,7 @@ func NewCatalog(sources []core.Source, providers []core.Provider, templates []co
 
 	catalog := &Catalog{
 		sources: sourceIndex, providers: providerIndex, routeTemplates: templateIndex,
-		channels: channelIndex, endpoints: endpointIndex, credentials: credentialIndex,
+		channels: channelIndex, endpoints: endpointIndex, egressProfiles: egressProfileIndex, credentials: credentialIndex,
 		collections: collectionIndex, overlays: overlayIndex,
 	}
 	if err := catalog.Validate(); err != nil {
@@ -97,6 +102,14 @@ func (catalog *Catalog) Validate() error {
 			return fmt.Errorf("%w: endpoint id is inconsistent", ErrInvalidCatalog)
 		}
 	}
+	for id, profile := range catalog.egressProfiles {
+		if profile.ID != id {
+			return fmt.Errorf("%w: egress profile id is inconsistent", ErrInvalidCatalog)
+		}
+		if err := profile.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidCatalog, err)
+		}
+	}
 	for id, credential := range catalog.credentials {
 		if credential.ID != id {
 			return fmt.Errorf("%w: credential id is inconsistent", ErrInvalidCatalog)
@@ -112,8 +125,8 @@ func (catalog *Catalog) Validate() error {
 		if channel.ID != id {
 			return fmt.Errorf("%w: channel id is inconsistent", ErrInvalidCatalog)
 		}
-		// Channel/Endpoint/Credential 是可写配置。引用在生命周期中可以悬挂，
-		// 例如 Credential 被删除后必须继续加载并报告 credential_missing。
+		// 可写资源的悬挂引用和历史冲突必须继续加载，让 Router/Doctor 返回
+		// 精确诊断；管理写入和 ValidateForStorage 仍拒绝制造新冲突。
 		template, ok := catalog.routeTemplates[channel.RouteTemplateID]
 		if ok && !matchesConstraint(template.SourceConstraint, channel.Source) {
 			return fmt.Errorf("%w: channel %s source %s violates template constraint", ErrInvalidCatalog, id, channel.Source)
@@ -228,7 +241,7 @@ func (catalog *Catalog) Copy() *Catalog {
 	return &Catalog{
 		sources: cloneIndex(catalog.sources, cloneSource), providers: cloneIndex(catalog.providers, cloneProvider),
 		routeTemplates: cloneIndex(catalog.routeTemplates, cloneRouteTemplate), channels: cloneIndex(catalog.channels, cloneChannel),
-		endpoints: cloneIndex(catalog.endpoints, cloneEndpoint), credentials: cloneIndex(catalog.credentials, cloneCredential),
+		endpoints: cloneIndex(catalog.endpoints, cloneEndpoint), egressProfiles: cloneIndex(catalog.egressProfiles, cloneEgressProfile), credentials: cloneIndex(catalog.credentials, cloneCredential),
 		collections: cloneIndex(catalog.collections, cloneCollection), overlays: cloneIndex(catalog.overlays, cloneOverlay),
 	}
 }
@@ -265,6 +278,10 @@ func (catalog *Catalog) Endpoints() []core.EndpointProfile {
 	return sortedValues(catalog.endpoints, func(value core.EndpointProfile) string { return value.ID }, cloneEndpoint)
 }
 
+func (catalog *Catalog) EgressProfiles() []core.EgressProfile {
+	return sortedValues(catalog.egressProfiles, func(value core.EgressProfile) string { return value.ID }, cloneEgressProfile)
+}
+
 func (catalog *Catalog) Channel(id string) (core.Channel, bool) {
 	value, ok := catalog.channels[id]
 	return cloneChannel(value), ok
@@ -278,6 +295,11 @@ func (catalog *Catalog) RouteTemplate(id string) (core.RouteTemplate, bool) {
 func (catalog *Catalog) Endpoint(id string) (core.EndpointProfile, bool) {
 	value, ok := catalog.endpoints[id]
 	return cloneEndpoint(value), ok
+}
+
+func (catalog *Catalog) EgressProfile(id string) (core.EgressProfile, bool) {
+	value, ok := catalog.egressProfiles[id]
+	return cloneEgressProfile(value), ok
 }
 
 func (catalog *Catalog) Credential(id string) (core.Credential, bool) {
@@ -306,6 +328,20 @@ func (catalog *Catalog) WithCredential(credential core.Credential) *Catalog {
 	copy := catalog.Copy()
 	copy.credentials[credential.ID] = cloneCredential(credential)
 	return copy
+}
+
+// WithEgressProfile 为一次性 Direct Feed 附加显式 direct/environment 出口。
+// 调用方仍需把相同 ID 固定到临时 Channel；该方法不写入 SQLite。
+func (catalog *Catalog) WithEgressProfile(profile core.EgressProfile) (*Catalog, error) {
+	if err := profile.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCatalog, err)
+	}
+	copy := catalog.Copy()
+	if _, exists := copy.egressProfiles[profile.ID]; exists {
+		return nil, fmt.Errorf("%w: transient egress profile %s already exists", ErrInvalidCatalog, profile.ID)
+	}
+	copy.egressProfiles[profile.ID] = cloneEgressProfile(profile)
+	return copy, nil
 }
 
 // WithSourceAndChannel 为一次无状态查询附加调用方显式给出的 Direct Feed。
@@ -423,6 +459,8 @@ func cloneEndpoint(value core.EndpointProfile) core.EndpointProfile {
 	value.Options = cloneStringAnyMap(value.Options)
 	return value
 }
+
+func cloneEgressProfile(value core.EgressProfile) core.EgressProfile { return value }
 
 func cloneCredential(value core.Credential) core.Credential {
 	if value.Value != nil {

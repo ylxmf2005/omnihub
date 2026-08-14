@@ -79,7 +79,8 @@
     "duration_ms": 700,
     "examined": 10,
     "returned": 0,
-    "auth": {"required": true, "used": true, "credential_id": "cred_github"}
+    "auth": {"required": true, "used": true, "credential_id": "cred_github"},
+    "egress": {"profile_id": "egress_environment", "mode": "environment", "proxied": false}
   }, {
     "channel_id": "channel_github_tavily",
     "route_template_id": "web-via-tavily",
@@ -92,7 +93,8 @@
     "duration_ms": 600,
     "examined": 0,
     "returned": 0,
-    "auth": {"required": true, "used": true, "credential_id": "cred_tavily"}
+    "auth": {"required": true, "used": true, "credential_id": "cred_tavily"},
+    "egress": {"profile_id": "egress_environment", "mode": "environment", "proxied": false}
   }],
   "items": [],
   "coverage": [],
@@ -435,7 +437,7 @@ Direct Feed URL、Source canonical URL、Feed metadata URL 与 Endpoint base URL
 
 RSSHub `api_key` Credential 不复制到 Channel 或 Endpoint。执行时按实际 outbound URL 的 pathname 计算 `code=md5(pathname+accessKey)`；pathname 包含 Endpoint base path 且不含 query。同 origin 且仍位于分段 Endpoint base-path 内的 redirect 必须删除旧 `key/code` 并按新 pathname 重算；跨 origin、越 base path、编码 traversal、double slash 或认证 Feed 的 HTML alternate discovery在下一跳发网前失败。
 
-Stage 3 尚无 EgressProfile。认证链只使用 OmniHub 自建的受信任 transport，绝不继承外部注入的 `http.Transport`，包括自定义 DialContext/DialTLS、TLS 与 protocol 设置；任何外部 transport 都在发网前返回 `config_error`。proxy resolver 在签名前只接收已清除 `key/code` 与受限 headers 的 clean request clone；解析为 proxy 时，Endpoint 与 proxy 均不得收到网络请求。只有确认不命中 proxy 后，才向真实网络请求注入 code 并直连。原 key 与派生 code 不得进入 proxy resolver、配置、cache key/value、ProviderState、日志、Error、Envelope 或 Probe。只有带 code 的 RoundTrip 返回 response 时，Execution 才记录 `auth.used=true`；无 response 或 cache hit 均记录 `false`。独立 Endpoint Probe 不绑定 Credential，Channel Probe 使用 Channel Credential 检查 health、Route metadata 与实际 Feed；cache 按 Endpoint/Credential revision 分区。
+RSSHub 认证链必须使用 Endpoint 固定绑定的 EgressProfile；缺失、不匹配、禁用或 Credential 不可解析时在发网前返回 `config_error`。实际 HTTP client/transport 只由 OmniHub 从该 Profile 构造，不接受调用方注入的 Client、RoundTripper、DialContext/DialTLS、TLS 或 protocol 设置，也不隐式切换出口。带 RSSHub key 的 HTTP 只允许 literal loopback，且本次代理解析必须确认没有使用代理；非 loopback HTTP 或任何明文代理路径都在注入 code 前失败。HTTPS 可经显式 environment、HTTP proxy 或 SOCKS5 出口，仍严格校验证书。原 key、派生 code、代理地址和代理 Credential 不得进入配置摘要、cache key/value、ProviderState、日志、Error、Envelope 或 Probe。只有带 code 的 RoundTrip 返回 response 时，Execution 才记录 `auth.used=true`；无 response 或 cache hit均记录 `false`。独立 Endpoint Probe 不使用 RSSHub Channel Credential，但仍使用 Endpoint Egress；Channel Probe 使用 Channel Credential 检查 health、Route metadata 与实际 Feed；cache 按 Endpoint/Credential/Egress revision 分区。
 
 配置来源分为 `builtin | imported | user`：builtin RouteTemplate 只读，用户通过 Channel/overlay 个性化；imported 资源需审核后启用。远程查询结果不得指定 executable、login URL 或 Cookie scope。
 
@@ -463,7 +465,7 @@ Stage 3 尚无 EgressProfile。认证链只使用 OmniHub 自建的受信任 tra
 }
 ```
 
-`desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | ready_dependent | degraded`。`ready_dependent` 只用于跨多个显式绑定聚合：至少一个绑定真实 Probe 成功且存在其他失败，并必须列出成功/失败 profile ID；单 Channel 不使用该值。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
+`desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | ready_dependent | degraded`。`ready_dependent` 只用于 Stage C 的跨多个显式绑定聚合：至少一个绑定真实 Probe 成功且存在其他失败，并必须列出成功/失败 profile ID；单 Channel 不使用该值。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
 
 ### 7.6 EgressProfile 与主动 Probe（Stage A 合同）
 
@@ -509,7 +511,7 @@ spec:
 
 `layer` 至少覆盖 `dns | tcp | proxy_connect | tls | http | feed_parse`，`subject` 区分 `target | proxy`；每层 `status` 为 `passed | degraded | failed | not_run`。`reason` 必须是可行动的脱敏原因，`retryable` 表示同一配置下重试是否可能恢复。Direct 才观察 target DNS/TCP；HTTP CONNECT 先观察 proxy DNS/TCP 与 CONNECT，再观察 tunnel 内 target TLS/HTTP/Feed。SOCKS5 local DNS 可观察本地 target DNS；proxy DNS 必须把 target DNS 标为 `not_run/delegated_to_egress`，不得输出伪造的 resolved IP。任一实际前置层失败时，依赖它的下游层统一为 `not_run`。普通 Query 使用相同的已解析 transport 与错误分类，但不自动运行完整分层 Probe。真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不在本合同中。
 
-当 direct 绑定失败、另一个显式 proxy 绑定成功时，各 Endpoint×Egress 事实独立成立。单 Channel 只按固定绑定裁决；跨多个显式绑定聚合时，至少一个成功且存在其他失败为 `ready_dependent`，结果列出成功与失败 profile ID。
+当 direct 绑定失败、另一个显式 proxy 绑定成功时，各 Endpoint×Egress 事实独立成立。单 Channel 只按固定绑定裁决；Stage C 的持久 Probe health 与 Dashboard aggregate consumer 存在后，跨多个显式绑定聚合时至少一个成功且存在其他失败才为 `ready_dependent`，结果列出成功与失败 profile ID。
 
 ### 7.7 Semantic Profile 与 embedding cache
 

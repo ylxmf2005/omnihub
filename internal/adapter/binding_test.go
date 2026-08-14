@@ -1,21 +1,32 @@
 package adapter
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/md5"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +35,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 )
 
 func TestCommandAndMCPBindingProduceSameAdapterResult(t *testing.T) {
@@ -311,21 +323,21 @@ func TestFeedAdapterMapsUpstreamFailures(t *testing.T) {
 	})
 
 	t.Run("network", func(t *testing.T) {
-		client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("dial failed")
-		})}
-		result := (FeedAdapter{Client: client}).Execute(context.Background(), feedRequestFixture("https://example.invalid/feed"))
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		target := server.URL
+		server.Close()
+		result := (FeedAdapter{}).Execute(context.Background(), feedRequestFixture(target))
 		assertFeedError(t, result, core.ErrorNetwork)
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 			<-request.Context().Done()
-			return nil, request.Context().Err()
-		})}
+		}))
+		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		result := (FeedAdapter{Client: client}).Execute(ctx, feedRequestFixture("https://example.invalid/feed"))
+		result := (FeedAdapter{}).Execute(ctx, feedRequestFixture(server.URL))
 		assertFeedError(t, result, core.ErrorTimeout)
 	})
 
@@ -397,7 +409,8 @@ func TestFeedURLAndCacheKeyBoundaries(t *testing.T) {
 }
 
 func TestRSSHubBuildURLAndRouteContract(t *testing.T) {
-	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: "https://rsshub.example/base", Enabled: true}
+	egressProfile := testEgressProfile("egress_direct_fixture", core.EgressModeDirect, "", "", "")
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: "https://rsshub.example/base", EgressProfileID: egressProfile.ID, Enabled: true}
 	template := core.RouteTemplate{
 		RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
 		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{
@@ -407,7 +420,7 @@ func TestRSSHubBuildURLAndRouteContract(t *testing.T) {
 	}
 	channel := core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID,
 		Parameters: map[string]any{"path": "/v2ex/topics/latest", "limit": float64(20)}}
-	request := RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}
+	request := RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}
 	if err := ValidateRSSHubRequest(request); err != nil {
 		t.Fatalf("ValidateRSSHubRequest() = %v", err)
 	}
@@ -439,7 +452,7 @@ func TestRSSHubBuildURLAndRouteContract(t *testing.T) {
 	request.Credential = nil
 
 	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "code": "must-not-enter-url"}
-	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil {
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}); err == nil {
 		t.Fatal("ValidateRSSHubRequest() accepted an undeclared credential-like parameter")
 	}
 	if _, err := BuildRSSHubFeedURL(endpoint, channel); err == nil {
@@ -448,11 +461,11 @@ func TestRSSHubBuildURLAndRouteContract(t *testing.T) {
 
 	template.ParametersSchema = map[string]any{"type": "object", "additionalProperties": true}
 	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "nested": map[string]any{"value": "unsupported"}}
-	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil {
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}); err == nil {
 		t.Fatal("ValidateRSSHubRequest() accepted a schema-valid parameter that the transport cannot encode")
 	}
 	channel.Parameters = map[string]any{"path": "/v2ex/topics/latest", "target": "https://example.test/?access_token=must-not-enter"}
-	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint}); err == nil || strings.Contains(err.Error(), "must-not-enter") {
+	if err := ValidateRSSHubRequest(RSSHubRequest{Channel: channel, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}); err == nil || strings.Contains(err.Error(), "must-not-enter") {
 		t.Fatalf("ValidateRSSHubRequest(secret URL parameter) error = %v", err)
 	}
 	requiredConfig, known := rssHubRequiredConfig([]any{
@@ -483,18 +496,9 @@ func TestRSSHubCredentialExecuteSignsScopedRequestWithoutLeaks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	endpointURL, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jar.SetCookies(endpointURL, []*http.Cookie{{Name: "browser", Value: "must-not-be-sent"}})
 	cache := NewMemoryFeedCache()
 	request := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
-	adapter := RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Jar: jar}, Cache: cache}}
+	adapter := RSSHubAdapter{Feed: FeedAdapter{Cache: cache}}
 	result := adapter.Execute(context.Background(), request)
 	if len(result.Errors) != 0 || len(result.Items) != 1 || result.ProviderState["auth_used"] != "true" {
 		t.Fatalf("Execute() = %#v", result)
@@ -654,7 +658,7 @@ func TestRSSHubCredentialProbeAuthenticatesChannelButNotEndpointProbe(t *testing
 		rssHubAccessCode("/base/v2ex/topics/latest", accessKey),
 	)
 
-	endpointProbe := (RSSHubAdapter{}).ProbeEndpoint(context.Background(), request.Endpoint)
+	endpointProbe := (RSSHubAdapter{}).ProbeEndpoint(context.Background(), request.Endpoint, request.Egress, nil)
 	if endpointProbe.Passed || endpointProbe.Error == nil || endpointProbe.Error.Code != core.ErrorAuth || anonymous.Load() != 1 {
 		t.Fatalf("anonymous Endpoint Probe = %#v, requests=%d", endpointProbe, anonymous.Load())
 	}
@@ -730,7 +734,7 @@ func TestRSSHubCredentialRejectsReflectedCode(t *testing.T) {
 
 func TestRSSHubCredentialDoesNotClaimAuthBeforeRequestWrite(t *testing.T) {
 	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "unused-access-key", 1)
-	result := (RSSHubAdapter{Feed: FeedAdapter{rssHubProxy: func(*http.Request) (*url.URL, error) { return nil, nil }}}).Execute(context.Background(), request)
+	result := (RSSHubAdapter{}).Execute(context.Background(), request)
 	assertRSSHubError(t, result, core.ErrorNetwork)
 	if result.ProviderState["auth_used"] != "" {
 		t.Fatalf("auth_used = %q before request write", result.ProviderState["auth_used"])
@@ -758,68 +762,6 @@ func TestRSSHubCredentialDoesNotClaimAuthWithoutResponse(t *testing.T) {
 	}
 }
 
-func TestRSSHubCredentialRejectsImplicitConfiguredProxy(t *testing.T) {
-	const accessKey = "proxy-boundary-access-key"
-	var endpointRequests, proxyRequests, proxyDecisions atomic.Int32
-	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		endpointRequests.Add(1)
-		if request.URL.Query().Get("code") != rssHubAccessCode(request.URL.EscapedPath(), accessKey) {
-			t.Errorf("endpoint query = %q", request.URL.RawQuery)
-		}
-		writer.Header().Set("Content-Type", "application/rss+xml")
-		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
-	}))
-	defer endpoint.Close()
-	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		proxyRequests.Add(1)
-	}))
-	defer proxy.Close()
-	proxyURL, err := url.Parse(proxy.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := rssHubCredentialRequest(endpoint.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
-	result := (RSSHubAdapter{Feed: FeedAdapter{rssHubProxy: func(request *http.Request) (*url.URL, error) {
-		proxyDecisions.Add(1)
-		if hasQueryKeyFold(request.URL.Query(), "key") || hasQueryKeyFold(request.URL.Query(), "code") || strings.Contains(request.URL.String(), accessKey) {
-			t.Errorf("proxy resolver observed access material: %q", request.URL)
-		}
-		return proxyURL, nil
-	}}}).Execute(context.Background(), request)
-	assertRSSHubError(t, result, core.ErrorConfig)
-	if proxyDecisions.Load() != 1 || endpointRequests.Load() != 0 || proxyRequests.Load() != 0 || result.ProviderState["auth_used"] != "" {
-		t.Fatalf("implicit proxy boundary = %#v, decisions=%d endpoint=%d proxy=%d", result, proxyDecisions.Load(), endpointRequests.Load(), proxyRequests.Load())
-	}
-}
-
-func TestRSSHubCredentialRejectsUnverifiableCustomTransport(t *testing.T) {
-	var calls atomic.Int32
-	custom := roundTripperFunc(func(*http.Request) (*http.Response, error) {
-		calls.Add(1)
-		return nil, errors.New("must not run")
-	})
-	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "custom-transport-key", 1)
-	result := (RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Transport: custom}}}).Execute(context.Background(), request)
-	assertRSSHubError(t, result, core.ErrorConfig)
-	if calls.Load() != 0 || result.ProviderState["auth_used"] != "" {
-		t.Fatalf("custom transport calls/auth = %d/%q", calls.Load(), result.ProviderState["auth_used"])
-	}
-}
-
-func TestRSSHubCredentialRejectsCustomDialTransport(t *testing.T) {
-	var calls atomic.Int32
-	transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
-		calls.Add(1)
-		return nil, errors.New("must not dial")
-	}}
-	request := rssHubCredentialRequest("http://127.0.0.1:1/base", "/v2ex/topics/latest", "custom-dial-key", 1)
-	result := (RSSHubAdapter{Feed: FeedAdapter{Client: &http.Client{Transport: transport}}}).Execute(context.Background(), request)
-	assertRSSHubError(t, result, core.ErrorConfig)
-	if calls.Load() != 0 || result.ProviderState["auth_used"] != "" {
-		t.Fatalf("custom dial calls/auth = %d/%q", calls.Load(), result.ProviderState["auth_used"])
-	}
-}
-
 func TestRSSHubProbeSeparatesEndpointMetadataAndFeed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -838,10 +780,11 @@ func TestRSSHubProbeSeparatesEndpointMetadataAndFeed(t *testing.T) {
 	}))
 	defer server.Close()
 
-	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, Enabled: true}
+	egressProfile := testEgressProfile("egress_direct_fixture", core.EgressModeDirect, "", "", "")
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, EgressProfileID: egressProfile.ID, Enabled: true}
 	template := core.RouteTemplate{RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
 		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}}
-	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint}
+	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}
 	report := (RSSHubAdapter{}).Probe(context.Background(), request)
 	if !report.Endpoint.Passed || !report.Metadata.Passed || !report.Metadata.RouteFound || report.Metadata.Pattern != "/v2ex/topics/latest" || !report.Metadata.Features.RequireConfigKnown || !report.Metadata.Features.RequirePuppeteerKnown || !report.Metadata.Features.RequirePuppeteer || !report.Metadata.Features.AntiCrawlerKnown || report.Readiness != "ready" {
 		t.Fatalf("Probe() report = %#v", report)
@@ -866,10 +809,11 @@ func TestRSSHubProbeMetadataMissingRouteDegradesFeedSuccess(t *testing.T) {
 	}))
 	defer server.Close()
 
-	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, Enabled: true}
+	egressProfile := testEgressProfile("egress_direct_fixture", core.EgressModeDirect, "", "", "")
+	endpoint := core.EndpointProfile{ID: "rsshub_fixture", Provider: "rsshub", BaseURL: server.URL, EgressProfileID: egressProfile.ID, Enabled: true}
 	template := core.RouteTemplate{RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
 		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}}}
-	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint}
+	request := RSSHubRequest{Channel: core.Channel{ID: "channel_rsshub", Source: "v2ex", RouteTemplateID: template.RouteTemplateID, EndpointProfileID: endpoint.ID, Parameters: map[string]any{"path": "/v2ex/topics/latest"}}, RouteTemplate: template, Endpoint: endpoint, Egress: egressProfile}
 	report := (RSSHubAdapter{}).Probe(context.Background(), request)
 	if !report.Endpoint.Passed || report.Metadata.Passed || report.Metadata.Error == nil || !report.Feed.FeedParsed || report.Readiness != "degraded" {
 		t.Fatalf("Probe() report = %#v", report)
@@ -898,7 +842,625 @@ func TestFeedAdapterDoesNotInventCanonicalURLForMissingItemLink(t *testing.T) {
 	}
 }
 
+func TestEgressBuilderAcceptsOnlyValidProfileCredentialCombinations(t *testing.T) {
+	value := "proxy-user:proxy-pass"
+	credential := &core.Credential{ID: "credential_proxy", Provider: "egress", AuthKind: "basic", Value: &value, Enabled: true, Revision: 1}
+	valid := []struct {
+		name       string
+		profile    core.EgressProfile
+		credential *core.Credential
+	}{
+		{name: "direct", profile: testEgressProfile("egress_direct", core.EgressModeDirect, "", "", "")},
+		{name: "environment", profile: testEgressProfile("egress_environment", core.EgressModeEnvironment, "", "", "")},
+		{name: "http proxy", profile: testEgressProfile("egress_http", core.EgressModeHTTPProxy, "http://127.0.0.1:8080", credential.ID, ""), credential: credential},
+		{name: "socks local", profile: testEgressProfile("egress_socks_local", core.EgressModeSOCKS5, "socks5://127.0.0.1:1080", credential.ID, core.Socks5DNSLocal), credential: credential},
+		{name: "socks proxy", profile: testEgressProfile("egress_socks_proxy", core.EgressModeSOCKS5, "socks5://127.0.0.1:1080", "", core.Socks5DNSProxy)},
+	}
+	for _, test := range valid {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := egress.Build(test.profile, test.credential, nil); err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+		})
+	}
+
+	badValue := "proxy-user\n:proxy-pass"
+	invalid := []struct {
+		name       string
+		profile    core.EgressProfile
+		credential *core.Credential
+	}{
+		{name: "disabled", profile: func() core.EgressProfile { profile := valid[0].profile; profile.Enabled = false; return profile }()},
+		{name: "missing credential", profile: valid[2].profile},
+		{name: "unexpected credential", profile: valid[0].profile, credential: credential},
+		{name: "control in credential", profile: valid[2].profile, credential: &core.Credential{ID: credential.ID, Provider: "egress", AuthKind: "basic", Value: &badValue, Enabled: true, Revision: 1}},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := egress.Build(test.profile, test.credential, nil); err == nil {
+				t.Fatal("Build() succeeded")
+			}
+		})
+	}
+	zeroRevision := valid[0].profile
+	zeroRevision.Revision = 0
+	if _, err := egress.Build(zeroRevision, nil, nil); err != nil {
+		t.Fatalf("transient zero-revision profile = %v", err)
+	}
+}
+
+func TestAdaptersRejectMissingEgressBeforeNetwork(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+
+	feedRequest := feedRequestFixture(server.URL)
+	feedRequest.Egress = core.EgressProfile{}
+	feedResult := (FeedAdapter{}).Execute(context.Background(), feedRequest)
+	assertFeedError(t, feedResult, core.ErrorConfig)
+
+	rssHubRequest := rssHubCredentialRequest(server.URL+"/base", "/v2ex/topics/latest", "missing-egress-key", 1)
+	rssHubRequest.Egress = core.EgressProfile{}
+	rssHubRequest.Endpoint.EgressProfileID = ""
+	rssHubResult := (RSSHubAdapter{}).Execute(context.Background(), rssHubRequest)
+	assertRSSHubError(t, rssHubResult, core.ErrorConfig)
+	probe := (RSSHubAdapter{}).Probe(context.Background(), rssHubRequest)
+	if probe.Endpoint.Error == nil || probe.Metadata.Error == nil || probe.Feed.Error == nil {
+		t.Fatalf("missing-egress probe = %#v", probe)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("missing-egress requests = %d", requests.Load())
+	}
+}
+
+func TestFeedProbeUsesOneRealDirectRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer server.Close()
+
+	target := strings.Replace(server.URL, "127.0.0.1", "localhost", 1)
+	request := feedRequestFixture(target)
+	request.Egress = testEgressProfile("egress_direct", core.EgressModeDirect, "", "", "")
+	queryResult := (FeedAdapter{}).Execute(context.Background(), request)
+	report := (FeedAdapter{}).Probe(context.Background(), request)
+	if len(queryResult.Errors) != 0 || len(report.Result.Errors) != 0 || requests.Load() != 2 {
+		t.Fatalf("query/probe = %#v/%#v, requests=%d", queryResult, report, requests.Load())
+	}
+	if queryResult.ProviderState["egress_proxied"] != "false" || report.Egress.ProfileID != request.Egress.ID || report.Egress.Proxied {
+		t.Fatalf("egress facts = %#v/%#v", queryResult.ProviderState, report.Egress)
+	}
+	assertProbeCheck(t, report.Checks, egress.LayerDNS, egress.SubjectTarget, egress.CheckPassed, "")
+	assertProbeCheck(t, report.Checks, egress.LayerTCP, egress.SubjectTarget, egress.CheckPassed, "")
+	assertProbeCheck(t, report.Checks, egress.LayerProxyConnect, egress.SubjectTarget, egress.CheckNotRun, "not_required")
+	assertProbeCheck(t, report.Checks, egress.LayerTLS, egress.SubjectTarget, egress.CheckNotRun, "not_required")
+	assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckPassed, "")
+	assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckPassed, "")
+}
+
+func TestEnvironmentEgressUsesCurrentProcessDecision(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer server.Close()
+	request := feedRequestFixture(server.URL)
+	request.Egress = testEgressProfile("egress_environment", core.EgressModeEnvironment, "", "", "")
+	result := (FeedAdapter{}).Execute(context.Background(), request)
+	if len(result.Errors) != 0 || requests.Load() != 1 || result.ProviderState["egress_mode"] != "environment" || result.ProviderState["egress_proxied"] != "false" {
+		t.Fatalf("environment result = %#v, requests=%d", result, requests.Load())
+	}
+}
+
+func TestEnvironmentEgressReportsActualProxyDecision(t *testing.T) {
+	const helperFlag = "OMNIHUB_ENV_PROXY_HELPER"
+	if os.Getenv(helperFlag) == "1" {
+		request := feedRequestFixture("http://example.com/feed")
+		request.Egress = testEgressProfile("egress_environment", core.EgressModeEnvironment, "", "", "")
+		result := (FeedAdapter{}).Execute(context.Background(), request)
+		if len(result.Errors) != 0 || len(result.Items) != 1 || result.ProviderState["egress_proxied"] != "true" {
+			t.Fatalf("environment proxy result = %#v", result)
+		}
+		return
+	}
+
+	var proxyRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		proxyRequests.Add(1)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://example.com")))
+	}))
+	defer proxy.Close()
+	command := exec.Command(os.Args[0], "-test.run=^TestEnvironmentEgressReportsActualProxyDecision$", "-test.v")
+	command.Env = append(os.Environ(), helperFlag+"=1", "HTTP_PROXY="+proxy.URL, "HTTPS_PROXY="+proxy.URL, "NO_PROXY=")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("environment proxy helper failed: %v\n%s", err, output)
+	}
+	if proxyRequests.Load() != 1 {
+		t.Fatalf("environment proxy requests = %d\n%s", proxyRequests.Load(), output)
+	}
+}
+
+func TestFeedProbeLocatesTLSHTTPAndParseFailures(t *testing.T) {
+	direct := testEgressProfile("egress_direct", core.EgressModeDirect, "", "", "")
+
+	t.Run("tls", func(t *testing.T) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte(rssFeedFixture("https://" + request.Host)))
+		}))
+		defer server.Close()
+		request := feedRequestFixture(server.URL)
+		request.Egress = direct
+		report := (FeedAdapter{}).Probe(context.Background(), request)
+		assertProbeCheck(t, report.Checks, egress.LayerTLS, egress.SubjectTarget, egress.CheckFailed, "certificate_invalid")
+		assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+		assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+	})
+
+	t.Run("http", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusForbidden) }))
+		defer server.Close()
+		request := feedRequestFixture(server.URL)
+		request.Egress = direct
+		report := (FeedAdapter{}).Probe(context.Background(), request)
+		assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckFailed, "http_forbidden")
+		assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+	})
+
+	t.Run("feed parse", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/rss+xml")
+			_, _ = writer.Write([]byte("not a feed"))
+		}))
+		defer server.Close()
+		request := feedRequestFixture(server.URL)
+		request.Egress = direct
+		report := (FeedAdapter{}).Probe(context.Background(), request)
+		assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckPassed, "")
+		assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckFailed, "invalid_feed")
+	})
+}
+
+func TestFeedProbeReportsHTTPConnect407AndStopsDownstream(t *testing.T) {
+	var requests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Method != http.MethodConnect {
+			t.Errorf("proxy method = %s", request.Method)
+		}
+		writer.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer proxy.Close()
+
+	request := feedRequestFixture("https://example.invalid/feed")
+	request.Egress = testEgressProfile("egress_http", core.EgressModeHTTPProxy, proxy.URL, "", "")
+	report := (FeedAdapter{}).Probe(context.Background(), request)
+	if requests.Load() != 1 || !report.Egress.Proxied {
+		t.Fatalf("proxy requests/egress = %d/%#v", requests.Load(), report.Egress)
+	}
+	assertProbeCheck(t, report.Checks, egress.LayerDNS, egress.SubjectTarget, egress.CheckNotRun, "delegated_to_egress")
+	assertProbeCheck(t, report.Checks, egress.LayerProxyConnect, egress.SubjectTarget, egress.CheckFailed, "proxy_auth_required")
+	assertProbeCheck(t, report.Checks, egress.LayerTLS, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+	assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+	assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckNotRun, "prerequisite_failed")
+	assertNoRSSHubAccessMaterial(t, report, proxy.URL)
+}
+
+func TestSOCKS5DNSModeControlsTargetAddress(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		dnsMode core.Socks5DNSMode
+		wantDNS egress.CheckStatus
+		wantIP  bool
+	}{
+		{name: "local", dnsMode: core.Socks5DNSLocal, wantDNS: egress.CheckPassed, wantIP: true},
+		{name: "proxy", dnsMode: core.Socks5DNSProxy, wantDNS: egress.CheckNotRun, wantIP: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var originRequests atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				originRequests.Add(1)
+				writer.Header().Set("Content-Type", "application/rss+xml")
+				_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+			}))
+			defer origin.Close()
+			proxyEndpoint, targets, stop := startSOCKS5Recorder(t)
+			defer stop()
+			proxyEndpoint = strings.Replace(proxyEndpoint, "127.0.0.1", "localhost", 1)
+			request := feedRequestFixture(strings.Replace(origin.URL, "127.0.0.1", "localhost", 1))
+			request.Egress = testEgressProfile("egress_socks_"+test.name, core.EgressModeSOCKS5, proxyEndpoint, "", test.dnsMode)
+			report := (FeedAdapter{}).Probe(context.Background(), request)
+			if len(report.Result.Errors) != 0 || originRequests.Load() != 1 || !report.Egress.Proxied {
+				t.Fatalf("SOCKS result = %#v, requests=%d", report, originRequests.Load())
+			}
+			var target string
+			select {
+			case target = <-targets:
+			case <-time.After(2 * time.Second):
+				t.Fatal("SOCKS5 fixture did not receive target")
+			}
+			if gotIP := net.ParseIP(target) != nil; gotIP != test.wantIP {
+				t.Fatalf("SOCKS target = %q, wantIP=%v", target, test.wantIP)
+			}
+			check := assertProbeCheck(t, report.Checks, egress.LayerDNS, egress.SubjectTarget, test.wantDNS, "")
+			if test.dnsMode == core.Socks5DNSProxy && check.Reason != "delegated_to_egress" {
+				t.Fatalf("proxy DNS reason = %q", check.Reason)
+			}
+			assertProbeCheck(t, report.Checks, egress.LayerHTTP, egress.SubjectTarget, egress.CheckPassed, "")
+			assertProbeCheck(t, report.Checks, egress.LayerFeedParse, egress.SubjectTarget, egress.CheckPassed, "")
+			proxyDNS := assertProbeCheck(t, report.Checks, egress.LayerDNS, egress.SubjectProxy, egress.CheckPassed, "")
+			proxyTCP := assertProbeCheck(t, report.Checks, egress.LayerTCP, egress.SubjectProxy, egress.CheckPassed, "")
+			if len(proxyDNS.ResolvedIPs) == 0 || proxyTCP.Address == "" {
+				t.Fatalf("SOCKS proxy trace facts = %#v/%#v", proxyDNS, proxyTCP)
+			}
+			assertProbeCheck(t, report.Checks, egress.LayerProxyConnect, egress.SubjectTarget, egress.CheckPassed, "")
+		})
+	}
+}
+
+func TestHTTPProxyCacheFactsPartitionAndRedact(t *testing.T) {
+	const credentialValue = "proxy-user:proxy-pass"
+	var originRequests, proxyRequests atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		originRequests.Add(1)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		writer.Header().Set("Cache-Control", "max-age=3600")
+		_, _ = writer.Write([]byte(rssFeedFixture("http://" + request.Host)))
+	}))
+	defer origin.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		proxyRequests.Add(1)
+		authRequest := request.Clone(request.Context())
+		authRequest.Header = request.Header.Clone()
+		authRequest.Header.Set("Authorization", request.Header.Get("Proxy-Authorization"))
+		if user, password, ok := authRequest.BasicAuth(); !ok || user != "proxy-user" || password != "proxy-pass" {
+			t.Errorf("proxy auth = %q/%q/%v", user, password, ok)
+		}
+		outbound := request.Clone(request.Context())
+		outbound.RequestURI = ""
+		outbound.Header = request.Header.Clone()
+		outbound.Header.Del("Proxy-Authorization")
+		response, err := (&http.Transport{Proxy: nil}).RoundTrip(outbound)
+		if err != nil {
+			http.Error(writer, "upstream failed", http.StatusBadGateway)
+			return
+		}
+		defer response.Body.Close()
+		for key, values := range response.Header {
+			writer.Header()[key] = append([]string(nil), values...)
+		}
+		writer.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(writer, response.Body)
+	}))
+	defer proxy.Close()
+
+	credential := &core.Credential{ID: "credential_proxy", Provider: "egress", AuthKind: "basic", Value: stringPointer(credentialValue), Enabled: true, Revision: 1}
+	request := feedRequestFixture(origin.URL)
+	request.Egress = testEgressProfile("egress_http", core.EgressModeHTTPProxy, proxy.URL, credential.ID, "")
+	request.EgressCredential = credential
+	adapter := FeedAdapter{Cache: NewMemoryFeedCache(), Now: func() time.Time { return time.Date(2026, 8, 14, 2, 0, 0, 0, time.UTC) }}
+	first := adapter.Execute(context.Background(), request)
+	cacheHit := adapter.Execute(context.Background(), request)
+	request.Egress.Revision++
+	revisionMiss := adapter.Execute(context.Background(), request)
+	request.EgressCredential = &core.Credential{ID: credential.ID, Provider: credential.Provider, AuthKind: credential.AuthKind, Value: credential.Value, Enabled: true, Revision: 2}
+	credentialMiss := adapter.Execute(context.Background(), request)
+	if len(first.Errors) != 0 || len(cacheHit.Errors) != 0 || len(revisionMiss.Errors) != 0 || len(credentialMiss.Errors) != 0 || originRequests.Load() != 3 || proxyRequests.Load() != 3 {
+		t.Fatalf("proxy cache results=%#v/%#v/%#v/%#v requests=%d/%d", first, cacheHit, revisionMiss, credentialMiss, originRequests.Load(), proxyRequests.Load())
+	}
+	if first.ProviderState["egress_proxied"] != "true" || cacheHit.ProviderState["egress_proxied"] != "false" || revisionMiss.ProviderState["egress_proxied"] != "true" || credentialMiss.ProviderState["egress_proxied"] != "true" {
+		t.Fatalf("proxy facts=%#v/%#v/%#v/%#v", first.ProviderState, cacheHit.ProviderState, revisionMiss.ProviderState, credentialMiss.ProviderState)
+	}
+	assertNoRSSHubAccessMaterial(t, []any{first, cacheHit, revisionMiss, credentialMiss}, credentialValue, proxy.URL, "cHJveHktdXNlcjpwcm94eS1wYXNz")
+}
+
+func TestRSSHubCredentialRejectsCleartextProxyBeforeNetwork(t *testing.T) {
+	const accessKey = "rsshub-cleartext-key"
+	var endpointRequests, proxyRequests atomic.Int32
+	endpoint := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { endpointRequests.Add(1) }))
+	defer endpoint.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { proxyRequests.Add(1) }))
+	defer proxy.Close()
+
+	request := rssHubCredentialRequest(endpoint.URL+"/base", "/v2ex/topics/latest", accessKey, 1)
+	request.Egress = testEgressProfile("egress_http", core.EgressModeHTTPProxy, proxy.URL, "", "")
+	request.Endpoint.EgressProfileID = request.Egress.ID
+	result := (RSSHubAdapter{}).Execute(context.Background(), request)
+	assertRSSHubError(t, result, core.ErrorConfig)
+	if endpointRequests.Load() != 0 || proxyRequests.Load() != 0 || result.ProviderState["egress_proxied"] != "false" || result.ProviderState["auth_used"] != "" {
+		t.Fatalf("cleartext proxy = %#v requests=%d/%d", result, endpointRequests.Load(), proxyRequests.Load())
+	}
+	assertNoRSSHubAccessMaterial(t, result, accessKey, proxy.URL)
+}
+
+func TestRSSHubCredentialRejectsRemoteCleartextDirect(t *testing.T) {
+	for _, baseURL := range []string{"http://192.0.2.1/base", "http://localhost:1200/base"} {
+		request := rssHubCredentialRequest(baseURL, "/v2ex/topics/latest", "remote-cleartext-key", 1)
+		request.Egress = testEgressProfile("egress_direct", core.EgressModeDirect, "", "", "")
+		request.Endpoint.EgressProfileID = request.Egress.ID
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		result := (RSSHubAdapter{}).Execute(ctx, request)
+		cancel()
+		assertRSSHubError(t, result, core.ErrorConfig)
+		if result.ProviderState["auth_used"] != "" || result.ProviderState["egress_proxied"] != "false" {
+			t.Fatalf("remote cleartext result = %#v", result)
+		}
+		report := (RSSHubAdapter{}).Probe(context.Background(), request)
+		if report.Endpoint.Error == nil || report.Endpoint.Error.Code != core.ErrorConfig || report.Metadata.Error == nil || report.Metadata.Error.Code != core.ErrorConfig || report.Feed.Error == nil || report.Feed.Error.Code != core.ErrorConfig {
+			t.Fatalf("remote cleartext probe = %#v", report)
+		}
+	}
+}
+
+func TestRSSHubCredentialSignsThroughExplicitHTTPSProxy(t *testing.T) {
+	const (
+		helperFlag = "OMNIHUB_PROXY_SIGNING_HELPER"
+		accessKey  = "rsshub-explicit-proxy-key"
+	)
+	if os.Getenv(helperFlag) == "1" {
+		rootPEM, err := os.ReadFile(os.Getenv("SSL_CERT_FILE"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(rootPEM) {
+			t.Fatal("fixture root certificate is invalid")
+		}
+		x509.SetFallbackRoots(roots)
+		request := rssHubCredentialRequest(os.Getenv("OMNIHUB_PROXY_TARGET")+"/base", "/v2ex/topics/latest", accessKey, 1)
+		request.Egress = testEgressProfile("egress_http", core.EgressModeHTTPProxy, os.Getenv("OMNIHUB_PROXY_ENDPOINT"), "", "")
+		request.Endpoint.EgressProfileID = request.Egress.ID
+		result := (RSSHubAdapter{}).Execute(context.Background(), request)
+		if len(result.Errors) != 0 || len(result.Items) != 1 || result.ProviderState["auth_used"] != "true" || result.ProviderState["egress_proxied"] != "true" {
+			t.Fatalf("proxied RSSHub result = %#v", result)
+		}
+		assertNoRSSHubAccessMaterial(t, result, accessKey, os.Getenv("OMNIHUB_PROXY_ENDPOINT"))
+		return
+	}
+
+	var targetRequests atomic.Int32
+	target, rootCertificate := newTrustedTLSServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetRequests.Add(1)
+		if request.URL.Query().Get("code") != rssHubAccessCode(request.URL.EscapedPath(), accessKey) {
+			t.Errorf("signed query = %q", request.URL.RawQuery)
+		}
+		assertNoInheritedRSSHubAuth(t, request)
+		writer.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = writer.Write([]byte(rssFeedFixture("https://example.com")))
+	}))
+	defer target.Close()
+
+	proxyEndpoint, proxyRequests, stopProxy := startHTTPConnectTunnel(t, target.Listener.Addr().String())
+	defer stopProxy()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootCertificate})
+	certificatePath := filepath.Join(t.TempDir(), "fixture-ca.pem")
+	if err := os.WriteFile(certificatePath, certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	targetPort := target.Listener.Addr().(*net.TCPAddr).Port
+	command := exec.Command(os.Args[0], "-test.run=^TestRSSHubCredentialSignsThroughExplicitHTTPSProxy$", "-test.v")
+	command.Env = append(os.Environ(),
+		helperFlag+"=1",
+		"OMNIHUB_PROXY_TARGET=https://example.com:"+strconv.Itoa(targetPort),
+		"OMNIHUB_PROXY_ENDPOINT="+proxyEndpoint,
+		"SSL_CERT_FILE="+certificatePath,
+		"GODEBUG=x509usefallbackroots=1",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("proxy signing helper failed: %v\n%s", err, output)
+	}
+	if targetRequests.Load() != 1 || proxyRequests.Load() != 1 {
+		t.Fatalf("proxied signing requests = target:%d proxy:%d\n%s", targetRequests.Load(), proxyRequests.Load(), output)
+	}
+}
+
+func testEgressProfile(id string, mode core.EgressMode, endpoint, credentialID string, dnsMode core.Socks5DNSMode) core.EgressProfile {
+	return core.EgressProfile{ID: id, Mode: mode, ProxyEndpoint: endpoint, CredentialID: credentialID, Socks5DNS: dnsMode, Enabled: true, Revision: 1}
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func assertProbeCheck(t *testing.T, checks []egress.Check, layer egress.Layer, subject egress.Subject, status egress.CheckStatus, reason string) egress.Check {
+	t.Helper()
+	for _, check := range checks {
+		if check.Layer != layer || check.Subject != subject {
+			continue
+		}
+		if check.Status != status || reason != "" && check.Reason != reason {
+			t.Fatalf("probe check %s/%s = %#v, want status=%s reason=%q", layer, subject, check, status, reason)
+		}
+		return check
+	}
+	t.Fatalf("probe check %s/%s is absent: %#v", layer, subject, checks)
+	return egress.Check{}
+}
+
+func startSOCKS5Recorder(t *testing.T) (string, <-chan string, func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := make(chan string, 8)
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				close(done)
+				return
+			}
+			go recordSOCKS5Target(connection, targets)
+		}
+	}()
+	stop := func() {
+		once.Do(func() {
+			_ = listener.Close()
+			<-done
+		})
+	}
+	return "socks5://" + listener.Addr().String(), targets, stop
+}
+
+func startHTTPConnectTunnel(t *testing.T, upstreamAddress string) (string, *atomic.Int32, func()) {
+	t.Helper()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Method != http.MethodConnect {
+			http.Error(writer, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", upstreamAddress)
+		if err != nil {
+			http.Error(writer, "upstream unavailable", http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		hijacker, ok := writer.(http.Hijacker)
+		if !ok {
+			http.Error(writer, "hijacking unavailable", http.StatusInternalServerError)
+			return
+		}
+		client, buffered, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		copyDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			_ = upstream.(*net.TCPConn).CloseWrite()
+			close(copyDone)
+		}()
+		_, _ = io.Copy(client, upstream)
+		<-copyDone
+	}))
+	return server.URL, &requests, server.Close
+}
+
+func newTrustedTLSServer(t *testing.T, handler http.Handler) (*httptest.Server, []byte) {
+	t.Helper()
+	now := time.Now()
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "OmniHub fixture root"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "example.com"}, DNSNames: []string{"example.com"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootTemplate, &leafKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := tls.Certificate{Certificate: [][]byte{leafDER, rootDER}, PrivateKey: leafKey}
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	return server, rootDER
+}
+
+func recordSOCKS5Target(connection net.Conn, targets chan<- string) {
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	reader := bufio.NewReader(connection)
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(reader, header); err != nil || header[0] != 5 {
+		return
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(reader, methods); err != nil {
+		return
+	}
+	if _, err := connection.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	request := make([]byte, 4)
+	if _, err := io.ReadFull(reader, request); err != nil || request[0] != 5 || request[1] != 1 {
+		return
+	}
+	var host string
+	switch request[3] {
+	case 1:
+		value := make([]byte, net.IPv4len)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return
+		}
+		host = net.IP(value).String()
+	case 3:
+		length, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		value := make([]byte, int(length))
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return
+		}
+		host = string(value)
+	case 4:
+		value := make([]byte, net.IPv6len)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return
+		}
+		host = net.IP(value).String()
+	default:
+		return
+	}
+	port := make([]byte, 2)
+	if _, err := io.ReadFull(reader, port); err != nil {
+		return
+	}
+	targets <- host
+	upstream, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port[0])<<8|int(port[1]))))
+	if err != nil {
+		_, _ = connection.Write([]byte{5, 5, 0, 1, 127, 0, 0, 1, 0, 0})
+		return
+	}
+	defer upstream.Close()
+	if _, err := connection.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); err != nil {
+		return
+	}
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(upstream, reader)
+		_ = upstream.(*net.TCPConn).CloseWrite()
+		close(copyDone)
+	}()
+	_, _ = io.Copy(connection, upstream)
+	<-copyDone
+}
+
 func rssHubCredentialRequest(baseURL, routePath, accessKey string, revision int64) RSSHubRequest {
+	egressProfile := testEgressProfile("egress_direct_fixture", core.EgressModeDirect, "", "", "")
 	template := core.RouteTemplate{
 		RouteTemplateID: "rsshub_fixture", Provider: "rsshub", Adapter: "rsshub", EndpointRequired: true,
 		ParametersSchema: map[string]any{"type": "object", "additionalProperties": false, "required": []any{"path"}, "properties": map[string]any{"path": map[string]any{"type": "string"}}},
@@ -912,11 +1474,12 @@ func rssHubCredentialRequest(baseURL, routePath, accessKey string, revision int6
 		},
 		RouteTemplate: template,
 		Endpoint: core.EndpointProfile{
-			ID: "endpoint_rsshub_fixture", Provider: "rsshub", BaseURL: baseURL, Enabled: true, Revision: 1,
+			ID: "endpoint_rsshub_fixture", Provider: "rsshub", BaseURL: baseURL, EgressProfileID: egressProfile.ID, Enabled: true, Revision: 1,
 		},
 		Credential: &core.Credential{
 			ID: credentialID, Provider: "rsshub", AuthKind: "api_key", Value: &accessKey, Enabled: true, Revision: revision,
 		},
+		Egress: egressProfile,
 	}
 }
 
@@ -1007,6 +1570,7 @@ func feedRequestFixture(rawURL string) FeedRequest {
 			Enabled:         true,
 		},
 		RouteTemplate: core.RouteTemplate{RouteTemplateID: "direct-feed-window", Provider: "direct-feed", Adapter: "feed"},
+		Egress:        testEgressProfile("egress_direct_fixture", core.EgressModeDirect, "", "", ""),
 	}
 }
 

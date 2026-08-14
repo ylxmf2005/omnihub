@@ -2,14 +2,14 @@
 
 把多来源信息接入统一成 Agent 与应用可复用、可追溯的搜索合同。
 
-> Stage 3 已完成实现、E2E、质量闸与独立复核：Stage 2 的统一模型、Registry/Router、SQLite 配置、Direct RSS/Atom/JSON Feed 查询、条件缓存、Channel 管理与 OPML 保持稳定；新增了用户自管 RSSHub Endpoint/Channel、分层 Probe、统一 Query/fallback，以及受限的 access-key 请求传输。GitHub、Tavily、X、HTTP/MCP/Skill 与 Dashboard 仍属于后续阶段。
+> Stage A 已完成可信出站纵切：Direct Feed 与 RSSHub 都必须显式绑定 `EgressProfile`，支持 `direct`、`environment`、HTTP proxy 与 SOCKS5（local/proxy DNS）；主动 Channel Probe 会按真实拓扑报告 DNS、TCP、proxy connect、TLS、HTTP 与 Feed parse。普通 Query 复用相同出口，但不会额外执行 Probe。GitHub、Tavily、X、HTTP/MCP/Skill 与 Dashboard 仍属于后续阶段。
 
 ```text
 一次性 Feed URL / Direct Channel ── Feed Adapter ─┐
-                                                  ├─ Query → Normalize / exact identity → Envelope JSON
+                                                  ├─ EgressProfile ─ Query / Probe ─ Envelope JSON
 RSSHub Channel ─ Router ─ RSSHub Adapter ─────────┘
                       │
-             user-owned Endpoint + 分层 Probe
+              user-owned Endpoint
 ```
 
 ## 快速开始
@@ -25,6 +25,7 @@ go build -o omnihub ./cmd/omnihub
 ./omnihub latest \
   --feed-url https://www.v2ex.com/index.xml \
   --source v2ex \
+  --egress-mode direct \
   --limit 10
 ```
 
@@ -40,6 +41,7 @@ go build -o omnihub ./cmd/omnihub
 ./omnihub latest \
   --feed-url https://example.com/feed.xml \
   --source example \
+  --egress-mode direct \
   --limit 20 \
   --identity-dedupe exact \
   --deadline-ms 30000
@@ -51,6 +53,7 @@ go build -o omnihub ./cmd/omnihub
 ./omnihub search \
   --feed-url https://example.com/feed.xml \
   --source example \
+  --egress-mode environment \
   --query "agent infrastructure" \
   --from 2026-08-01T00:00:00Z \
   --to 2026-08-14T23:59:59Z \
@@ -61,7 +64,19 @@ go build -o omnihub ./cmd/omnihub
 
 ### 保存为 Channel
 
-需要复用的订阅可以写入 SQLite：
+需要复用的订阅先保存出口，再写入 SQLite：
+
+```bash
+./omnihub egress-profiles apply <<'JSON'
+{
+  "id": "egress_direct",
+  "display_name": "Direct",
+  "mode": "direct",
+  "enabled": true,
+  "expected_revision": 0
+}
+JSON
+```
 
 ```bash
 ./omnihub channels apply <<'JSON'
@@ -69,6 +84,7 @@ go build -o omnihub ./cmd/omnihub
   "source_id": "example",
   "source_display_name": "Example",
   "channel_display_name": "Example Feed",
+  "egress_profile_id": "egress_direct",
   "url": "https://example.com/feed.xml",
   "priority": 100,
   "expected_revision": 0
@@ -102,11 +118,24 @@ JSON
 ### OPML
 
 ```bash
-./omnihub opml import < subscriptions.opml
+./omnihub opml import --egress-profile egress_direct < subscriptions.opml
 ./omnihub opml export > subscriptions.opml
 ```
 
-Import 是非破坏性 merge，不把文档中缺失的订阅解释为退订；重复 URL 复用同一个 Direct Feed Channel，同一 Channel 可以属于多个 Collection。标准 Feed metadata、Collection 层级与 membership 可以回导。OPML 不承载 priority、enabled、RouteTemplate、fallback、Endpoint 或 Credential 等本地执行策略；`include`/`link` 不会被执行，未知 attribute 会在脱敏报告中说明后忽略。
+Import 是非破坏性 merge，不把文档中缺失的订阅解释为退订；新 Channel 使用命令显式选择的 EgressProfile，已有 Channel 的出口保持不变。重复 URL 复用同一个 Direct Feed Channel，同一 Channel 可以属于多个 Collection。标准 Feed metadata、Collection 层级与 membership 可以回导。OPML 不承载 priority、enabled、RouteTemplate、fallback、Endpoint、EgressProfile 或 Credential 等本地执行策略；`include`/`link` 不会被执行，未知 attribute 会在脱敏报告中说明后忽略。
+
+### 出口与分层 Probe（Stage A）
+
+`EgressProfile` 是用户管理的出站资源。`environment` 只遵循 Go 的 `HTTP_PROXY`、`HTTPS_PROXY` 与 `NO_PROXY`，不冒充 macOS System Proxy/PAC；HTTP proxy 只接受 `http://host:port`，SOCKS5 还必须选择 `local` 或 `proxy` DNS。代理 Basic Credential 使用 `provider=egress`、`auth_kind=basic`，值格式为 `username:password`，列表只返回掩码。
+
+Endpoint-backed Channel 从 Endpoint 继承固定出口；无 Endpoint 的 Direct Feed Channel 直接绑定出口。Operation 和 Probe 都不能覆盖。缺绑定、Profile 禁用、代理 Credential 不可用或 Endpoint/Channel 双绑定冲突会在发网前失败；OmniHub 不会偷偷直连、切公共 DoH/代理或关闭 TLS。
+
+```bash
+./omnihub egress-profiles
+./omnihub channels probe CHANNEL_ID
+```
+
+Probe 是一条主动、无缓存的真实请求。Direct 会观察 target DNS/TCP；HTTP CONNECT 会先观察 proxy DNS/TCP/CONNECT；SOCKS5 proxy DNS 会明确把 target DNS 标成 `not_run/delegated_to_egress`。前置层失败后，依赖层统一为 `not_run/prerequisite_failed`。普通 `latest/search` 不支付这条诊断链的额外请求成本。
 
 ### RSSHub Endpoint 与 Channel（Stage 3）
 
@@ -124,7 +153,7 @@ Endpoint Probe 只检查实例 health；Channel Probe 分开报告 Endpoint、Ro
 
 API key 可以按本地 MVP 方案保存，并通过 `credentials` 查看掩码摘要。引用 Credential 的 RSSHub 请求只向 Channel 显式 Endpoint 发出：按实际 URL pathname（包含 Endpoint base path，不含 query）计算 `code=md5(pathname+accessKey)`；同 origin 且仍位于分段 base-path 内的 redirect 会先清除旧 `key/code`，再按新 pathname 重签。跨 origin、越界、编码 traversal、double slash 与认证 Feed 的 HTML alternate discovery 都在下一跳发网前失败。
 
-Stage 3 尚无 EgressProfile，认证链只使用 OmniHub 自建的受信任 transport，绝不继承外部注入的 `http.Transport`、DialContext/DialTLS、TLS 或 protocol 设置；发现外部 transport 即在发网前返回 `config_error`。proxy resolver 在签名前只读取已经清除 `key/code` 和受限 headers 的 request clone；若解析结果会命中 proxy，则 Endpoint 与 proxy 都不会收到网络请求。只有确认不命中 proxy 后，才向真正的网络请求注入 code 并直连。原 key 和派生 code 因而也不会暴露给 proxy resolver、Catalog、cache、日志、Error、Envelope 或 Probe。
+Stage A 后认证链只接受 Endpoint 固定绑定的 EgressProfile，实际 transport 全部由 OmniHub 构造，不接受调用方注入的 `http.Client`、DialContext/DialTLS、TLS 或 protocol 设置。带 access key 的明文 RSSHub 只允许 literal loopback 且必须直连；非 loopback HTTP 或任何明文代理路径都在签名前失败。原 key、派生 code 与代理密码不会进入代理 URL、Catalog、cache、日志、Error、Envelope 或 Probe。
 
 Endpoint Probe 始终匿名，因此受保护实例可如实返回 `403/auth_error`；Channel Probe 使用 Channel Credential 分别检查 health、Route metadata 与实际 Feed。`auth.used` 只在带签名的 RoundTrip 已取得 response 时为 `true`；无 response 或 cache hit 都保守为 `false`。
 
@@ -136,6 +165,7 @@ Endpoint Probe 始终匿名，因此受保护实例可如实返回 `403/auth_err
 ./omnihub sources
 ./omnihub providers
 ./omnihub route-templates
+./omnihub egress-profiles
 ./omnihub channels
 ./omnihub doctor --json
 ```
@@ -178,7 +208,7 @@ Registry 按以下顺序装配：
 
 1. 二进制内建的 Source、Provider 与只读 RouteTemplate；
 2. 配置目录中可选的严格 `sources.yaml` Source Bundle；
-3. SQLite 中 user-owned Source、Channel、EndpointProfile、Collection、overlay 与 Credential。
+3. SQLite 中 user-owned Source、Channel、EndpointProfile、EgressProfile、Collection、overlay 与 Credential。
 
 内建的 `github`、`linux.do`、`nodeseek`、`v2ex` 与 `x` 只是 Source 声明，不表示本机已经配置 Channel，更不表示所有上游当前可用。`direct-feed-window` 可以服务任意用户注册的 Source；示例 Feed 不会因为安装二进制就自动变成订阅。
 
@@ -190,7 +220,7 @@ Registry 按以下顺序装配：
 | `OMNIHUB_DATABASE` | 用户 SQLite 文件路径 |
 | `OMNIHUB_CACHE_DIR` | Direct Feed 条件响应缓存目录 |
 
-不存在数据库时，catalog、doctor、plan 和 OPML export 不会创建数据库或目录。一次性 Feed 查询只有成功取得可缓存响应后才会创建 cache，不会隐式创建 SQLite。
+不存在数据库时，catalog、doctor、plan 和 OPML export 不会创建数据库或目录。一次性 Feed 必须显式选择 `direct|environment`，只在成功取得可缓存响应后创建 cache，不会隐式创建 SQLite。
 
 Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 credential query/fragment key。API Key/Token 按已确认的本地 MVP 方案只允许保存在 SQLite Credential 表；不会旁路进入 RoutingCatalog、cache key、ImportReport 或 OPML。Cookie 仍不落 SQLite。
 
@@ -212,9 +242,11 @@ Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 cr
 - V2EX `https://www.v2ex.com/index.xml` 实际 examined 50、返回 3 条；linux.do `https://linux.do/latest.rss` 实际 examined 30、返回 3 条。两者都因 Feed window/全局 limit 如实标记 `partial`，不是全站 exhaustive。
 - NodeSeek 的 `/rss.xml`、`/latest.rss` 和第三方 `rss.nodeseek.com` 在同一环境均返回 retryable `network_error`；因此内建 Source 仍只是声明，不标记 runtime ready。
 
-这些是一次验收窗口，不是可用性监控或长期 SLA。Stage 2 的完整证据保留在对应提交历史；当前 [Test Report](test/test-report.md) 记录 Stage 3 的真实 CLI、SQLite、loopback 与质量闸。
+这些是一次验收窗口，不是可用性监控或长期 SLA。Stage 2 的完整证据保留在对应提交历史；当前 [Test Report](test/test-report.md) 记录 Stage A 的真实 CLI、SQLite、loopback 与质量闸。
 
 同日的 Stage 3 当前对象验收进一步确认：Endpoint revision 4 的受保护 Endpoint 匿名 Probe exit 5、`403/auth_error`；带 Credential revision 3（v1）的 Channel Probe exit 0，health、Route metadata、Feed 三层均为 200，`route_found/feed_parsed=true` 并成为 `ready`。首次 Query 使 fixture log 4→5，exit 0、Envelope 为 `partial`、返回 1 Item 且 `auth.used=true`；同请求 cache hit 保持 5→5 且 `auth.used=false`。Credential revision 3→4（v2）后再次 Query 使日志 5→6、`auth.used=true`。隐式 proxy 负例中 proxy callback 恰好 1 次但看不到 access material，Endpoint/proxy 网络请求均为 0；外部 transport 负例的 custom DialContext 调用为 0，均返回 `config_error`、`auth.used=false`。Catalog、cache、CLI 输出与请求日志全文扫描均未出现原 key、`key=` 或 `code=`；全量 Go test/race/vet、四平台构建、Schema 与 `git diff --check` 均 exit 0。最终独立全链复核结论为 `approve`，无未解决 P0–P2。详见同一 [Test Report](test/test-report.md)。
+
+Stage A 当前对象又确认：四种 Egress mode 的配置与实际 transport fixture 均通过；Direct Channel Probe 按 IP literal→TCP→HTTP→Feed parse 成功，普通 CLI Query 没有额外 Probe 请求。不可达 HTTP/SOCKS 代理分别停在 proxy TCP/handshake，target HTTP 与 Feed parse 为 `not_run` 且目标零请求；CONNECT 407、SOCKS local/proxy DNS、TLS 证书、HTTP 403 与坏 Feed 也各有分层回归。一次性 Feed 缺 `--egress-mode`、OPML 缺出口参数与未知 Profile 分别返回 exit 3/3/4。缺 Egress 的 Feed/RSSHub Execute/Probe 在真实网络边界前返回 `config_error`；代理凭据、地址、RSSHub key/code 在公共输出面保持脱敏。完整命令与证据见当前 [Test Report](test/test-report.md)。
 
 ## 当前边界
 
@@ -224,7 +256,8 @@ Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 cr
 - GitHub、Tavily、X 等非 Feed Provider；
 - `fetch` 上游执行、HTTP API、MCP Server、JSONL、Feed 分发与 Agent Skill；
 - View/Subscription Plane、Run refresh、Dashboard Backend、Chrome Native Messaging Bridge 与前端；
-- Cookie transport，以及显式 EgressProfile、代理和 DNS→TCP→TLS→HTTP→Feed parse 主动诊断；这些属于后续独立阶段，不是 Stage 3 已交付能力；
+- Cookie transport；
+- macOS System Proxy/PAC、VPN/TUN、公共代理池、隐式 fallback 或自动“最快线路”；
 - embedding/向量数据库/Ollama similarity grouping；
 - MySQL Store、多实例运行、Linux/Windows 运行验证与 Windows 当前用户 ACL。
 

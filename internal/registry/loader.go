@@ -117,7 +117,7 @@ func Load(ctx context.Context, store catalogStore, importedBundlePath string) (*
 			sources = append(sources, cloneSource(source))
 		}
 	}
-	catalog, err := NewCatalog(sources, providers, templates, routing.Channels, routing.Endpoints, credentials, routing.Collections, routing.Overlays)
+	catalog, err := NewCatalog(sources, providers, templates, routing.Channels, routing.Endpoints, routing.EgressProfiles, credentials, routing.Collections, routing.Overlays)
 	if err != nil {
 		return nil, fmt.Errorf("assemble registry: %w", err)
 	}

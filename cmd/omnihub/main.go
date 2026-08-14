@@ -31,6 +31,9 @@ const usage = `usage:
   omnihub sources
   omnihub providers
   omnihub route-templates
+  omnihub egress-profiles
+  omnihub egress-profiles apply < egress-profile.json
+  omnihub egress-profiles disable ID --revision N
   omnihub endpoints
   omnihub endpoints apply < endpoint.json
   omnihub endpoints disable ID --revision N
@@ -42,14 +45,14 @@ const usage = `usage:
   omnihub channels apply-rsshub < rsshub-channel.json
   omnihub channels disable ID --revision N
   omnihub channels probe ID
-  omnihub opml import < subscriptions.opml
+  omnihub opml import --egress-profile ID < subscriptions.opml
   omnihub opml export > subscriptions.opml
   omnihub doctor --json
   omnihub plan < operation.json
   omnihub latest < latest.json
   omnihub search < search.json
-  omnihub latest --feed-url URL --source ID [--limit N] [--format json]
-  omnihub search --feed-url URL --source ID --query QUERY [--limit N] [--format json]
+  omnihub latest --feed-url URL --source ID --egress-mode direct|environment [--limit N] [--format json]
+  omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json]
 
 plan only selects declared channels; it never executes an upstream request.
 `
@@ -62,13 +65,14 @@ const (
 )
 
 type catalogOutput struct {
-	SchemaVersion  string                    `json:"schema_version"`
-	Sources        *[]core.Source            `json:"sources,omitempty"`
-	Providers      *[]core.Provider          `json:"providers,omitempty"`
-	RouteTemplates *[]core.RouteTemplate     `json:"route_templates,omitempty"`
-	Endpoints      *[]core.EndpointProfile   `json:"endpoints,omitempty"`
-	Credentials    *[]core.CredentialSummary `json:"credentials,omitempty"`
-	Channels       *[]core.Channel           `json:"channels,omitempty"`
+	SchemaVersion  string                       `json:"schema_version"`
+	Sources        *[]core.Source               `json:"sources,omitempty"`
+	Providers      *[]core.Provider             `json:"providers,omitempty"`
+	RouteTemplates *[]core.RouteTemplate        `json:"route_templates,omitempty"`
+	EgressProfiles *[]core.EgressProfileSummary `json:"egress_profiles,omitempty"`
+	Endpoints      *[]core.EndpointProfile      `json:"endpoints,omitempty"`
+	Credentials    *[]core.CredentialSummary    `json:"credentials,omitempty"`
+	Channels       *[]core.Channel              `json:"channels,omitempty"`
 }
 
 type routePlanOutput struct {
@@ -90,6 +94,12 @@ type rssHubChannelProbeOutput struct {
 	ChannelID         string                    `json:"channel_id"`
 	EndpointProfileID string                    `json:"endpoint_profile_id"`
 	Probe             adapter.RSSHubProbeReport `json:"probe"`
+}
+
+type directFeedChannelProbeOutput struct {
+	SchemaVersion string                  `json:"schema_version"`
+	ChannelID     string                  `json:"channel_id"`
+	Probe         adapter.FeedProbeReport `json:"probe"`
 }
 
 func main() {
@@ -170,6 +180,72 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		defer closeCatalog()
 		templates := catalog.RouteTemplates()
 		value = catalogOutput{SchemaVersion: core.SchemaVersion, RouteTemplates: &templates}
+
+	case "egress-profiles":
+		if len(args) == 1 {
+			service, closeService, err := openReadManagementService(context.Background())
+			if err != nil {
+				fmt.Fprintf(stderr, "omnihub: open egress profile reader: %v\n", err)
+				return exitConfig
+			}
+			defer closeService()
+			profiles, listErr := service.ListEgressProfileSummaries(context.Background())
+			if listErr != nil {
+				fmt.Fprintf(stderr, "omnihub: list egress profiles: %v\n", listErr)
+				return managementExitCode(listErr)
+			}
+			value = catalogOutput{SchemaVersion: core.SchemaVersion, EgressProfiles: &profiles}
+			break
+		}
+		if len(args) < 2 || args[1] != "apply" && args[1] != "disable" {
+			fmt.Fprint(stderr, usage)
+			return exitParameter
+		}
+		switch args[1] {
+		case "apply":
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			input, decodeErr := decodeStrictJSON[management.ApplyEgressProfileInput](stdin)
+			if decodeErr != nil {
+				fmt.Fprintf(stderr, "omnihub: decode egress profile: %v\n", decodeErr)
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			profile, applyErr := service.ApplyEgressProfile(context.Background(), input)
+			if applyErr != nil {
+				fmt.Fprintf(stderr, "omnihub: apply egress profile: %v\n", applyErr)
+				return managementExitCode(applyErr)
+			}
+			value = profile
+		case "disable":
+			if len(args) < 3 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+			expectedRevision, parseErr := revisionFlag("egress-profiles disable", args[3:], stderr)
+			if parseErr != nil {
+				return exitParameter
+			}
+			service, closeService, openErr := openManagementService(context.Background())
+			if openErr != nil {
+				fmt.Fprintf(stderr, "omnihub: open management service: %v\n", openErr)
+				return exitConfig
+			}
+			defer closeService()
+			profile, disableErr := service.DisableEgressProfile(context.Background(), args[2], expectedRevision)
+			if disableErr != nil {
+				fmt.Fprintf(stderr, "omnihub: disable egress profile: %v\n", disableErr)
+				return managementExitCode(disableErr)
+			}
+			value = profile
+		}
 
 	case "endpoints":
 		if len(args) == 1 {
@@ -268,7 +344,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		input, decodeErr := decodeStrictJSON[management.ApplyCredentialInput](stdin)
 		if decodeErr != nil {
-			fmt.Fprintf(stderr, "omnihub: decode RSSHub credential: %v\n", decodeErr)
+			fmt.Fprintf(stderr, "omnihub: decode credential: %v\n", decodeErr)
 			return exitParameter
 		}
 		service, closeService, openErr := openManagementService(context.Background())
@@ -279,7 +355,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		defer closeService()
 		credential, applyErr := service.ApplyCredential(context.Background(), input)
 		if applyErr != nil {
-			fmt.Fprintf(stderr, "omnihub: apply RSSHub credential: %v\n", applyErr)
+			fmt.Fprintf(stderr, "omnihub: apply credential: %v\n", applyErr)
 			return managementExitCode(applyErr)
 		}
 		value = credential
@@ -374,7 +450,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 				fmt.Fprint(stderr, usage)
 				return exitParameter
 			}
-			probe, code := runRSSHubChannelProbe(args[2], stderr)
+			probe, code := runChannelProbe(args[2], stderr)
 			if probe == nil {
 				return code
 			}
@@ -382,9 +458,27 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 
 	case "opml":
-		if len(args) != 2 || args[1] != "import" && args[1] != "export" {
+		if len(args) < 2 || args[1] != "import" && args[1] != "export" {
 			fmt.Fprint(stderr, usage)
 			return exitParameter
+		}
+		var importEgressProfileID string
+		if args[1] == "export" {
+			if len(args) != 2 {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
+		} else {
+			flags := flag.NewFlagSet("opml import", flag.ContinueOnError)
+			flags.SetOutput(stderr)
+			flags.StringVar(&importEgressProfileID, "egress-profile", "", "saved EgressProfile for newly imported feeds")
+			if err := flags.Parse(args[2:]); err != nil {
+				return exitParameter
+			}
+			if flags.NArg() != 0 || strings.TrimSpace(importEgressProfileID) == "" {
+				fmt.Fprint(stderr, usage)
+				return exitParameter
+			}
 		}
 		openService := openManagementService
 		if args[1] == "export" {
@@ -403,7 +497,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			}
 			return 0
 		}
-		report, err := service.ImportOPML(context.Background(), stdin)
+		report, err := service.ImportOPML(context.Background(), stdin, importEgressProfileID)
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: import OPML: %v\n", err)
 			return managementExitCode(err)
@@ -493,6 +587,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 type directFeedFlags struct {
 	feedURL    string
 	source     string
+	egressMode string
 	query      string
 	format     string
 	identity   string
@@ -516,6 +611,11 @@ func runQueryCommand(kind core.OperationKind, args []string, stdin io.Reader, st
 	}
 	defer closeCatalog()
 	if transient != nil {
+		catalog, err = catalog.WithEgressProfile(transient.egress)
+		if err != nil {
+			fmt.Fprintf(stderr, "omnihub: configure direct feed egress: %v\n", err)
+			return nil, exitConfig
+		}
 		catalog, err = catalog.WithSourceAndChannel(transient.source, transient.channel)
 		if err != nil {
 			fmt.Fprintf(stderr, "omnihub: configure direct feed: %v\n", err)
@@ -560,9 +660,14 @@ func runRSSHubEndpointProbe(endpointID string, stderr io.Writer) (any, int) {
 		fmt.Fprintf(stderr, "omnihub: probe RSSHub endpoint: endpoint %q is not configured\n", endpointID)
 		return nil, exitConfig
 	}
+	egressProfile, egressCredential, reason := router.ResolveEgress(catalog, core.Channel{EndpointProfileID: endpoint.ID})
+	if reason != "" {
+		fmt.Fprintf(stderr, "omnihub: probe RSSHub endpoint: egress is unavailable (%s)\n", reason)
+		return nil, exitConfig
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	probe := (adapter.RSSHubAdapter{}).ProbeEndpoint(ctx, endpoint)
+	probe := (adapter.RSSHubAdapter{}).ProbeEndpoint(ctx, endpoint, egressProfile, egressCredential)
 	code := 0
 	if !probe.Passed {
 		code = exitFailed
@@ -573,7 +678,7 @@ func runRSSHubEndpointProbe(endpointID string, stderr io.Writer) (any, int) {
 	return rssHubEndpointProbeOutput{SchemaVersion: core.SchemaVersion, EndpointProfileID: endpoint.ID, Probe: probe}, code
 }
 
-func runRSSHubChannelProbe(channelID string, stderr io.Writer) (any, int) {
+func runChannelProbe(channelID string, stderr io.Writer) (any, int) {
 	catalog, closeCatalog, err := loadCatalog(context.Background())
 	if err != nil {
 		fmt.Fprintf(stderr, "omnihub: load catalog: %v\n", err)
@@ -582,14 +687,46 @@ func runRSSHubChannelProbe(channelID string, stderr io.Writer) (any, int) {
 	defer closeCatalog()
 	channel, ok := catalog.Channel(strings.TrimSpace(channelID))
 	if !ok {
-		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: channel %q is not configured\n", channelID)
+		fmt.Fprintf(stderr, "omnihub: probe channel: channel %q is not configured\n", channelID)
 		return nil, exitConfig
 	}
 	template, ok := catalog.RouteTemplate(channel.RouteTemplateID)
-	if !ok || template.Adapter != "rsshub" || template.Provider != "rsshub" {
-		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: channel %q is not bound to RSSHub\n", channelID)
+	if !ok || template.Adapter != "feed" && template.Adapter != "rsshub" {
+		fmt.Fprintf(stderr, "omnihub: probe channel: channel %q has no supported probe adapter\n", channelID)
 		return nil, exitConfig
 	}
+	egressProfile, egressCredential, reason := router.ResolveEgress(catalog, channel)
+	if reason != "" {
+		fmt.Fprintf(stderr, "omnihub: probe channel: egress is unavailable (%s)\n", reason)
+		return nil, exitConfig
+	}
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationLatest,
+		Scope: core.Scope{Channels: []string{channel.ID}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
+		Limit: 100, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
+	}
+	ctx, cancel, err := operation.Context(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "omnihub: probe channel: %v\n", err)
+		return nil, exitInternal
+	}
+	defer cancel()
+
+	if template.Adapter == "feed" {
+		probe := (adapter.FeedAdapter{}).Probe(ctx, adapter.FeedRequest{
+			Operation: operation, Channel: channel, RouteTemplate: template,
+			Egress: egressProfile, EgressCredential: egressCredential,
+		})
+		code := 0
+		if len(probe.Result.Errors) > 0 {
+			code = exitFailed
+			if probe.Result.Errors[0].Code == core.ErrorConfig {
+				code = exitConfig
+			}
+		}
+		return directFeedChannelProbeOutput{SchemaVersion: core.SchemaVersion, ChannelID: channel.ID, Probe: probe}, code
+	}
+
 	endpoint, ok := catalog.Endpoint(channel.EndpointProfileID)
 	if !ok {
 		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: endpoint %q is not configured\n", channel.EndpointProfileID)
@@ -604,19 +741,9 @@ func runRSSHubChannelProbe(channelID string, stderr io.Writer) (any, int) {
 		}
 		credential = &resolved
 	}
-	operation := core.Operation{
-		SchemaVersion: core.SchemaVersion, Operation: core.OperationLatest,
-		Scope: core.Scope{Channels: []string{channel.ID}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
-		Limit: 100, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
-	}
-	ctx, cancel, err := operation.Context(context.Background())
-	if err != nil {
-		fmt.Fprintf(stderr, "omnihub: probe RSSHub channel: %v\n", err)
-		return nil, exitInternal
-	}
-	defer cancel()
 	probe := (adapter.RSSHubAdapter{}).Probe(ctx, adapter.RSSHubRequest{
 		Operation: operation, Channel: channel, RouteTemplate: template, Endpoint: endpoint, Credential: credential,
+		Egress: egressProfile, EgressCredential: egressCredential,
 	})
 	code := 0
 	if probe.Readiness == "failed" {
@@ -630,6 +757,7 @@ func runRSSHubChannelProbe(channelID string, stderr io.Writer) (any, int) {
 type transientDirectFeed struct {
 	source  core.Source
 	channel core.Channel
+	egress  core.EgressProfile
 }
 
 func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, stderr io.Writer) (core.Operation, *transientDirectFeed, error) {
@@ -651,6 +779,7 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	options := directFeedFlags{}
 	flags.StringVar(&options.feedURL, "feed-url", "", "absolute RSS, Atom, JSON Feed, or discovery page URL")
 	flags.StringVar(&options.source, "source", "", "logical source ID")
+	flags.StringVar(&options.egressMode, "egress-mode", "", "explicit transient egress (direct or environment)")
 	flags.StringVar(&options.query, "query", "", "bounded-window search query")
 	flags.StringVar(&options.format, "format", "json", "output format (json)")
 	flags.StringVar(&options.identity, "identity-dedupe", string(core.IdentityExact), "identity dedupe mode (exact or none)")
@@ -666,6 +795,10 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	}
 	if strings.TrimSpace(options.feedURL) == "" || strings.TrimSpace(options.source) == "" {
 		return core.Operation{}, nil, errors.New("--feed-url and --source are required for flag-based queries")
+	}
+	egressMode := core.EgressMode(strings.TrimSpace(options.egressMode))
+	if egressMode != core.EgressModeDirect && egressMode != core.EgressModeEnvironment {
+		return core.Operation{}, nil, errors.New("--egress-mode must be direct or environment for flag-based queries")
 	}
 	if options.format != "json" {
 		return core.Operation{}, nil, fmt.Errorf("unsupported format %q", options.format)
@@ -688,6 +821,7 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	sourceID := strings.TrimSpace(options.source)
 	digest := sha256.Sum256([]byte(sourceID + "\x00" + normalizedURL))
 	channelID := fmt.Sprintf("channel_ephemeral_feed_%x", digest)
+	egressID := "egress_ephemeral_" + string(egressMode)
 	operation := core.Operation{
 		SchemaVersion:      core.SchemaVersion,
 		Operation:          kind,
@@ -711,8 +845,9 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 		channel: core.Channel{
 			ID: channelID, DisplayName: sourceID, Source: sourceID,
 			RouteTemplateID: "direct-feed-window", Parameters: map[string]any{"url": normalizedURL},
-			Priority: 100, Enabled: true, Revision: 1,
+			EgressProfileID: egressID, Priority: 100, Enabled: true, Revision: 1,
 		},
+		egress: core.EgressProfile{ID: egressID, Mode: egressMode, Enabled: true, Revision: 1},
 	}, nil
 }
 
@@ -869,7 +1004,7 @@ func openReadManagementService(ctx context.Context) (management.Service, func(),
 }
 
 func managementExitCode(err error) int {
-	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) {
+	if errors.Is(err, management.ErrInvalidDirectFeed) || errors.Is(err, management.ErrInvalidEgress) || errors.Is(err, management.ErrInvalidOPML) || errors.Is(err, management.ErrInvalidRSSHub) {
 		return exitParameter
 	}
 	return exitConfig

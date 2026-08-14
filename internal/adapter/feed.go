@@ -23,6 +23,7 @@ import (
 
 	"github.com/mmcdole/gofeed"
 	"github.com/ylxmf2005/omnihub/internal/core"
+	"github.com/ylxmf2005/omnihub/internal/egress"
 	"golang.org/x/net/html"
 )
 
@@ -37,10 +38,12 @@ var (
 // Adapter。CacheKey 是可选的额外分区（例如 Credential revision），不会替代
 // Channel、RouteTemplate 与参数本身的缓存分区。
 type FeedRequest struct {
-	Operation     core.Operation
-	Channel       core.Channel
-	RouteTemplate core.RouteTemplate
-	CacheKey      string
+	Operation        core.Operation
+	Channel          core.Channel
+	RouteTemplate    core.RouteTemplate
+	Egress           core.EgressProfile
+	EgressCredential *core.Credential
+	CacheKey         string
 }
 
 // FeedCacheEntry 只保存重新验证响应所需的有限上游事实。Body 在写入前已经通过
@@ -235,12 +238,22 @@ func FeedCacheKey(request FeedRequest) (string, error) {
 		ChannelID       string         `json:"channel_id"`
 		RouteTemplateID string         `json:"route_template_id"`
 		Parameters      map[string]any `json:"parameters"`
+		EgressID        string         `json:"egress_id,omitempty"`
+		EgressRevision  int64          `json:"egress_revision,omitempty"`
+		CredentialID    string         `json:"egress_credential_id,omitempty"`
+		CredentialRev   int64          `json:"egress_credential_revision,omitempty"`
 		Partition       string         `json:"partition,omitempty"`
 	}{
 		ChannelID:       request.Channel.ID,
 		RouteTemplateID: routeTemplateID(request),
 		Parameters:      request.Channel.Parameters,
+		EgressID:        request.Egress.ID,
+		EgressRevision:  request.Egress.Revision,
 		Partition:       request.CacheKey,
+	}
+	if request.EgressCredential != nil {
+		material.CredentialID = request.EgressCredential.ID
+		material.CredentialRev = request.EgressCredential.Revision
 	}
 	raw, err := json.Marshal(material)
 	if err != nil {
@@ -305,16 +318,26 @@ func NormalizeFeedURL(raw string) (string, error) {
 }
 
 type FeedAdapter struct {
-	Client           *http.Client
 	Cache            FeedCache
 	Now              func() time.Time
 	MaxResponseBytes int64
 	rssHubCredential *rssHubCredentialPolicy
-	rssHubProxy      func(*http.Request) (*url.URL, error)
+	trusted          *egress.Client
+	probe            *egress.Probe
 }
 
-func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) core.AdapterResult {
+type FeedProbeReport struct {
+	CheckedAt time.Time            `json:"checked_at"`
+	Egress    core.ExecutionEgress `json:"egress"`
+	Checks    []egress.Check       `json:"checks"`
+	Result    core.AdapterResult   `json:"result"`
+}
+
+func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) (final core.AdapterResult) {
 	result := emptyFeedResult()
+	defer func() {
+		annotateFeedEgress(&final, request.Egress, adapter.trusted)
+	}()
 	if ctx == nil {
 		return feedFailureResult(request, result, core.ErrorInternal, "feed execution requires a context", false, nil, nil)
 	}
@@ -336,6 +359,13 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) cor
 		return feedFailureResult(request, result, core.ErrorConfig, "feed Channel URL is invalid", false, nil, nil)
 	}
 	result.ProviderState["effective_url"] = configuredURL
+	if request.Egress.ID == "" {
+		return feedFailureResult(request, result, core.ErrorConfig, "feed execution requires an explicit egress profile", false, nil, nil)
+	}
+	adapter.trusted, err = egress.Build(request.Egress, request.EgressCredential, adapter.probe)
+	if err != nil {
+		return feedFailureResult(request, result, core.ErrorConfig, "feed egress configuration is invalid", false, nil, nil)
+	}
 
 	cacheKey, err := FeedCacheKey(request)
 	if err != nil {
@@ -435,7 +465,11 @@ func (adapter FeedAdapter) Execute(ctx context.Context, request FeedRequest) cor
 	}
 	result.ProviderState["effective_url"] = effectiveURL
 
+	parseStarted := time.Now()
 	feed, err := parseFeed(body)
+	if adapter.probe != nil {
+		adapter.probe.RecordFeedParse(err, parseStarted)
+	}
 	if err != nil {
 		return feedFailureResult(request, result, core.ErrorParse, "parse upstream feed", false, nil, nil)
 	}
@@ -494,6 +528,9 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 	if err != nil {
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "upstream selected an invalid feed URL"}
 	}
+	if adapter.probe != nil {
+		ctx = adapter.probe.Context(ctx)
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, normalized, nil)
 	if err != nil {
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorConfig, Message: "construct upstream feed request"}
@@ -509,11 +546,17 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 
 	response, err := adapter.httpClient().Do(request)
 	if err != nil {
+		if adapter.probe != nil {
+			adapter.probe.RecordRequestError(err)
+		}
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 		if errors.Is(err, errRSSHubExplicitEgressRequired) {
 			return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorConfig, Message: "credentialed RSSHub request requires an explicit egress profile"}
+		}
+		if errors.Is(err, egress.ErrCleartextCredential) || errors.Is(err, egress.ErrUntrustedTransport) {
+			return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorConfig, Message: "credentialed RSSHub egress is invalid"}
 		}
 		if errors.Is(err, ErrInvalidFeedURL) {
 			return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "upstream redirect selected an invalid feed URL"}
@@ -525,6 +568,9 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorNetwork, Message: "request upstream feed", Retryable: true}
 	}
 	defer response.Body.Close()
+	if adapter.probe != nil {
+		adapter.probe.RecordHTTP(response.StatusCode)
+	}
 	if adapter.rssHubCredential != nil && adapter.rssHubCredential.containsSensitiveHeaders(response.Header) {
 		return feedHTTPResponse{}, &feedRequestFailure{Code: core.ErrorProtocol, Message: "RSSHub response exposed access material"}
 	}
@@ -587,25 +633,24 @@ func (adapter FeedAdapter) fetch(ctx context.Context, target, etag, lastModified
 }
 
 func (adapter FeedAdapter) httpClient() *http.Client {
-	base := adapter.Client
-	if base == nil {
-		base = http.DefaultClient
-	}
-	client := *base
-	if adapter.rssHubCredential != nil {
-		client.Jar = nil
-		if client.Transport != nil {
-			// 调用方注入的 transport 可能自定义 dial/TLS/protocol 出口。Stage 3
-			// 无 EgressProfile 时无法证明其边界，因此不把 Credential 交给它。
-			client.Transport = rssHubCredentialTransportRejected{}
-		} else {
-			proxy := adapter.rssHubProxy
-			if proxy == nil {
-				proxy = http.ProxyFromEnvironment
-			}
-			client.Transport = restrictedRSSHubTransport(proxy, adapter.rssHubCredential)
+	var client *http.Client
+	var err error
+	if adapter.rssHubCredential == nil {
+		client, err = adapter.trusted.HTTPClient()
+	} else {
+		var base http.RoundTripper
+		base, err = adapter.trusted.RoundTripper()
+		if err == nil {
+			client = &http.Client{Transport: &rssHubCredentialTransport{base: base, policy: adapter.rssHubCredential, egress: adapter.trusted}}
 		}
 	}
+	if err != nil {
+		return &http.Client{Transport: rssHubCredentialTransportRejected{}}
+	}
+	return adapter.withRedirectPolicy(client)
+}
+
+func (adapter FeedAdapter) withRedirectPolicy(client *http.Client) *http.Client {
 	originalCheck := client.CheckRedirect
 	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if adapter.rssHubCredential != nil {
@@ -627,7 +672,32 @@ func (adapter FeedAdapter) httpClient() *http.Client {
 		}
 		return nil
 	}
-	return &client
+	return client
+}
+
+// Probe 明确执行一次无缓存 Feed 请求，并把该请求真实经过的网络层与 Feed
+// 解析结果一起返回。它不会在 Execute 之外另做预检。
+func (adapter FeedAdapter) Probe(ctx context.Context, request FeedRequest) FeedProbeReport {
+	rawURL, _ := request.Channel.Parameters["url"].(string)
+	normalized, _ := NormalizeFeedURL(rawURL)
+	probe := egress.NewProbe(request.Egress, normalized)
+	adapter.Cache = nil
+	adapter.probe = probe
+	result := adapter.Execute(ctx, request)
+	if len(result.Errors) > 0 && result.Errors[0].Code == core.ErrorConfig {
+		probe.RecordConfigurationError()
+	}
+	report := probe.Report()
+	return FeedProbeReport{CheckedAt: report.CheckedAt, Egress: report.Egress, Checks: report.Checks, Result: result}
+}
+
+func annotateFeedEgress(result *core.AdapterResult, profile core.EgressProfile, client *egress.Client) {
+	if result == nil || profile.ID == "" {
+		return
+	}
+	result.ProviderState["egress_profile_id"] = profile.ID
+	result.ProviderState["egress_mode"] = string(profile.Mode)
+	result.ProviderState["egress_proxied"] = strconv.FormatBool(client != nil && client.Proxied())
 }
 
 func (adapter FeedAdapter) maxResponseBytes() int64 {

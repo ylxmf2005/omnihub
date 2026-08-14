@@ -241,11 +241,12 @@ func (store *Store) runMigration(ctx context.Context, version int, statements []
 // routingCatalogPayload 只保存用户可编辑的 Registry 资源。聚合 revision 由表列独立维护，
 // builtin/imported 声明、Provider、RouteTemplate 和 Credential 不会混入可编辑 JSON。
 type routingCatalogPayload struct {
-	Sources     []core.Source          `json:"sources"`
-	Endpoints   []core.EndpointProfile `json:"endpoints"`
-	Channels    []core.Channel         `json:"channels"`
-	Collections []core.Collection      `json:"collections"`
-	Overlays    []core.TemplateOverlay `json:"overlays"`
+	Sources        []core.Source          `json:"sources"`
+	Endpoints      []core.EndpointProfile `json:"endpoints"`
+	EgressProfiles []core.EgressProfile   `json:"egress_profiles,omitempty"`
+	Channels       []core.Channel         `json:"channels"`
+	Collections    []core.Collection      `json:"collections"`
+	Overlays       []core.TemplateOverlay `json:"overlays"`
 }
 
 func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.SaveRoutingCatalog) (core.RoutingCatalog, error) {
@@ -256,11 +257,12 @@ func (store *Store) SaveRoutingCatalog(ctx context.Context, input repository.Sav
 		return core.RoutingCatalog{}, err
 	}
 	payload, err := json.Marshal(routingCatalogPayload{
-		Sources:     input.Catalog.Sources,
-		Endpoints:   input.Catalog.Endpoints,
-		Channels:    input.Catalog.Channels,
-		Collections: input.Catalog.Collections,
-		Overlays:    input.Catalog.Overlays,
+		Sources:        input.Catalog.Sources,
+		Endpoints:      input.Catalog.Endpoints,
+		EgressProfiles: input.Catalog.EgressProfiles,
+		Channels:       input.Catalog.Channels,
+		Collections:    input.Catalog.Collections,
+		Overlays:       input.Catalog.Overlays,
 	})
 	if err != nil {
 		return core.RoutingCatalog{}, fmt.Errorf("encode routing catalog: %w", err)
@@ -330,12 +332,13 @@ func scanRoutingCatalog(row rowScanner) (core.RoutingCatalog, error) {
 		return core.RoutingCatalog{}, fmt.Errorf("decode routing catalog: %w", err)
 	}
 	return core.RoutingCatalog{
-		Revision:    revision,
-		Sources:     payload.Sources,
-		Endpoints:   payload.Endpoints,
-		Channels:    payload.Channels,
-		Collections: payload.Collections,
-		Overlays:    payload.Overlays,
+		Revision:       revision,
+		Sources:        payload.Sources,
+		Endpoints:      payload.Endpoints,
+		EgressProfiles: payload.EgressProfiles,
+		Channels:       payload.Channels,
+		Collections:    payload.Collections,
+		Overlays:       payload.Overlays,
 	}, nil
 }
 

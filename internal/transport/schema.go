@@ -303,6 +303,44 @@ func applyEnvelopeConstraints(schema *jsonschema.Schema) {
 	if items := schema.Properties["items"]; items != nil && items.Items != nil {
 		requireArray(items.Items.Properties["observations"], true)
 	}
+	if executions := schema.Properties["executions"]; executions != nil && executions.Items != nil {
+		execution := executions.Items
+		applyExecutionEgressConstraints(execution.Properties["egress"])
+		for _, status := range []core.ExecutionStatus{core.ExecutionCompleted, core.ExecutionFailed} {
+			statusValue := any(string(status))
+			execution.AllOf = append(execution.AllOf, &jsonschema.Schema{
+				If: &jsonschema.Schema{
+					Required:   []string{"status"},
+					Properties: map[string]*jsonschema.Schema{"status": {Const: &statusValue}},
+				},
+				Then: &jsonschema.Schema{Required: []string{"egress"}},
+			})
+		}
+	}
+}
+
+func applyExecutionEgressConstraints(egress *jsonschema.Schema) {
+	if egress == nil {
+		return
+	}
+	egress.Type = "object"
+	egress.Types = nil
+	if profileID := egress.Properties["profile_id"]; profileID != nil {
+		minimum := 1
+		profileID.MinLength = &minimum
+		profileID.Pattern = `.*\S.*`
+	}
+	modeValue, proxiedValue := any(string(core.EgressModeDirect)), any(false)
+	egress.AllOf = append(egress.AllOf, &jsonschema.Schema{
+		If: &jsonschema.Schema{
+			Required:   []string{"mode"},
+			Properties: map[string]*jsonschema.Schema{"mode": {Const: &modeValue}},
+		},
+		Then: &jsonschema.Schema{
+			Required:   []string{"proxied"},
+			Properties: map[string]*jsonschema.Schema{"proxied": {Const: &proxiedValue}},
+		},
+	})
 }
 
 func requireArray(property *jsonschema.Schema, nonEmpty bool) {
@@ -328,6 +366,7 @@ func schemaOptions() *jsonschema.ForOptions {
 		reflect.TypeFor[core.Status]():             enumSchema(string(core.StatusComplete), string(core.StatusPartial), string(core.StatusFailed)),
 		reflect.TypeFor[core.ContentRole]():        enumSchema(string(core.ContentSnippet), string(core.ContentSummary), string(core.ContentBody)),
 		reflect.TypeFor[core.ExecutionStatus]():    enumSchema(string(core.ExecutionCompleted), string(core.ExecutionFailed), string(core.ExecutionSkipped)),
+		reflect.TypeFor[core.EgressMode]():         enumSchema(string(core.EgressModeEnvironment), string(core.EgressModeDirect), string(core.EgressModeHTTPProxy), string(core.EgressModeSOCKS5)),
 		reflect.TypeFor[core.Selection]():          enumSchema(string(core.SelectionCandidate), string(core.SelectionPrimary), string(core.SelectionPreferred), string(core.SelectionAggregate), string(core.SelectionFallback)),
 		reflect.TypeFor[core.ErrorCode](): enumSchema(
 			string(core.ErrorParameter), string(core.ErrorConfig), string(core.ErrorAuth), string(core.ErrorRateLimit), string(core.ErrorTimeout),

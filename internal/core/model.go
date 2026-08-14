@@ -158,21 +158,30 @@ const (
 )
 
 type Execution struct {
-	ChannelID       string          `json:"channel_id"`
-	RouteTemplateID string          `json:"route_template_id"`
-	Source          string          `json:"source"`
-	Provider        string          `json:"provider"`
-	Endpoint        string          `json:"endpoint,omitempty"`
-	Capability      string          `json:"capability"`
-	Selection       Selection       `json:"selection"`
-	Status          ExecutionStatus `json:"status"`
-	Reason          *string         `json:"reason,omitempty"`
-	StartedAt       time.Time       `json:"started_at"`
-	DurationMS      int64           `json:"duration_ms"`
-	Examined        int             `json:"examined"`
-	Returned        int             `json:"returned"`
-	Auth            ExecutionAuth   `json:"auth"`
-	Limitations     []string        `json:"limitations,omitempty"`
+	ChannelID       string           `json:"channel_id"`
+	RouteTemplateID string           `json:"route_template_id"`
+	Source          string           `json:"source"`
+	Provider        string           `json:"provider"`
+	Endpoint        string           `json:"endpoint,omitempty"`
+	Capability      string           `json:"capability"`
+	Selection       Selection        `json:"selection"`
+	Status          ExecutionStatus  `json:"status"`
+	Reason          *string          `json:"reason,omitempty"`
+	StartedAt       time.Time        `json:"started_at"`
+	DurationMS      int64            `json:"duration_ms"`
+	Examined        int              `json:"examined"`
+	Returned        int              `json:"returned"`
+	Auth            ExecutionAuth    `json:"auth"`
+	Egress          *ExecutionEgress `json:"egress,omitempty"`
+	Limitations     []string         `json:"limitations,omitempty"`
+}
+
+// ExecutionEgress 只投影本次执行实际选择的出口事实。代理地址和凭据仍只存在于
+// EgressProfile/Credential 的受限执行边界，不能进入 Envelope。
+type ExecutionEgress struct {
+	ProfileID string     `json:"profile_id"`
+	Mode      EgressMode `json:"mode"`
+	Proxied   bool       `json:"proxied"`
 }
 
 type Selection string
