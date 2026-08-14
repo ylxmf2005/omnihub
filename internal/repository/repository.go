@@ -149,16 +149,18 @@ type ProbeHealthFilter struct {
 	Limit      int
 }
 
-// EmbeddingCacheKey 隔离输入、Endpoint 与模型 cohort；任一执行配置或
-// 输入配方 revision 变化都会自然 miss，旧向量不会进入新一轮比较。
+// EmbeddingCacheKey 隔离输入、Endpoint、Credential 与模型 cohort；
+// 任一执行配置或输入配方 revision 变化都会自然 miss。
 type EmbeddingCacheKey struct {
-	InputHash         string
-	EndpointProfileID string
-	EndpointRevision  int64
-	Provider          string
-	Model             string
-	Dimension         int
-	IndexRevision     int64
+	InputHash          string
+	EndpointProfileID  string
+	EndpointRevision   int64
+	CredentialID       string
+	CredentialRevision int64
+	Provider           string
+	Model              string
+	Dimension          int
+	IndexRevision      int64
 }
 
 type EmbeddingCacheEntry struct {

@@ -199,7 +199,7 @@ func (service Service) resolve(catalog *registry.Catalog, operation core.Operati
 }
 
 func validBearerCredential(credential core.Credential) bool {
-	return credential.Enabled && credential.Provider == "embedding" && credential.AuthKind == "bearer" && credential.Value != nil &&
+	return credential.Revision > 0 && credential.Enabled && credential.Provider == "embedding" && credential.AuthKind == "bearer" && credential.Value != nil &&
 		*credential.Value != "" && !strings.ContainsFunc(*credential.Value, unicode.IsControl)
 }
 
@@ -225,6 +225,12 @@ func prepareInputs(resolved dependencies, items []core.Item) ([]itemInput, []rep
 	records := make([]itemInput, len(items))
 	keys := make([]repository.EmbeddingCacheKey, 0, len(items))
 	inputs := make(map[repository.EmbeddingCacheKey]string, len(items))
+	credentialID := ""
+	credentialRevision := int64(0)
+	if resolved.credential != nil {
+		credentialID = resolved.credential.ID
+		credentialRevision = resolved.credential.Revision
+	}
 	invalid := 0
 	for index, item := range items {
 		input, ok := embeddingInput(item)
@@ -236,6 +242,7 @@ func prepareInputs(resolved dependencies, items []core.Item) ([]itemInput, []rep
 		inputHash := hex.EncodeToString(digest[:])
 		key := repository.EmbeddingCacheKey{
 			InputHash: inputHash, EndpointProfileID: resolved.endpoint.ID, EndpointRevision: resolved.endpoint.Revision,
+			CredentialID: credentialID, CredentialRevision: credentialRevision,
 			Provider: resolved.endpoint.Provider, Model: resolved.profile.Model, Dimension: resolved.profile.Dimension,
 			IndexRevision: resolved.profile.IndexRevision,
 		}
@@ -474,7 +481,8 @@ func clamp(value float64) float64 {
 func semanticGroupID(profileID string, representative repository.EmbeddingCacheKey) string {
 	seed := strings.Join([]string{
 		profileID, representative.InputHash, representative.EndpointProfileID,
-		fmt.Sprintf("%d", representative.EndpointRevision), representative.Provider,
+		fmt.Sprintf("%d", representative.EndpointRevision), representative.CredentialID,
+		fmt.Sprintf("%d", representative.CredentialRevision), representative.Provider,
 		representative.Model, fmt.Sprintf("%d", representative.Dimension),
 		fmt.Sprintf("%d", representative.IndexRevision),
 	}, "\x00")

@@ -20,7 +20,7 @@ import (
 )
 
 // CurrentSchemaVersion 是写入 migration 与只读入口共同接受的唯一版本真相。
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 type Store struct {
 	db    *sql.DB
@@ -169,6 +169,12 @@ func (store *Store) initialize(ctx context.Context) error {
 		if err := store.migrateV4(ctx); err != nil {
 			return err
 		}
+		version = 4
+	}
+	if version == 4 {
+		if err := store.migrateV5(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -303,7 +309,7 @@ func (store *Store) migrateV3(ctx context.Context) error {
 }
 
 func (store *Store) migrateV4(ctx context.Context) error {
-	return store.runMigration(ctx, CurrentSchemaVersion, []string{
+	return store.runMigration(ctx, 4, []string{
 		`CREATE TABLE embedding_cache (
 			input_hash TEXT NOT NULL,
 			endpoint_profile_id TEXT NOT NULL,
@@ -317,6 +323,37 @@ func (store *Store) migrateV4(ctx context.Context) error {
 			last_used_at_ns INTEGER NOT NULL,
 			PRIMARY KEY(input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision)
 		)`,
+		`CREATE INDEX embedding_cache_by_last_used ON embedding_cache(last_used_at_ns)`,
+	})
+}
+
+func (store *Store) migrateV5(ctx context.Context) error {
+	return store.runMigration(ctx, CurrentSchemaVersion, []string{
+		`ALTER TABLE embedding_cache RENAME TO embedding_cache_v4`,
+		`CREATE TABLE embedding_cache (
+			input_hash TEXT NOT NULL,
+			endpoint_profile_id TEXT NOT NULL,
+			endpoint_revision INTEGER NOT NULL CHECK(endpoint_revision > 0),
+			credential_id TEXT NOT NULL,
+			credential_revision INTEGER NOT NULL,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			dimension INTEGER NOT NULL CHECK(dimension > 0),
+			index_revision INTEGER NOT NULL CHECK(index_revision > 0),
+			vector BLOB NOT NULL,
+			created_at_ns INTEGER NOT NULL,
+			last_used_at_ns INTEGER NOT NULL,
+			CHECK((credential_id = '' AND credential_revision = 0) OR
+				(credential_id <> '' AND credential_revision > 0)),
+			PRIMARY KEY(input_hash, endpoint_profile_id, endpoint_revision, credential_id, credential_revision, provider, model, dimension, index_revision)
+		)`,
+		`INSERT INTO embedding_cache(
+			input_hash, endpoint_profile_id, endpoint_revision, credential_id, credential_revision,
+			provider, model, dimension, index_revision, vector, created_at_ns, last_used_at_ns
+		) SELECT input_hash, endpoint_profile_id, endpoint_revision, '', 0,
+			provider, model, dimension, index_revision, vector, created_at_ns, last_used_at_ns
+			FROM embedding_cache_v4`,
+		`DROP TABLE embedding_cache_v4`,
 		`CREATE INDEX embedding_cache_by_last_used ON embedding_cache(last_used_at_ns)`,
 	})
 }
@@ -1582,7 +1619,8 @@ func (store *Store) GetEmbeddings(ctx context.Context, keys []repository.Embeddi
 		var encoded []byte
 		var createdAt, lastUsedAt int64
 		err := tx.QueryRowContext(ctx, `SELECT vector, created_at_ns, last_used_at_ns FROM embedding_cache
-			WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ? AND provider = ?
+			WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ?
+			AND credential_id = ? AND credential_revision = ? AND provider = ?
 			AND model = ? AND dimension = ? AND index_revision = ?`, embeddingKeyArgs(key)...).Scan(&encoded, &createdAt, &lastUsedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -1605,7 +1643,8 @@ func (store *Store) GetEmbeddings(ctx context.Context, keys []repository.Embeddi
 		}
 		if usedAt.After(entry.LastUsedAt) {
 			if _, err := tx.ExecContext(ctx, `UPDATE embedding_cache SET last_used_at_ns = ?
-				WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ? AND provider = ?
+				WHERE input_hash = ? AND endpoint_profile_id = ? AND endpoint_revision = ?
+				AND credential_id = ? AND credential_revision = ? AND provider = ?
 				AND model = ? AND dimension = ? AND index_revision = ?`, append([]any{timeValue(usedAt)}, embeddingKeyArgs(key)...)...); err != nil {
 				rollback()
 				return nil, fmt.Errorf("touch embedding cache: %w", err)
@@ -1648,10 +1687,11 @@ func (store *Store) PutEmbeddings(ctx context.Context, entries []repository.Embe
 	for _, value := range encoded {
 		args := append(embeddingKeyArgs(value.entry.Key), value.vector, timeValue(value.entry.CreatedAt), timeValue(value.entry.LastUsedAt))
 		if _, err := tx.ExecContext(ctx, `INSERT INTO embedding_cache(
-			input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision,
+			input_hash, endpoint_profile_id, endpoint_revision, credential_id, credential_revision,
+			provider, model, dimension, index_revision,
 			vector, created_at_ns, last_used_at_ns
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(input_hash, endpoint_profile_id, endpoint_revision, credential_id, credential_revision, provider, model, dimension, index_revision)
 		DO UPDATE SET vector = excluded.vector, created_at_ns = excluded.created_at_ns,
 			last_used_at_ns = excluded.last_used_at_ns`, args...); err != nil {
 			rollback()
@@ -1667,6 +1707,8 @@ func (store *Store) PutEmbeddings(ctx context.Context, entries []repository.Embe
 func validEmbeddingCacheKey(key repository.EmbeddingCacheKey) bool {
 	return key.InputHash != "" && key.InputHash == strings.TrimSpace(key.InputHash) &&
 		key.EndpointProfileID != "" && key.EndpointProfileID == strings.TrimSpace(key.EndpointProfileID) && key.EndpointRevision > 0 &&
+		((key.CredentialID == "" && key.CredentialRevision == 0) ||
+			(key.CredentialID != "" && key.CredentialID == strings.TrimSpace(key.CredentialID) && key.CredentialRevision > 0)) &&
 		key.Provider != "" && key.Provider == strings.TrimSpace(key.Provider) &&
 		key.Model != "" && key.Model == strings.TrimSpace(key.Model) &&
 		key.Dimension > 0 && key.IndexRevision > 0
@@ -1677,7 +1719,10 @@ func validEmbeddingCacheTimes(createdAt, lastUsedAt time.Time) bool {
 }
 
 func embeddingKeyArgs(key repository.EmbeddingCacheKey) []any {
-	return []any{key.InputHash, key.EndpointProfileID, key.EndpointRevision, key.Provider, key.Model, key.Dimension, key.IndexRevision}
+	return []any{
+		key.InputHash, key.EndpointProfileID, key.EndpointRevision, key.CredentialID, key.CredentialRevision,
+		key.Provider, key.Model, key.Dimension, key.IndexRevision,
+	}
 }
 
 func encodeEmbeddingVector(vector []float32, dimension int) ([]byte, error) {

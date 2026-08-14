@@ -130,10 +130,17 @@ type feedOrigin struct {
 	Verification    string `json:"verification" xml:"verification,attr"`
 }
 
+type feedSimilarity struct {
+	GroupID  *string  `json:"group_id" xml:"groupId,attr,omitempty"`
+	Strategy string   `json:"strategy" xml:"strategy,attr"`
+	Score    *float64 `json:"score,omitempty" xml:"score,attr,omitempty"`
+}
+
 type itemMetadata struct {
-	Identity string       `json:"identity" xml:"identity,attr"`
-	Role     string       `json:"content_role" xml:"contentRole,attr"`
-	Origins  []feedOrigin `json:"origins" xml:"omnihub:origin"`
+	Identity   string         `json:"identity" xml:"identity,attr"`
+	Role       string         `json:"content_role" xml:"contentRole,attr"`
+	Similarity feedSimilarity `json:"similarity" xml:"omnihub:similarity"`
+	Origins    []feedOrigin   `json:"origins" xml:"omnihub:origin"`
 }
 
 func itemMeta(item core.Item) itemMetadata {
@@ -146,7 +153,14 @@ func itemMeta(item core.Item) itemMetadata {
 			Verification: string(observation.Verification),
 		})
 	}
-	return itemMetadata{Identity: item.Identity.ClusterID, Role: string(item.Content.Role), Origins: origins}
+	return itemMetadata{
+		Identity: item.Identity.ClusterID,
+		Role:     string(item.Content.Role),
+		Similarity: feedSimilarity{
+			GroupID: item.Similarity.GroupID, Strategy: item.Similarity.Strategy, Score: item.Similarity.Score,
+		},
+		Origins: origins,
+	}
 }
 
 type jsonFeed struct {

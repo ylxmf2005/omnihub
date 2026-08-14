@@ -3,10 +3,12 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -3393,7 +3395,7 @@ func stageESemanticProfile() core.SemanticProfile {
 	}
 }
 
-func stageESemanticCatalog(t *testing.T, baseURL string, profile core.SemanticProfile) *registry.Catalog {
+func stageESemanticCatalog(t *testing.T, baseURL string, profile core.SemanticProfile, credentials ...core.Credential) *registry.Catalog {
 	t.Helper()
 	catalog, err := registry.NewCatalog(
 		[]core.Source{{ID: "semantic-source", Enabled: true}},
@@ -3414,7 +3416,7 @@ func stageESemanticCatalog(t *testing.T, baseURL string, profile core.SemanticPr
 			EgressProfileID: "semantic-direct", Enabled: true, Revision: 1,
 		}},
 		[]core.EgressProfile{{ID: "semantic-direct", Mode: core.EgressModeDirect, Enabled: true, Revision: 1}},
-		nil, []core.SemanticProfile{profile}, nil, nil,
+		credentials, []core.SemanticProfile{profile}, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3597,6 +3599,113 @@ func TestStageESemanticGroupingContracts(t *testing.T) {
 		}
 		jsonlEnvelope, _ := decodeJSONLEnvelope(t, jsonl.Bytes())
 		assertJSONEquivalent(t, jsonlEnvelope, first)
+
+		// Snapshot 是 Feed 的唯一输入；三种格式必须从同一已提交 Item
+		// 投影 semantic group/strategy/score，不能只保留链接后丢失分组事实。
+		encodedEnvelope, err := json.Marshal(first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot := core.ViewSnapshot{
+			ID: "snapshot-semantic", ViewID: "view-semantic", RunID: "run-semantic",
+			StateKeys: []core.StateKey{{
+				ChannelID: "semantic-channel", RouteTemplateID: "semantic-feed", ParametersHash: "semantic-fixture",
+			}},
+			Envelope: encodedEnvelope, CreatedAt: first.Meta.FinishedAt, FreshUntil: first.Meta.FinishedAt.Add(time.Hour),
+		}
+		view := core.View{ID: snapshot.ViewID, DisplayName: "Semantic View", Operation: input.OperationRequest(), Enabled: true}
+		for _, format := range []subscription.FeedFormat{subscription.FeedJSON, subscription.FeedRSS, subscription.FeedAtom} {
+			rendered, err := subscription.RenderFeed(subscription.FeedRenderInput{
+				View: view, Snapshot: subscription.SnapshotResult{Snapshot: snapshot}, Format: format,
+				FeedURL: "http://127.0.0.1/feeds/view-semantic." + string(format), Now: first.Meta.FinishedAt,
+			})
+			if err != nil {
+				t.Fatalf("RenderFeed(%s): %v", format, err)
+			}
+			want := first.Items[0].Similarity
+			if format == subscription.FeedJSON {
+				var projected struct {
+					Items []struct {
+						OmniHub struct {
+							Similarity core.Similarity `json:"similarity"`
+						} `json:"_omnihub"`
+					} `json:"items"`
+				}
+				if err := json.Unmarshal(rendered.Body, &projected); err != nil || len(projected.Items) != len(first.Items) || !reflect.DeepEqual(projected.Items[0].OmniHub.Similarity, want) {
+					t.Fatalf("semantic JSON Feed similarity = %#v, want %#v, err=%v", projected.Items, want, err)
+				}
+				continue
+			}
+
+			decoder := xml.NewDecoder(bytes.NewReader(rendered.Body))
+			found := false
+			for {
+				token, err := decoder.Token()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatalf("decode %s Feed: %v", format, err)
+				}
+				start, ok := token.(xml.StartElement)
+				if !ok || start.Name.Local != "similarity" {
+					continue
+				}
+				attributes := make(map[string]string, len(start.Attr))
+				for _, attribute := range start.Attr {
+					attributes[attribute.Name.Local] = attribute.Value
+				}
+				if want.GroupID == nil || want.Score == nil || attributes["groupId"] != *want.GroupID || attributes["strategy"] != want.Strategy || attributes["score"] != "1" {
+					t.Fatalf("semantic %s Feed attributes = %#v, want %#v", format, attributes, want)
+				}
+				found = true
+				break
+			}
+			if !found {
+				t.Fatalf("semantic %s Feed has no similarity extension: %s", format, rendered.Body)
+			}
+		}
+	})
+
+	t.Run("credential revision isolates cache cohort", func(t *testing.T) {
+		store := stageEStore(t)
+		profile := stageESemanticProfile()
+		profile.CredentialID = "embedding-token"
+		input := stageESearchInput(profile.ID)
+		item := stageESemanticItem("credential", "Credential", nil, "body", 1)
+		digest := sha256.Sum256([]byte("Credential\n\nbody"))
+		key := repository.EmbeddingCacheKey{
+			InputHash: fmt.Sprintf("%x", digest), EndpointProfileID: "embedding-endpoint", EndpointRevision: 1,
+			CredentialID: profile.CredentialID, CredentialRevision: 1,
+			Provider: "embedding", Model: profile.Model, Dimension: profile.Dimension, IndexRevision: profile.IndexRevision,
+		}
+		createdAt := time.Date(2026, 8, 15, 15, 0, 0, 0, time.UTC)
+		secondKey := key
+		secondKey.CredentialRevision = 2
+		if err := store.PutEmbeddings(context.Background(), []repository.EmbeddingCacheEntry{
+			{Key: key, Vector: []float32{1, 0}, CreatedAt: createdAt, LastUsedAt: createdAt},
+			{Key: secondKey, Vector: []float32{0, 1}, CreatedAt: createdAt, LastUsedAt: createdAt},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		firstValue := "token-v1"
+		firstCredential := core.Credential{
+			ID: profile.CredentialID, Provider: "embedding", AuthKind: "bearer",
+			Value: &firstValue, Enabled: true, Revision: 1,
+		}
+		first := stageEExecute(t, store, stageESemanticCatalog(t, "https://127.0.0.1:1", profile, firstCredential), input, []core.Item{item})
+
+		secondValue := "token-v2"
+		secondCredential := firstCredential
+		secondCredential.Value = &secondValue
+		secondCredential.Revision = 2
+		rotated := stageEExecute(t, store, stageESemanticCatalog(t, "https://127.0.0.1:1", profile, secondCredential), input, []core.Item{item})
+		if first.Status != core.StatusComplete || rotated.Status != core.StatusComplete ||
+			first.Items[0].Similarity.GroupID == nil || rotated.Items[0].Similarity.GroupID == nil ||
+			*first.Items[0].Similarity.GroupID == *rotated.Items[0].Similarity.GroupID {
+			t.Fatalf("credential rotation did not isolate cache/group: first=%#v rotated=%#v", first, rotated)
+		}
 	})
 
 	t.Run("leader grouping chooses best and earliest representative", func(t *testing.T) {

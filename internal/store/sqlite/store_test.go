@@ -953,7 +953,7 @@ func TestEmbeddingCacheRoundTripAndCohortIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	variants := make([]repository.EmbeddingCacheKey, 0, 7)
+	variants := make([]repository.EmbeddingCacheKey, 0, 10)
 	key := base
 	key.InputHash = "sha256:other"
 	variants = append(variants, key)
@@ -962,6 +962,16 @@ func TestEmbeddingCacheRoundTripAndCohortIsolation(t *testing.T) {
 	variants = append(variants, key)
 	key = base
 	key.EndpointRevision++
+	variants = append(variants, key)
+	key = base
+	key.CredentialID = "credential-other"
+	variants = append(variants, key)
+	key = base
+	key.CredentialRevision++
+	variants = append(variants, key)
+	key = base
+	key.CredentialID = ""
+	key.CredentialRevision = 0
 	variants = append(variants, key)
 	key = base
 	key.Provider = "other-compatible"
@@ -988,7 +998,8 @@ func TestEmbeddingCacheRoundTripAndCohortIsolation(t *testing.T) {
 	}
 	var raw []byte
 	if err := store.db.QueryRowContext(ctx, `SELECT vector FROM embedding_cache WHERE input_hash = ? AND endpoint_profile_id = ?
-		AND endpoint_revision = ? AND provider = ? AND model = ? AND dimension = ? AND index_revision = ?`,
+		AND endpoint_revision = ? AND credential_id = ? AND credential_revision = ?
+		AND provider = ? AND model = ? AND dimension = ? AND index_revision = ?`,
 		embeddingKeyArgs(base)...).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
@@ -1027,6 +1038,8 @@ func TestEmbeddingCacheRejectsInvalidWritesAndStoredVectors(t *testing.T) {
 		mutate func(*repository.EmbeddingCacheEntry)
 	}{
 		{name: "bad key", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Key.Model = "" }},
+		{name: "missing credential revision", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Key.CredentialRevision = 0 }},
+		{name: "revision without credential", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Key.CredentialID = "" }},
 		{name: "dimension mismatch", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Vector = []float32{1} }},
 		{name: "nan", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Vector[0] = float32(math.NaN()) }},
 		{name: "infinity", mutate: func(entry *repository.EmbeddingCacheEntry) { entry.Vector[0] = float32(math.Inf(1)) }},
@@ -1128,10 +1141,10 @@ func TestEmbeddingCacheTouchAndThirtyDayPrune(t *testing.T) {
 	}
 }
 
-func TestSQLiteFreshAndV3MigrationCreateEmbeddingCache(t *testing.T) {
+func TestSQLiteFreshAndLegacyMigrationCreateCredentialIsolatedEmbeddingCache(t *testing.T) {
 	ctx := context.Background()
-	if CurrentSchemaVersion != 4 {
-		t.Fatalf("CurrentSchemaVersion = %d, want v4 embedding cache schema", CurrentSchemaVersion)
+	if CurrentSchemaVersion != 5 {
+		t.Fatalf("CurrentSchemaVersion = %d, want v5 credential-isolated embedding cache schema", CurrentSchemaVersion)
 	}
 	t.Run("fresh", func(t *testing.T) {
 		store := openTestStore(t)
@@ -1168,6 +1181,43 @@ func TestSQLiteFreshAndV3MigrationCreateEmbeddingCache(t *testing.T) {
 		credential, err := store.GetCredential(ctx, "cred_v1")
 		if err != nil || credential.Revision != 3 {
 			t.Fatalf("v3 migration changed existing rows: %#v, %v", credential, err)
+		}
+	})
+
+	t.Run("v4", func(t *testing.T) {
+		databasePath := filepath.Join(t.TempDir(), "omnihub-v4.db")
+		legacy, err := sql.Open("sqlite", databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := createV4Fixture(ctx, legacy); err != nil {
+			_ = legacy.Close()
+			t.Fatal(err)
+		}
+		if err := legacy.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		store, err := Open(ctx, databasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		assertSchemaVersion(t, store, CurrentSchemaVersion)
+		assertEmbeddingCacheSchema(t, store)
+
+		anonymous := embeddingCacheKeyFixture()
+		anonymous.CredentialID = ""
+		anonymous.CredentialRevision = 0
+		authenticated := anonymous
+		authenticated.CredentialID = "credential-new"
+		authenticated.CredentialRevision = 1
+		hits, err := store.GetEmbeddings(ctx, []repository.EmbeddingCacheKey{anonymous, authenticated}, time.Unix(10, 0).UTC())
+		if err != nil || len(hits) != 1 || !reflect.DeepEqual(hits[anonymous].Vector, []float32{0.5, -0.5}) {
+			t.Fatalf("v4 migrated cache lookup = %#v, %v", hits, err)
+		}
+		if _, exists := hits[authenticated]; exists {
+			t.Fatal("v4 anonymous row was reused by a new authenticated credential")
 		}
 	})
 }
@@ -1604,6 +1654,7 @@ func routingCatalogFixture(channelID string) core.RoutingCatalog {
 func embeddingCacheKeyFixture() repository.EmbeddingCacheKey {
 	return repository.EmbeddingCacheKey{
 		InputHash: "sha256:fixture", EndpointProfileID: "endpoint-embedding", EndpointRevision: 1,
+		CredentialID: "credential-embedding", CredentialRevision: 2,
 		Provider: "openai-compatible", Model: "embedding-fixture", Dimension: 2, IndexRevision: 1,
 	}
 }
@@ -1620,9 +1671,10 @@ func insertRawEmbedding(t *testing.T, store *Store, key repository.EmbeddingCach
 	t.Helper()
 	args := append(embeddingKeyArgs(key), vector, timeValue(createdAt), timeValue(lastUsedAt))
 	if _, err := store.db.Exec(`INSERT INTO embedding_cache(
-		input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision,
+		input_hash, endpoint_profile_id, endpoint_revision, credential_id, credential_revision,
+		provider, model, dimension, index_revision,
 		vector, created_at_ns, last_used_at_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1694,6 +1746,23 @@ func createV3Fixture(ctx context.Context, database *sql.DB) error {
 	return (&Store{db: database}).migrateV3(ctx)
 }
 
+func createV4Fixture(ctx context.Context, database *sql.DB) error {
+	if err := createV3Fixture(ctx, database); err != nil {
+		return err
+	}
+	if err := (&Store{db: database}).migrateV4(ctx); err != nil {
+		return err
+	}
+	key := embeddingCacheKeyFixture()
+	_, err := database.ExecContext(ctx, `INSERT INTO embedding_cache(
+		input_hash, endpoint_profile_id, endpoint_revision, provider, model, dimension, index_revision,
+		vector, created_at_ns, last_used_at_ns
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.InputHash, key.EndpointProfileID, key.EndpointRevision, key.Provider, key.Model, key.Dimension, key.IndexRevision,
+		rawFloat32Vector(0.5, -0.5), int64(1), int64(2))
+	return err
+}
+
 func assertEmbeddingCacheSchema(t *testing.T, store *Store) {
 	t.Helper()
 	var objects int
@@ -1704,6 +1773,33 @@ func assertEmbeddingCacheSchema(t *testing.T, store *Store) {
 	}
 	if objects != 2 {
 		t.Fatalf("embedding cache schema objects = %d, want table and last-used index", objects)
+	}
+	rows, err := store.db.Query(`PRAGMA table_info(embedding_cache)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	primaryKey := make(map[int]string)
+	for rows.Next() {
+		var columnID, notNull, keyPosition int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&columnID, &name, &columnType, &notNull, &defaultValue, &keyPosition); err != nil {
+			t.Fatal(err)
+		}
+		if keyPosition > 0 {
+			primaryKey[keyPosition] = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantPrimaryKey := map[int]string{
+		1: "input_hash", 2: "endpoint_profile_id", 3: "endpoint_revision", 4: "credential_id", 5: "credential_revision",
+		6: "provider", 7: "model", 8: "dimension", 9: "index_revision",
+	}
+	if !reflect.DeepEqual(primaryKey, wantPrimaryKey) {
+		t.Fatalf("embedding cache primary key = %#v, want %#v", primaryKey, wantPrimaryKey)
 	}
 }
 
