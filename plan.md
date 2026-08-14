@@ -1,8 +1,8 @@
 # OmniHub Implementation Plan
 
-状态：`Stage 3 completed`
+状态：`Stage A ready`
 
-已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—2 已交付；Stage 3 已实现匿名与受限 access-key RSSHub Endpoint/Channel、health/Route metadata/Feed 三层 Probe 和统一 Query/fallback，E2E、全部质量闸与独立复核均通过。Stage 4 及以后仍只是计划。
+已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
 ## Stage 0：冻结合同与创建独立仓库（已完成）
 
@@ -58,105 +58,63 @@
 
 当前证据：本机不装 RSSHub 时 Direct Feed 正常；显式 Endpoint 可单独探测；Endpoint、Route metadata 与实际 Feed 不互相冒充；V2EX RSSHub 的 prefer/only/fallback 已通过真实 CLI 与 loopback 验收。受限 transport 按实际 pathname 派生 code，只允许显式 Endpoint 的同 origin、分段 base path，每跳清除并重签；越界、编码 traversal、double slash 与认证 HTML discovery fail-closed，cache 按 Endpoint/Credential revision 隔离，所有持久化与输出面脱敏。Stage 3 只用 OmniHub 自建 transport，拒绝所有外部 `http.Transport`；proxy resolver 只看 clean request clone，命中 proxy 时 Endpoint/proxy 网络请求为 0，确认不命中才注入 code 直连。authenticated/cache/rotation、proxy callback 无 access material、custom DialContext=0 的 E2E、全量 test/race/vet、四平台 build/schema 与 diff check 已通过；独立全链复核 `approve`，无未解决 P0–P2。
 
-## Stage 4：显式 EgressProfile 与主动分层网络 Probe
+## Stage A：可信出站与主动分层 Probe
 
-目标：让用户显式控制“请求从哪里出去”，并在主动诊断时看到可行动的分层故障，而不把重型 Probe 成本塞进普通 Query。
+目标：所有真实 Provider 先共享一个可审计出口，主动诊断能指出故障层，普通 Query 不支付额外 Probe 成本。
 
-- 增加 revision 化 EgressProfile：`environment | direct | http_proxy | socks5`；SOCKS5 显式选择 local/proxy DNS。
-- Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID，不能传任意 proxy URL；具体 binding/default/override/allowlist precedence 待 Owner 裁决。
-- HTTP/SOCKS5 代理 Credential 使用既有 Credential 引用，不写入 URL；配置与输出只披露 profile ID、mode、是否代理，不显示密码或完整代理 URL。
-- Egress Resolver/Transport Factory 禁止隐式 fallback、自动直连、公共 DoH、公共代理、关闭 TLS 与未知出口。
-- `channels probe` 按实际连接拓扑输出 observation：Direct 的 target DNS/TCP/TLS/HTTP/Feed；HTTP CONNECT 的 proxy DNS/TCP、CONNECT、tunnel 内 target TLS/HTTP/Feed；SOCKS5 local/proxy DNS 的 target-resolution 语义分别取证。每层关联 Egress 与 target/proxy subject，输出 `passed | degraded | failed | not_run`、耗时、可行动 reason 与 retryable；Query 不自动执行完整 Probe。
-- Probe、readiness 与 Execution 按 Endpoint×Egress 记录；无 Endpoint Channel 使用目标连接×Egress 的等价键。
+- 新增 revision 化 EgressProfile：`environment | direct | http_proxy | socks5`，SOCKS5 显式 local/proxy DNS；代理 Credential 复用现有 Credential。
+- 有 Endpoint 的路线只使用 Endpoint 固定绑定的 profile；无 Endpoint Channel 固定绑定自己的 profile；Operation/Probe 不覆盖。同一 BaseURL 多出口用多个 EndpointProfile 表达。
+- migration 允许旧绑定为空，但缺绑定即 `not_configured/config_error`。一次性 Direct Feed 以显式 ephemeral Channel 选择 `direct|environment`；代理只能引用已保存 profile，不接受临时 proxy URL。
+- 以一个内部 transport builder 构造可信 `http.Transport`；不新增单实现 Factory/interface，不隐式 fallback、公共 DoH/代理或关闭 TLS。
+- Probe 复用真实 transport、`httptrace`、HTTP CONNECT hook 与 Feed parser，按真实拓扑产生 DNS/TCP/proxy-connect/TLS/HTTP/Feed-parse observation；SOCKS proxy DNS 不伪造 target IP。
 
-完成证据：四种 mode 分别有成功与 fail-closed fixture；proxy Credential 与完整 proxy URL 不出现在日志/Envelope/Probe/cache；Direct、HTTP CONNECT、SOCKS5 local/proxy DNS 的 observation 与真实连接拓扑一致，proxy DNS 不伪造 target resolved IP；各层失败能阻断下游并留下 `not_run`；普通 Query 的请求数证明没有额外 Probe；同一目标的 direct/proxy 事实不会互相覆盖。
+完成证据：四种 mode 的配置、成功和 fail-closed fixture；下游 `not_run`、proxy 407、SOCKS local/FQDN、Credential 脱敏、Query 单请求与 Probe 分层请求均可重放；单 Channel 与跨绑定 `ready_dependent` 状态正确。
 
-Owner decisions：
+## Stage B：代表 Provider 与 Agent Query 发布面
 
-1. Egress 固定绑定在 Endpoint、Channel default/override，还是 Operation/Probe 从允许的 profile ID 集中选择，以及各层 precedence/allowlist。
-2. 已有 Endpoint/Channel 是 breaking fail-closed 后由用户显式补 profile，还是 migration 生成并显式绑定某个 profile；不能偷选 direct/environment。
-3. direct 失败、另一个用户显式 proxy 成功时，整体 readiness 映射为 `ready(dependent)` 还是 `degraded`。
+目标：用最少三种非 Feed 路线证明扩展能力，并同时完成 Agent 真正会调用的出口，避免两轮集成。
 
-这些决定不阻断 Stage 3，也不得由 Stage 4 实现者自行猜测。
+- GitHub 使用专用 REST Adapter；Tavily 使用专用 HTTP Adapter；X 使用受控 xurl command binding。command 固定 argv、无 shell、Credential 只走受信任 env/stdin、限制 timeout/output/exit。
+- Direct Feed/RSSHub 继续覆盖 V2EX、linux.do；NodeSeek 保持 conditional。arXiv、YouTube channel、Hacker News、Newsletter/Podcast 用 Source Bundle + 已证明 Feed 类型交付，不新增专用 Adapter。
+- 完成 `fetch`，抽取单一 Operation Service；CLI、REST/OpenAPI、MCP stdio/Streamable HTTP、JSONL 与 OmniHub Skill 都调用它。
+- MCP Server 复用已经依赖的官方 Go SDK；HTTP/RFC9457/JSONL 用 Go stdlib。MCP client binding 先用稳定 fixture 验证，X v1 只要求 command 真路径。
 
-本 Stage 不实现真正 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
+完成证据：每个宣称来源都有成功、缺配置/凭据、rate-limit/上游失败与 provenance/redaction 测试；GitHub/Tavily/xurl 可 aggregate 并正确 partial；同一 Operation 经 CLI/REST/MCP 得到语义等价 Envelope，JSONL 与 Skill 不丢 coverage/error/最终引用。
 
-## Stage 5：Provider 扩展与三类非 Feed 路线
+## Stage C：Subscription、Dashboard Backend 与 Feed 分发
 
-目标：证明不修改 Core 也能接入通用服务和专项工具。
+目标：一次性 Query 与持久 View 使用同一内核，前端不读数据库也不猜终态。
 
-- 实现 GitHub native Adapter 或受控 `gh` binding，覆盖 search、rate limit、分页与 metadata provenance。
-- 实现 Tavily Provider，结果 Source 从目标 URL/domain 推导，Provider/coverage 保持为 Tavily/Web index。
-- 实现通用 fixed command binding：typed argv、Credential 仅 env/stdin 注入、JSON/JSONL parser、大小/timeout/exit code限制。
-- 实现标准 MCP client binding：initialize、tools/list/call、cancellation、outputSchema mapping。
-- 用官方 xurl 的 command 与 MCP 形态验证 X recent search；只有存在用户 X Developer 配置时才做真实上游 E2E，否则明确停在 configured/route-probe 前一层。
-- 把 twscrape 做成用户显式配置的可选 Source Bundle，禁止自动 fallback。
+- 实现 View、Snapshot、Channel checkpoint、identity tombstone 与 Run 的最小 Repository/SQLite migration；补齐 Run 模型中当前未持久化的 resource/request/progress/error 字段。
+- View refresh 走 Create/Claim/Execute/Commit/Finish；Snapshot+checkpoint 原子提交，失败保留旧 Snapshot；支持 fresh/stale/empty、singleflight、显式 refresh 与外部 cron，不内置 scheduler。
+- 一个 Snapshot renderer 投影 RSS/Atom/JSON Feed，并实现 ETag/Last-Modified 与 stale metadata。
+- `serve` 扩展为 loopback Dashboard Backend：summary、catalog/Channel/Endpoint/Egress/Credential/Collection/View/Run/readiness、Query Workbench；写入用 revision/If-Match 与 Idempotency-Key，预执行错误用 RFC9457。
+- Credential 列表只返回掩码，detail 仅 `include_value=true` 回显并设置 `Cache-Control: no-store`；Cookie 永不进入 HTTP。
 
-完成证据：一次请求可并发组合 GitHub、Tavily、X Channel；一条失败时返回 partial；每个 Item 能追到实际 Source、Channel、RouteTemplate 和 Provider；未授权 X 不报告 ready。
+完成证据：故障注入、重复 idempotency、lease 过期重领、刷新失败保留旧 Snapshot、retention tombstone 不复活、三种 Feed 200→304；Dashboard CRUD/409/202 polling/Host-Origin-CORS/credential no-store 和前端 mock/OpenAPI 全通过。
 
-## Stage 6：Subscription Plane、Run、View 与 Feed 分发
+## Stage D：Chrome Cookie Backend
 
-目标：在不影响一次性 CLI 的前提下提供有状态订阅。
+目标：Chrome 在线且用户授权时按执行读取 Cookie，同时不把 Host 变成通用凭据导出器。
 
-- 完成 channel_state、response_cache、items/observations、identity_tombstones、views/snapshots、runs/run_channel_events Repository。
-- 实现 View create/show/refresh 与 Snapshot 原子替换。
-- 实现已确认的 freshness 策略：fresh、stale-while-revalidate、empty/blocking refresh、singleflight。
-- View refresh 创建持久 Run，并通过 revision + lease claim/renew/finish；进程中断后 Run 可恢复或安全过期重领。
-- 实现 RSS/Atom/JSON Feed 投影、ETag/Last-Modified、snapshot/stale metadata。
-- 支持显式 refresh 与外部 cron；不实现 scheduler/monitoring。
+- 实现 `omnihub chrome-host` 的 Native Messaging length-prefixed JSON、精确 `allowed_origins` manifest 与当前用户 IPC；macOS/Linux 用 0600 Unix socket，Windows 用最窄 named-pipe 实现。
+- Operation Service 根据 Channel/RouteTemplate 权威校验 origin/name/store/partition allowlist；Extension 只执行已授权的明确查询。Host 不信任 payload 自报 Extension ID。
+- Cookie 仅进入当前 Execute/Probe 内存，取消/结束即释放；Bridge 断线、permission 缺失、Cookie 缺失与真实 Probe 是独立 health checks。
+- 输出 MV3 Companion message schema、安装清单与 mock host；Extension 客户端/UI 仍由独立前端工作流完成。
 
-完成证据：故障注入后 checkpoint 与 Snapshot 不分叉；旧 Snapshot 在刷新失败后仍可读；retention 清理后的旧 Feed Item 不会复活；重复 idempotency key 和过期 lease 不产生两个已提交 Snapshot。
+完成证据：framing、越权 scope、错误 origin、断线、成功一次性读取与 reconnect fixture；CLI/serve 共用 Bridge Client；SQLite/HTTP/Run/Error/log/fixture 全文无 Cookie；三平台构建和 Windows pipe 合同测试通过。
 
-## Stage 7：Channel 管理、Chrome Bridge 与凭据生命周期
+## Stage E：本地 semantic grouping 与 v1 发布候选
 
-目标：让 API Key Channel 能独立后台运行，让 Cookie Channel 在 Chrome 在线且用户已授权时按执行直接读取。
+目标：在不改变 identity 去重与单二进制边界的前提下提供可选语义分组，并完成发布审计。
 
-- 实现简化 Credential CRUD：API Key/Token value 原样存 SQLite，Chrome Cookie Credential 的 value 为 null；Channel 引用 `credential_id`。
-- 实现 `omnihub chrome-host` Native Messaging 子命令与双向 Port；Extension 通过 `connectNative()` 保持连接并按有界 backoff 重连，Host manifest 精确绑定发布 Extension ID。Host 同时提供当前用户专属 Unix socket/Windows named pipe，CLI 与 `serve` 使用同一 Browser Bridge Client。
-- 实现用户手势下的 optional host permission，以及 `read_cookies` request/response。Operation Service 权威校验 Channel/RouteTemplate 与 permission pattern/Cookie query scope；Extension 只验证当前 Profile permission 并执行明确 URL/domain/name/store/partition 查询。
-- Cookie 只交给当前 Execute/Probe 的 Adapter 内存，结束/取消/超时即释放，不写 SQLite、HTTP、Run、Error、日志或 fixture。
-- 实现 Credential revision 触发 state/cache 隔离，以及 Chrome permission 撤销、Bridge 断开、Cookie 缺失、真实 Probe 的分层 Channel Health。
-- 输出 Chrome MV3 Companion 所需的 message schema、安装清单合同和 mock host；Extension UI/代码由独立 Agent 实现。
+- 新增 SemanticProfile；本地优先连接用户已有 Ollama/OpenAI-compatible Endpoint，不下载模型、不启动 daemon、不从本地自动回退云端。
+- embedding 以 `float32` BLOB 缓存在现有 SQLite；只在同 provider/model/dimension/index-revision cohort 内做 exact cosine。默认关闭，只写 group/reason/score，不删除或 rerank Item。
+- 固定小语料验证阈值、误合并边界、model revision 与 provider unavailable；另覆盖响应条数/dimension 不匹配、NaN/Inf、零范数与坏 BLOB。失败向量不写 cache、不分组，Item 保留且 Envelope partial。
+- 发布 OPML/Bundle、Egress、RSSHub、GitHub、Tavily、xurl、Chrome Host、SemanticProfile 示例；补扩展指南、SQLite/未来 MySQL 不变量、安装/卸载和 readiness 说明。
+- 生成 macOS/Linux/Windows 单二进制、archives 与 checksums；在全新目录重放 doctor 和来源×功能矩阵，完成独立 Review 与发布说明。
 
-完成证据：Dashboard 可录入并重新查看 API Key；SQLite readback 与 revision 更新可验证。没有用户手势/host permission、越权 domain/name、错误 Extension ID 都被拒绝；Bridge 断开立即产生 `browser_unavailable` 且保留旧 Snapshot；Cookie 从不落盘；真实 Probe 前不报告 ready。
-
-## Stage 8：Dashboard Backend 与前端合同交付
-
-目标：让独立前端 Agent 能在不读取数据库或猜内部状态的情况下完成综合管理 Dashboard。
-
-- 实现 `dashboard/summary` 只读聚合，以及 Source/RouteTemplate、Channel、Endpoint、Credential CRUD、Collection、View/Snapshot/Item、Run、Browser Bridge 与 readiness 管理 API。
-- 所有可写资源实现 revision/If-Match、Idempotency-Key、builtin disable/user overlay 和结构化冲突错误。
-- 实现 `fresh|stale|refreshing|empty|failed` View 呈现状态，同时返回最近成功 Snapshot 与最近失败 Run。
-- 实现已确认的持久 Run + 轮询，不提供 SSE/WebSocket；Query Workbench 必须显式 scope/provider/trust/cost 并展示 coverage。
-- Channel 页面返回 `desired_state`、派生 readiness、`checks[]`、`action_required`、最近 Probe 与最近 Execution；登录、Browser Bridge 与 Endpoint 状态不能互相冒充。
-- Credential 列表返回掩码，detail 仅在 `include_value=true` 时回显完整值并设置 `Cache-Control: no-store`；Cookie 永不进入 HTTP。输出 OpenAPI、JSON Schema、错误样例、redaction fixture 和前端 mock payload；前端实现由另一 Agent 接手。
-
-完成证据：前端只凭公开合同即可完成概览、Credential/Channel 配置、诊断、View、Run 与 Item 页面；完整 API Key 只出现在明确的 Credential detail 响应，Cookie 永不出现在 API；revision 冲突和重复提交可重放；Dashboard 不绕过 Operation Service/Repository。
-
-## Stage 9：公共出口与 Agent Skill
-
-目标：不同客户端使用同一个 Operation Service 和状态语义。
-
-- 完成 CLI 的 search/latest/fetch/refresh/serve/doctor 和机器/人类输出。
-- 完成 REST/OpenAPI、RFC 9457 预执行错误和 Envelope HTTP 映射。
-- 完成 MCP stdio 与 Streamable HTTP Server，输出 structured content。
-- 完成 JSONL start/channel/item/end event，保留 Execution、Coverage 与终态。
-- 编写并打包 OmniHub Skill：固定 CLI/MCP 调用、禁止自由 shell 包装、解析 partial/coverage、最终引用 Item URL。
-
-完成证据：同一请求经 CLI、HTTP、MCP 得到语义等价 Envelope；Feed 与 JSONL 不丢 Channel Execution/Coverage/Error；Tool Call 可识别 query、scope、Provider 和终态。
-
-## Stage 10：发布、可移植配置与来源扩充
-
-目标：交付可安装、可诊断、可由他人扩展的 v1 candidate。
-
-- 构建 macOS/Linux/Windows 单二进制、checksum 和全局安装说明。
-- 发布 OPML、Source Bundle、Channel、Endpoint/Credential、RSSHub、GitHub、Tavily、xurl 配置示例，以及 Chrome Companion/Native Host 的可验证安装与卸载说明。
-- 发布 Source/Provider 扩展指南、Schema 兼容规则和 readiness 定义。
-- 发布 Repository contract、SQLite 运维边界和未来 MySQL Store 的迁移不变量，但不宣称 MySQL 已支持。
-- 在已证明的 Adapter 上扩充 arXiv、YouTube、Hacker News、Newsletter/Podcast 等代表来源。
-- NodeSeek 等受反爬/网络影响的 Source 只有在目标环境真实探测成功后才从 unavailable/conditional 改为 ready。
-
-完成证据：全新环境安装后能运行 doctor；五条纵切分别有配置、成功和失败证据；README 不把 declared/installed 写成 runtime ready，也不把 Feed window/Tavily 写成全量平台搜索。
+完成证据：全来源/功能测试矩阵通过；test/race/vet/schema/OpenAPI/MCP/Skill/Feed/Chrome/Egress/semantic E2E 与三平台构建通过；README 不把 Feed window/Tavily/conditional Source 写成平台全量搜索或 runtime ready。
 
 ## 实施止损点
 
@@ -164,13 +122,13 @@ Owner decisions：
 2. Direct Feed 与 RSSHub 无法对同一 V2EX Source 正确选择/回退时，先修 Router/Channel Contract，不写平台特例。
 3. command/MCP binding 需要 Core 私有类型才能工作时，收窄公共 Adapter Result，不把第三方实现编进主二进制。
 4. 多 Channel 无法稳定续页时保持 first-window + truncated，不签发虚假 continuation。
-5. similarity 无法解释分组原因或误分组不可控时，v1 只发布 identity dedupe。
+5. semantic grouping 无法解释 group/score、模型 cohort 混算或误分组不可控时，保持默认关闭并标记实验性，不允许删除 Item。
 6. 真实 X/RSSHub/Tavily credential 不可用时，保留 preflight/fixture 证据并标记未 E2E，不把配置缺口抹成成功。
 7. 各出口字段漂移时回到领域 Schema 重建投影，不维护手工兼容层。
 8. Repository 为 MySQL 暴露的是 SQLite 方言细节、而不是领域原子行为时，先修 Repository，不开始第二 Store。
 9. Dashboard 需要读取表或根据多个不一致端点拼终态时，先修 Management API/Run 合同，不在前端加猜测逻辑。
 10. Chrome Companion 需要全域权限、直接读 Cookie DB/CDP，或 Native Host 变成任意 Cookie 导出器时，停止实现并回到授权模型。
-11. Stage 4 未裁决绑定 precedence 与既有资源迁移前，不实现隐式 direct/environment 默认；新建配置只接受用户已配置的 profile ID。
+11. Egress 绑定只允许 Endpoint 或无 Endpoint Channel 的固定 profile；若实现开始引入 override/allowlist precedence，退回当前单绑定合同。
 12. 正常 Query 若开始自动执行 DNS/TCP/TLS/HTTP/Feed parse 全链 Probe，先分离显式诊断入口，不接受隐藏的额外请求与延迟。
 
 ## 暂不实施
@@ -179,9 +137,9 @@ Owner decisions：
 - 内置 scheduler、告警和任务编排。
 - MySQL Store、多实例部署、分布式锁/选主、租户/RBAC；v1 只落实可迁移的领域不变量。
 - 通用网页爬虫/浏览器自动化平台。
-- 真正 macOS System Proxy/PAC、VPN/TUN 与最快线路自动选择；Stage 4 只实现显式 EgressProfile。
+- 真正 macOS System Proxy/PAC、VPN/TUN 与最快线路自动选择；Stage A 只实现显式 EgressProfile。
 - Go plugin 与自定义进程 RPC 协议。
-- 语义向量去重/rerank；Embedding API/本地 Ollama 与向量索引需要后续独立选型。
+- ANN 向量索引、向量删除式去重与 rerank；v1 只做 SQLite embedding cache + exact cosine semantic grouping。
 - 本 Task 的 Dashboard 前端实现、移动端、Chrome Extension UI/客户端、Webhook、WebSub、SSE/WebSocket。
 - 长期正文归档、OCR/ASR/Vision、证据编排与综合报告。
 - 未经实际 Channel Probe 就宣称支持大量平台。

@@ -69,7 +69,7 @@ flowchart LR
 
 已确认 Go 单二进制作为 v1 技术底座：符合全局安装、跨平台、并发 I/O、本地 HTTP/MCP Server 的目标。SQLite 选择无需系统动态库的驱动，避免安装后再要求用户准备额外运行时。
 
-建议目录按领域而不是出口组织：
+目录只在纵切需要时增加，不先搭空包；当前与下一步的最小边界是：
 
 ```text
 cmd/omnihub             进程入口
@@ -77,10 +77,9 @@ internal/core           Operation、Envelope、Item、Coverage、Error
 internal/registry       Source/Provider/RouteTemplate/Channel/Profile/Collection
 internal/router         Capability、Channel 与选择策略
 internal/adapter        内建 Adapter 与 command/MCP bindings
-internal/credential     SQLite Credential CRUD、redaction 与 Channel binding
-internal/browser        Chrome Bridge、permission、按执行 Cookie 请求
-internal/normalize      URL、时间、内容角色、Observation
-internal/dedupe         identity 与 similarity group
+internal/egress         Stage A profile、可信 transport 与 Probe trace
+internal/browser        Stage D Native Host、permission、按执行 Cookie 请求
+internal/semantic       Stage E embedding cache 与 grouping
 internal/repository     领域 Repository、Unit of Work 与 contract
 internal/store/sqlite   SQLite Repository 与 migration
 internal/transport      CLI、HTTP、MCP、Feed、OPML、Dashboard API
@@ -165,8 +164,9 @@ type Adapter interface {
 
 - `feed`：RSS/Atom/JSON Feed discovery、conditional GET、解析和 bounded window。
 - `rsshub`：Endpoint 鉴权、Route metadata、Feed 获取与 Route 级诊断。
-- `http-json`：受信任 Manifest 的受限 HTTP 请求和 JSON Pointer mapping。
-- 高价值专用 Adapter：例如 GitHub API；只在通用 mapping 无法正确处理鉴权、分页、rate limit 或语义时进入核心。
+- `github`、`tavily`：首批高价值 Provider 的窄专用 HTTP Adapter，直接表达各自鉴权、分页、rate limit 与 provenance。
+
+v1 不先实现通用 `http-json` mapping DSL；等第二个已验证 API 与现有专用 Adapter 真正同形时再抽取共同请求/解析逻辑。
 
 v1 不内建通用 HTML/CSS scraping DSL：RSSHub/RSS-Bridge 已经解决这类扩展，OmniHub 若再造会迅速背上反爬和浏览器维护成本。
 
@@ -211,7 +211,7 @@ spec:
 - Endpoint 只是连接配置；用户还需显式创建 Channel，引用 RSSHub RouteTemplate，填写 path、typed parameters、Credential、priority/fallback 和 Collection。每个人的 RSSHub Channel 集合保存在 user-owned config，不由内建清单替代。
 - access key 只从 Channel 引用的 Credential 进入当前执行内存。Adapter 按实际 outbound URL 的 pathname（包含 Endpoint base path，不含 query）计算 `code=md5(pathname+accessKey)`；原 key 与派生 code 都不进入 Channel 参数、cache key/value、ProviderState、日志、trace、Error、Envelope 或 Probe 输出。
 - 认证请求只允许留在用户显式 Endpoint 的同 origin 与分段 base-path 边界内；未越界 redirect 清除旧 `key/code` 后按新 pathname 重算，跨 origin、越界、编码 traversal 或 double slash 在目标发网前失败。认证 Feed 禁止 HTML alternate discovery，避免凭据材料扩散到第二个 URL。
-- Stage 3 尚无 EgressProfile：认证链只构造 OmniHub 自有受信任 transport，不继承外部注入的 `http.Transport` 及其 DialContext/DialTLS、TLS 或 protocol 设置；任何外部 transport 都在发网前 `config_error`。proxy resolver 在签名前只观察已清 `key/code` 与受限 headers 的 clean request clone；命中 proxy 时 Endpoint/proxy 均不发网络请求，确认不命中后才向真实请求注入 code 并直连。Stage 4 通过显式 profile 才允许 environment/direct/http_proxy/socks5。
+- Stage 3 尚无 EgressProfile：认证链只构造 OmniHub 自有受信任 transport，不继承外部注入的 `http.Transport` 及其 DialContext/DialTLS、TLS 或 protocol 设置；任何外部 transport 都在发网前 `config_error`。proxy resolver 在签名前只观察已清 `key/code` 与受限 headers 的 clean request clone；命中 proxy 时 Endpoint/proxy 均不发网络请求，确认不命中后才向真实请求注入 code 并直连。Stage A 通过显式 profile 才允许 environment/direct/http_proxy/socks5。
 - 优先读 RSSHub Route metadata；metadata 不可用时仍可实际请求 Feed，但 Channel readiness 记录为降级探测。
 - 独立 Endpoint Probe 没有 Channel Credential，受保护实例可以如实返回 auth required；Channel Probe 使用该 Channel 的 Credential 分别检查 health、Route metadata、实际 Feed、Content-Type、Feed parse、最新时间和已知 `requireConfig/requirePuppeteer/antiCrawler`。
 - readiness key 至少包含 Channel + RouteTemplate + Endpoint + Credential revision；Endpoint 200 不扩散为全局绿色。
@@ -220,15 +220,15 @@ spec:
 
 后续的 managed RSSHub mode 会引入容器、升级、持久化、安全和监控责任，需单独 Shape。
 
-## 7. 后续 Stage 4：显式出站与主动分层 Probe
+## 7. Stage A：显式出站与主动分层 Probe
 
-Stage 4 在 Adapter 之前增加两个窄组件：Egress Resolver 只接受用户已配置的 EgressProfile ID；Transport Factory 只为 `environment | direct | http_proxy | socks5` 构造受信任 transport。`environment` 是用户显式选择，不是默认读取；`direct` 明确不使用代理；HTTP/SOCKS5 代理认证从 Credential 注入，代理 URL 不带 userinfo。任何构造或引用失败都在发网前结束，不自动直连、切公共 DoH/公共代理、关闭 TLS 或尝试未知出口。
+Stage A 在 Adapter 之前增加一个窄的 Egress resolver/transport builder；它只接受用户已配置的 EgressProfile ID，并为 `environment | direct | http_proxy | socks5` 构造受信任 transport。`environment` 是用户显式选择，不是默认读取；`direct` 明确不使用代理；HTTP/SOCKS5 代理认证从 Credential 注入，代理 URL 不带 userinfo。任何构造或引用失败都在发网前结束，不自动直连、切公共 DoH/公共代理、关闭 TLS 或尝试未知出口。
 
-Egress 固定绑定在 Endpoint、Channel default/override，还是由 Operation/Probe 从用户允许的 profile ID 中选择，以及它们的 precedence/allowlist，必须由 Owner 在实现前裁决。已有 Endpoint/Channel 也需在 breaking fail-closed 后人工补 profile 与 migration 生成并显式绑定 profile 之间选择；设计不暗中补 direct/environment。Probe、readiness 与 Execution 均记录同一 Endpoint×Egress（无 Endpoint 时为目标连接×Egress）键，并只输出 profile ID、mode、proxied；代理密码和完整 proxy URL 始终脱敏。
+绑定不建立 precedence 表：有 Endpoint 的路线只读 `EndpointProfile.egress_profile_id`；无 Endpoint 的 Channel 只读自己的 `egress_profile_id`；Operation/Probe 无覆盖入口。同一 BaseURL 若确需多个出口就建立多个 EndpointProfile。migration 允许旧字段为空，但缺绑定即 `not_configured/config_error`，不补 direct/environment。Probe、readiness 与 Execution 均记录同一 Endpoint×Egress（无 Endpoint时为目标连接×Egress）键，并只输出 profile ID、mode、proxied；代理密码和完整 proxy URL 始终脱敏。
 
 主动 `channels probe` 复用已解析 transport，并按真实连接拓扑生成 observation：Direct 是 target DNS/TCP/TLS/HTTP/Feed；HTTP CONNECT 是 proxy DNS/TCP、CONNECT、tunnel 内 target TLS/HTTP/Feed；SOCKS5 local DNS 才记录本地 target resolution，proxy DNS 把该层标为 `not_run/delegated_to_egress`，不编造 resolved IP。每层关联 Egress 与 target/proxy subject，保存 `passed | degraded | failed | not_run`、duration、可行动 reason 与 retryable；某个实际前置层失败后，依赖它的下游层统一 `not_run`。普通 Query 只执行真实业务请求，不自动支付重型诊断链的额外 DNS/连接/握手/Feed 请求成本。
 
-真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不进入该 Stage。direct 失败而另一个显式 proxy 成功时，底层只保存两个绑定各自的事实；整体 readiness 采用 `ready(dependent)` 还是 `degraded` 必须等待 Owner 决策。
+真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不进入该 Stage。direct 失败而另一个显式 proxy 成功时，底层保存两个绑定各自的事实；单 Channel 按自己的绑定裁决，跨绑定聚合为 `ready_dependent` 并披露依赖的 profile。
 
 ## 8. 统一格式与来源链路
 
@@ -254,9 +254,9 @@ Egress 固定绑定在 Endpoint、Channel default/override，还是由 Operation
 
 ### 9.2 Similarity Grouping
 
-标题/正文相似度只建立 group，不把不同发布者的报道折叠成一个事实来源。标题比较保护数字、日期、版本号和实体 token；正文可以在限定时间窗内用 SimHash 等低成本指纹。默认关闭。
+semantic grouping 只建立 group，不把不同发布者的报道折叠成一个事实来源，默认关闭。MVP 不引入第二数据库或 ANN：embedding 以 `float32` BLOB 缓存在现有 SQLite，最多 100 个当前结果在同 cohort 内做精确 cosine。其复杂度上限清楚，且复用现有事务、备份、权限与三平台纯 Go 发布链。
 
-语义向量 grouping/rerank 需要单独选择 Embedding Provider（云 API 或本地 Ollama）、索引形态、阈值、费用、误合并恢复和模型升级重算策略，不进入 Stage 2。当前 `Similarity` 合同只保留扩展边界，不提前绑定向量数据库或模型。
+SemanticProfile 固定 Endpoint、Credential、model、dimension、threshold 与 index revision；本地 Ollama 和云端 OpenAI-compatible Endpoint 都经现有 Endpoint/Egress/Credential 边界。模型或输入规范变化提升 index revision，旧向量保持 stale 而不混算。embedding unavailable 只让 grouping 失败并使 Envelope `partial`，检索 Item 不丢失。
 
 ## 10. 状态、缓存与增量一致性
 
@@ -419,8 +419,8 @@ arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充
 | API Key | Dashboard 录入，SQLite 原样保存；列表掩码，detail 仅在 `include_value=true` 时完整回显 | 数据库备份可读到 Key | 已确认 |
 | Chrome 授权 | MV3 optional host permission + cookies API + connectNative 长连接；每次执行直接读 | Chrome/Bridge 离线时 Channel blocked | 已确认 |
 | RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
-| EgressProfile | Stage 4 显式 environment/direct/http_proxy/socks5；不隐式 fallback | 新增资源、transport 与诊断测试面；绑定/迁移/readiness 聚合待定 | 方向已确认 / Owner decision |
-| 扩展 | Built-in + Manifest + command/MCP | 要维护 mapping schema；不另造协议 | 已确认 |
-| 去重 | identity 默认；similarity 只分组 | 相似内容仍会占多条 | 已确认 |
+| EgressProfile | Endpoint 固定绑定；无 Endpoint Channel 固定绑定；Operation 无覆盖；缺绑定 fail-closed | 同一 BaseURL 多出口需多个 EndpointProfile | 已确认 |
+| 扩展 | 窄 Built-in + Manifest + command/MCP；同形 API 出现后再抽取 | 首批会有少量专用 Adapter；不另造协议/DSL | 已确认 |
+| 去重 | identity 默认；semantic 显式 opt-in，只分组；SQLite BLOB + exact cosine | 相似内容仍占多条；约 1 万向量或 p95>150ms 再评估 ANN | 已确认 |
 | v1 纵切 | Feed、V2EX/RSSHub、GitHub、Tavily、X/xurl | 首版不宣称大量平台 ready | 已确认 |
 | 测试文件 | 允许必要 `*_test.go`、Repository contract test 与 fixture | 增加维护量但形成可重放合同证据 | 已确认 |

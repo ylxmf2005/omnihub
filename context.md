@@ -4,6 +4,8 @@
 
 规划 OmniHub 的实现：用容易扩展的接入层统一搜索、最近更新和单条读取，并通过 API、CLI、MCP、RSS/Atom/JSON Feed、配套 Skill 与综合 Web Dashboard 对外提供能力。大量来源可以走 RSS/RSSHub，但用户可能不愿在本机安装 RSSHub，也可能使用需要 key 的远程实例；同一来源应允许 Direct Feed、RSSHub、原生 API、专项 CLI/MCP 或通用 Web Search 等不同路线。统一格式和扩展机制要优先吸收成熟项目的做法，而不是从零发明。
 
+继续执行请求：用户离开后不再回答问题，授权 Agent 自主完成技术与产品取舍；优先简单可发布的本地 MVP、复用现有能力并完成必要的新技术调研，使用 Ponytail 控制复杂度。最终目标是实现全部当前范围、为每个宣称支持的来源与功能提供测试、完成独立审核和发布准备，并以可验收纵切阶段性交付。
+
 来源：当前对话中用户显式调用 `$shape` 并要求先充分调查、产出 Shape 草稿、再进入 Grill；项目名与目标仓库已确定为 `OmniHub` / `ylxmf2005/omnihub`。
 
 ## Reality Coordinates
@@ -23,14 +25,15 @@
 - Chrome 现实：普通 localhost Dashboard 受同源与 HttpOnly 限制，无法读取其他站点 Cookie；可支持的正式路径是 Chrome MV3 Companion Extension 请求 optional host permission，通过 `chrome.cookies` 按执行直接读取，再经长连接 Native Messaging 与当前用户专属 IPC 交给 CLI/`serve`。Chrome 105+ 在 `connectNative()` 端口存活时会保持 Extension Service Worker；Chrome 关闭或 Bridge 断开时，依赖 Cookie 的 Channel 必须明确不可用。
 - 已确认本地 MVP 凭据取舍：Dashboard 可直接录入 API Key/Token，OmniHub 原样保存在本机 SQLite 的 Credential 记录中，不引入 Keychain、受保护 secret store 或只保存 opaque credential ID 的间接层。Cookie 不落 SQLite，用户授予 Chrome 域权限后按执行直接读取。
 - 已确认 MVP 安全尺度：不实现 bootstrap session、复杂 CSRF token 或 Credential generation 隔离；`serve` 只监听 loopback，并保留 Host/Origin/CORS 校验、SQLite 文件权限和日志脱敏这些低成本边界。
-- 已确认语义去重边界：Stage 2 只实现可解释的 exact identity dedupe。Embedding Provider（云 API 或本地 Ollama）、向量索引（SQLite/本地 HNSW 或独立向量数据库）、阈值、误合并恢复与模型升级重算必须在后续独立选型中与用户确认；当前不得提前绑定实现。
+- 已确认语义分组边界：exact identity dedupe 仍是唯一删除规则；v1 增加显式 opt-in 的 semantic grouping，保留全部 Item。MVP 复用现有 pure-Go SQLite，以 `float32` BLOB 缓存 embedding 并对单次最多 100 个结果做精确余弦比较；不引入第二数据库、CGO 或外部向量服务。Embedding 通过用户显式配置的本地 Ollama/OpenAI-compatible Endpoint 获取，不自动下载模型、不自动从本地回退云端。
 - 实施状态：Shape 与 Grill 已于 2026-08-13 收口为 `ready`；Stage 0—2 已提交并推送，Stage 3 已完成用户自管 RSSHub Endpoint/Channel、三层 Probe、统一 Query/fallback、管理 CAS 与受限 access-key transport。最新 proxy-fail-closed E2E、全量 test/race/vet、四平台构建、Schema 与 diff check 已通过，独立全链复核 `approve` 且无未解决 P0–P2。NodeSeek 由独立 side 任务处理；Stage 3 授权未扩大到其他 Provider、Cookie、Dashboard 前端或 Chrome Extension 客户端。
-- 已确认后续出站方向：独立 Stage 4 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID，不能传任意 proxy URL；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
-- Stage 4 尚待 Owner 裁决：Egress 固定绑定位置与 Endpoint/Channel default/override/Operation/Probe allowlist precedence；已有 Endpoint/Channel 是 breaking fail-closed 后显式补 profile，还是由 migration 生成并显式绑定某个 profile；以及 direct 失败、显式 proxy 成功时整体 readiness 呈现 `ready(dependent)` 还是 `degraded`。任何选项都不能偷选 direct/environment。
+- 已确认后续出站方向：Stage A 引入显式 `EgressProfile`（`environment | direct | http_proxy | socks5`，SOCKS5 可选 local/proxy DNS）；代理凭据引用 Credential，不写入 URL。主动 Channel Probe 将按实际出口分层报告网络与 Feed 事实，正常 Query 不自动运行这条重型诊断链。
+- Stage A 已在用户授权 Agent 自主取舍后收敛：有 Endpoint 的路线只从 `EndpointProfile.egress_profile_id` 取得出口；无 Endpoint 的 Direct Feed Channel 从 `Channel.egress_profile_id` 取得出口；Operation 与 Probe 不允许覆盖。旧资源迁移后字段可空，但缺绑定即 `not_configured/config_error`，不自动生成或选择 direct/environment。单 Channel 只按其固定绑定裁决；跨多个显式绑定聚合时，一个成功而其他失败呈现 `ready_dependent` 并保留各绑定事实。
+- 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
 
 ## Goal
 
-形成一套实现者无需猜测的 OmniHub 需求、公共合同、系统设计与分阶段计划：既支持无状态的一次性 Agent 检索，也能在启用本地状态后保存 View 并分发 Feed、通过 Web Dashboard 管理配置与运行；对每次执行如实返回实际 Provider、Channel、RouteTemplate、覆盖范围、失败和来源链路。
+把 OmniHub 实现并验收到可发布的本地 v1：既支持无状态的一次性 Agent 检索，也能保存 View、分发 Feed、通过 Web Dashboard Backend 管理配置与运行；CLI、HTTP、MCP、Feed 与 Skill 共享同一执行语义，并对每次执行如实返回实际 Provider、Channel、RouteTemplate、Egress、覆盖范围、失败和来源链路。
 
 ## Scope
 
@@ -43,9 +46,11 @@
 - 允许用户管理 Direct Feed、RSSHub Channel/参数、Endpoint、Credential、Collection 与 View，而不是只能使用内建来源。
 - 定义 Channel、RouteTemplate、Credential 与 Browser Bridge；支持 Dashboard 录入 API Key、用户授权 Chrome 域权限、打开登录页、按执行读取 Cookie、撤销授权并查看分层健康。
 - 规划 Chrome Companion Extension 与 Native Messaging Host 的后端合同；Extension 客户端实现不属于本后端 Task。
-- 规划显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage 4，不反向进入 Stage 3 验收。
+- 实现显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage A，不反向进入 Stage 3 验收。
 - 用代表性路线验证抽象：Direct Feed、RSSHub、GitHub、Tavily 与 X，而不是先堆平台数量。
-- 规划可检查的实施阶段和验收证据。
+- 为 V2EX、linux.do 与 NodeSeek conditional 提供基于 Feed 的真实来源样例；arXiv、YouTube、Hacker News、Newsletter/Podcast 只通过已证明的 Feed/Bundle 类型扩充，不提前增加专用 Adapter。
+- 提供显式 opt-in 的本地 semantic grouping，支持本地 Ollama 与用户配置的 OpenAI-compatible embedding Endpoint；不同模型/维度/revision 不混算，分组不删除 Item。
+- 按可独立验收的纵切完成实现、测试、审核与发布准备。
 
 ## Non-goals
 
@@ -58,8 +63,9 @@
 - v1 不实现 MySQL Store、多实例部署、分布式锁、租户/RBAC 或伪分布式兼容层；这里只冻结未来替换 Store 所需的领域边界和数据不变量。
 - v1 只支持 Google Chrome 常规 Profile；不直接解密浏览器 Cookie 数据库，不用 remote debugging/CDP 绕过 Chrome 保护，不默认扫描全部 Profile、域名或 Cookie，不支持 Firefox/Safari/Edge 与 Incognito。
 - v1 不接入系统 Keychain/Secret Service/Credential Manager；API Key/Token 的保护边界就是 loopback 进程、SQLite 文件权限和用户本机账号。Cookie 不持久化，因此 Chrome 未运行时不承诺依赖 Cookie 的后台刷新。
-- Stage 2 不实现 embedding、向量数据库或基于向量的删除式去重；后续能力默认先作为可解释的 similarity grouping 设计，是否删除内容需重新取得用户决定。
-- Stage 3 不实现 EgressProfile、HTTP/SOCKS5 代理或 DNS/TCP/TLS 分层 Probe。后续 Stage 4 也不实现真正的 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
+- 不实现基于向量的删除式去重、rerank、自动模型下载或云端 fallback；semantic 只建立可解释分组，exact identity 仍是唯一删除规则。
+- Stage 3 不实现 EgressProfile、HTTP/SOCKS5 代理或 DNS/TCP/TLS 分层 Probe。后续 Stage A 也不实现真正的 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
+- v1 不引入 sqlite-vec、Chromem、Qdrant、LanceDB 或独立 ANN 服务；当单模型 cohort 达到约一万条，或语义比较 p95 超过 150ms，再依据真实数据重新选择索引。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
 
 ## Acceptance Evidence
@@ -70,16 +76,22 @@
 - 公共合同示例可通过 JSON/YAML 校验，实施计划能从合同冻结、Repository/SQLite spike、五条纵切一路推进到 Dashboard Backend 与公共出口。
 - Stage 2 的 RSS/Atom/JSON Feed 与 HTML alternate discovery 必须从真实 CLI 进入统一 Envelope；ETag/Last-Modified 跨进程重验证、业务失败、缓存失败与覆盖窗口分别留证。
 - Direct Feed Channel 必须用 revision CAS 创建/更新/禁用；OPML import 为非破坏性 merge，并能回导标准 Feed metadata、稳定 Source/Channel identity、Collection 层级与 membership，不导出本地执行凭据。
-- Stage 2 只交付 `identity_dedupe=none|exact` 与 `similarity_grouping=off`；embedding API/本地 Ollama、向量索引和阈值在后续独立 Shape/选型前不得进入实现。
+- Stage 2 的已交付基线保持 `identity_dedupe=none|exact` 与 `similarity_grouping=off`；Stage E 再加入已冻结的 semantic profile、SQLite embedding cache 与 exact cosine，不反向改写 Stage 2 证据。
 - Stage 3 的受保护 RSSHub fixture 必须证明：匿名 Endpoint Probe 如实返回 auth failure；带 Credential 的 Channel Probe 与 Query 成功；cache hit 不虚报 auth 使用；Credential revision 隔离旧 cache；所有持久化与输出面不出现原 key 或派生 code。
+- 四种 Egress mode 都有成功与 fail-closed fixture；Probe 按真实连接拓扑输出 DNS/TCP/proxy connect/TLS/HTTP/Feed parse，未执行层为 `not_run`，普通 Query 不产生额外诊断请求。
+- Direct Feed、RSSHub、GitHub、Tavily 与 X/xurl 各有成功、缺配置/凭据和上游失败证据；V2EX、linux.do、NodeSeek conditional 及发布的 Feed Bundle 样例逐项有 fixture 或真实 smoke，未授权/不可达来源不报告 ready。
+- 同一 fixture Operation 经 CLI、REST、MCP 得到语义等价 Envelope；View refresh、Run 轮询、RSS/Atom/JSON Feed、JSONL、Skill 与 Dashboard API 均从同一 Operation/Subscription Service 投影。
+- Chrome mock Bridge 证明 permission/scope/断线/成功路径，Cookie 不进入 SQLite、HTTP、Run、Error、日志或 fixture；Extension 客户端仍由独立工作流交付。
+- semantic grouping 在固定语料上证明同模型 cohort、阈值边界、模型 revision 隔离、provider unavailable、dimension/finite/zero-norm 与坏 BLOB fail-closed；所有 Item 保留，功能默认关闭。
+- macOS/Linux/Windows 产物、checksum、全新目录安装/doctor、配置示例和扩展文档可重放；最终 Test 与独立 Review 均通过。
 
 ## Current Artifacts
 
 - `shape/evidence/reference-study.md`：`ready`，参考项目、标准、许可证与来源实测。
-- `shape/requirements.md`：`ready`，产品范围与可观察需求；Stage 4 绑定、迁移与整体 readiness 聚合仍有 Owner decisions。
-- `shape/contract.md`：`ready`，统一请求/结果与资源关系；Stage 4 新字段仅是后续合同，不代表已经实现。
-- `shape/design.md`：`ready`，当前系统回答与独立 Stage 4 出站设计边界。
-- `plan.md`：`completed`，Stage 3 已完成，Stage 4 及以后仍待实施。
+- `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
+- `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
+- `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
+- `plan.md`：`ready`，Stage 0—3 已完成，Stage A—E 待实施。
 - `dev/implementation.md`：`completed`，Stage 3 受限 credential transport 已实现并通过聚焦反馈。
 - `test/test-plan.md`：`completed`，TC-301—307 与全部质量闸已执行。
 - `test/test-report.md`：`passed`，authenticated/proxy/cache/revision、脱敏 E2E、四平台构建与 Schema 已闭合。

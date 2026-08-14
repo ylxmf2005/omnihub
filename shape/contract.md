@@ -43,7 +43,8 @@
 - `scope` 至少给出 Channel、Source、Provider 或 Collection 之一，除非所选 Provider Descriptor 明确允许 global discovery。`domains` 字段为后续通用 Web Search 保留；Stage 2 尚无 domain→Channel 元数据，非空时在上游调用前返回参数错误。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
-- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 合同预留 `off | title | content`，分组不删除不同 Item。Stage 2 Query Plane 只接受 `off`，embedding/向量索引选型完成前不得伪装支持其他值。
+- `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | semantic`，默认 `off`。semantic 只分组，不删除、折叠或 rerank 不同 Item；Stage E 完成前运行时仍只接受 `off`。
+- Stage E 会为 Operation 增加可选 `semantic_profile_id`：grouping=`semantic` 时必填，其他模式必须省略；它只选择 embedding 配置，不改变 Channel 路由或网络出口。该字段进入 Core/生成 Schema 前不放入当前可执行示例。
 - `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。Stage 2 尚未签发 token，因此任何非 null continuation 都在上游调用前拒绝。
 
 ## 2. Result Envelope
@@ -190,11 +191,12 @@ RouteTemplate 只是能力声明。用户 Channel 才绑定实际配置：
   "examined": 20,
   "returned": 10,
   "auth": {"required": true, "used": true, "credential_id": "cred_x_developer"},
+  "egress": {"profile_id": "egress_environment", "mode": "environment", "proxied": false},
   "limitations": ["x_recent_search_window"]
 }
 ```
 
-`status` 为 `completed | failed | skipped`。Execution 只记录 Endpoint/Credential ID，不复制 API Key 或 Cookie。
+`status` 为 `completed | failed | skipped`。Execution 只记录 Endpoint/Credential/Egress ID 与脱敏 mode/proxied 事实，不复制 API Key、代理地址、代理密码或 Cookie。
 
 ## 4. Item 与 Observation
 
@@ -364,11 +366,12 @@ metadata:
 spec:
   provider: rsshub
   baseUrl: http://127.0.0.1:1200
+  egressProfileId: egress_direct
   trust: local
   timeout: 10s
 ```
 
-Endpoint 只描述连接实例和 transport；账号凭据由 Channel 引用 Credential，避免一个 Endpoint 被误绑定成一个账号。
+Endpoint 描述连接实例并固定引用一个 EgressProfile；账号凭据由 Channel 引用 Credential，避免一个 Endpoint 被误绑定成一个账号。有 Endpoint 的 Channel 不再携带 Egress。
 
 ### 7.3 Credential
 
@@ -460,11 +463,11 @@ Stage 3 尚无 EgressProfile。认证链只使用 OmniHub 自建的受信任 tra
 }
 ```
 
-`desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | degraded`。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
+`desired_state` 为 `enabled | disabled`；`readiness` 为 `unknown | not_configured | needs_permission | needs_login | blocked | ready | ready_dependent | degraded`。`ready_dependent` 只用于跨多个显式绑定聚合：至少一个绑定真实 Probe 成功且存在其他失败，并必须列出成功/失败 profile ID；单 Channel 不使用该值。`browser_unavailable`、`cookie_missing` 等是 check/error code，不是 readiness 枚举。禁用 Channel 表达为 `desired_state=disabled` 与 `readiness=blocked`、reason=`disabled_by_user`。它是 `checks[]` 的派生读模型；`checks` 各自携带 checked/expires 时间和脱敏错误。`last_execution` 是独立事实，不能覆盖 readiness。只有真实 Channel Probe 成功且证据未过期才能成为 `ready`。
 
-### 7.6 EgressProfile 与主动 Probe（Stage 4 合同）
+### 7.6 EgressProfile 与主动 Probe（Stage A 合同）
 
-Stage 4 新增独立资源；下列合同不表示 Stage 3 已经支持代理：
+Stage A 新增独立资源；下列合同不表示 Stage 3 已经支持代理：
 
 ```yaml
 apiVersion: omnihub.dev/v1alpha1
@@ -482,9 +485,9 @@ spec:
 
 - `environment` 显式采用当前进程受支持的 proxy environment/NO_PROXY 决策；`direct` 显式禁止代理；`http_proxy` 与 `socks5` 只使用资源中声明的地址。任何模式都不得隐式 fallback 到另一模式、公共 DoH、公共代理或关闭 TLS。
 - 代理 Credential 由 EgressProfile 引用，不出现在 `proxyEndpoint`。资源列表、日志、Error、Probe、readiness 与 Execution 不返回密码或完整 proxy URL。
-- Endpoint、Channel、Operation 或 Probe 只能引用用户已配置的 profile ID，不得内嵌 proxy 配置或任意 proxy URL。Egress 究竟固定绑定在哪一层，以及 Endpoint/Channel default/override 与 Operation/Probe allowlist 的 precedence，仍是 Stage 4 Owner decision，当前合同不提前冻结。
+- 有 Endpoint 的 Channel 只从 `EndpointProfile.egress_profile_id` 取得出口，Channel 自身不得再填 Egress；无 Endpoint 的持久 Channel 必须填写 `Channel.egress_profile_id`。Operation 与 Probe 不接受 Egress override、内嵌 proxy 配置或任意 proxy URL。同一 BaseURL 需要多个出口时创建多个 EndpointProfile。无数据库的一次性 Direct Feed 由入口显式构造 ephemeral Channel，只允许选择 `direct|environment`；它不是对已选 Channel 的 override。
 - Probe、readiness 与 Execution 以 Endpoint×Egress 为事实键。普通输出只可携带 `egress.profile_id`、`egress.mode` 与 `egress.proxied`；无 Endpoint 时使用目标连接 ID 与 Egress 形成等价键。
-- 新建出站配置必须显式引用 profile ID。已有 Endpoint/Channel 的迁移在 breaking fail-closed 后人工补 profile 与 migration 生成并显式绑定 profile 之间保持未决；任何方案都不能暗中选择 direct/environment。
+- 新建 Endpoint 或无 Endpoint Channel 必须显式引用 profile ID。migration 允许旧字段为空，但该资源为 `not_configured` 且执行前返回 `config_error`；不得暗中生成或选择 direct/environment。
 
 显式 Channel Probe 的分层结果冻结 observation 与 Egress/subject 关联，不把代理路径伪装成 target 直连。以下示例表达 HTTP CONNECT，不承诺所有平台的额外诊断字段：
 
@@ -506,7 +509,34 @@ spec:
 
 `layer` 至少覆盖 `dns | tcp | proxy_connect | tls | http | feed_parse`，`subject` 区分 `target | proxy`；每层 `status` 为 `passed | degraded | failed | not_run`。`reason` 必须是可行动的脱敏原因，`retryable` 表示同一配置下重试是否可能恢复。Direct 才观察 target DNS/TCP；HTTP CONNECT 先观察 proxy DNS/TCP 与 CONNECT，再观察 tunnel 内 target TLS/HTTP/Feed。SOCKS5 local DNS 可观察本地 target DNS；proxy DNS 必须把 target DNS 标为 `not_run/delegated_to_egress`，不得输出伪造的 resolved IP。任一实际前置层失败时，依赖它的下游层统一为 `not_run`。普通 Query 使用相同的已解析 transport 与错误分类，但不自动运行完整分层 Probe。真正 macOS System Proxy/PAC、VPN/TUN 与最快线路选择不在本合同中。
 
-当 direct 绑定失败、另一个显式 proxy 绑定成功时，各 Endpoint×Egress 事实独立成立；整体 readiness 映射为 `ready(dependent)` 还是 `degraded` 仍是 Owner decision，当前合同不预设答案。
+当 direct 绑定失败、另一个显式 proxy 绑定成功时，各 Endpoint×Egress 事实独立成立。单 Channel 只按固定绑定裁决；跨多个显式绑定聚合时，至少一个成功且存在其他失败为 `ready_dependent`，结果列出成功与失败 profile ID。
+
+### 7.7 Semantic Profile 与 embedding cache
+
+`similarity_grouping=semantic` 必须引用一个 enabled SemanticProfile；Stage E 完成前运行时仍只接受 `off`：
+
+```yaml
+apiVersion: omnihub.dev/v1alpha1
+kind: SemanticProfile
+metadata:
+  id: semantic_local
+  revision: 1
+spec:
+  endpointProfileId: ollama_local
+  credentialId: null
+  model: embeddinggemma
+  dimension: 768
+  threshold: 0.88
+  indexRevision: 1
+  enabled: true
+```
+
+- Endpoint 必须由用户显式配置并遵守自己的 EgressProfile；本地 Ollama 与云端 OpenAI-compatible Endpoint 使用同一 embedding 请求边界，不自动下载模型、启动服务、切换 Provider 或从本地回退云端。
+- embedding 输入只由有界、确定性的 title + summary/content 组成。Cookie、Credential、Authorization、请求头、Browser Bridge 消息与未选择的正文不得进入输入。
+- MVP 把向量按 little-endian `float32` BLOB 缓存在现有 SQLite；cache key 至少包含规范化输入 hash、Endpoint、model、dimension 与 index revision。不同 cohort 不得比较，模型或规范化规则变化使旧 cohort stale。
+- 写 cache 前必须验证响应条数、每条 dimension 与 profile 完全一致，所有分量为有限数且向量范数大于零；BLOB 长度、字节序或解码失败同样拒绝。失败条目不写 cache、不参与 grouping，并产生 `similarity_unavailable`，不得让 NaN/Inf 进入 score。
+- 单次 Operation 最多 100 个 Item，使用精确 cosine，不建立 ANN 索引。每个分组 Item 保留自己的 ID/Observation，`similarity.strategy` 为 `semantic:<profile-id>:<model>`，并记录与组代表的 score。
+- embedding 失败时保留全部检索 Item，Envelope 为 `partial` 并报告 `similarity_unavailable`；不得静默关闭 grouping 或伪装成功。
 
 ## 8. Provider Binding
 
@@ -516,7 +546,7 @@ v1 不定义新的 External Adapter Protocol。
 
 - `feed`：RSS/Atom/JSON Feed。
 - `rsshub`：RSSHub Route 与 Endpoint 元数据。
-- `http-json`：受信任 Manifest 的受限 HTTP 请求和 JSON Pointer 字段映射；复杂签名/分页使用专用 Adapter。
+- `github`、`tavily`：首批高价值 Provider 的窄专用 HTTP Adapter。通用 `http-json` 等第二个真实同形 API 出现后再抽取，不在 v1 先做 mapping DSL。
 
 ### 8.2 Command binding
 

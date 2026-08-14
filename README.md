@@ -201,7 +201,7 @@ Direct Feed URL 只接受无 userinfo 的绝对 HTTP(S) URL，并拒绝常见 cr
 - `coverage` 描述 Adapter 实际观察的窗口；空结果不自动等于全量无结果。
 - `identity_dedupe=exact` 按同 Source 的稳定 upstream ID、canonical URL、最后才是规范化内容 hash 合并，并保留全部 Observation；`none` 不删除条目。
 - 坏 Feed 若重复使用 GUID，会优先借助条目 URL，或用内容/确定性 rank 保持条目独立，不把整批吞成一个 Item。
-- `similarity_grouping` 当前必须是 `off`。Embedding API、本地 Ollama、向量索引、阈值、模型升级重算和误合并恢复会在后续单独与项目 Owner 选型，不在当前实现中预埋一种答案。
+- `similarity_grouping` 当前实现仍只接受 `off`。Stage E 已选定显式 opt-in 的 semantic grouping：复用 SQLite 缓存 embedding，以同模型 cohort 的 exact cosine 分组；支持用户配置的本地 Ollama/OpenAI-compatible Endpoint，但不删除 Item、不自动下载模型或回退云端。
 - 无 Channel 完成为 `failed`；有成功但同时发生错误、fallback、截断或明确覆盖缺口为 `partial`；其余为 `complete`。
 
 ## 当前验证

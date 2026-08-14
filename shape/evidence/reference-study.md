@@ -206,6 +206,17 @@ GitHub 原生 API 提供结构化 search、Link pagination 与 rate-limit header
 
 这比在 README 罗列几十个平台更有价值：每个“支持”都能落到 Source、Capability、Route、Profile 和实际 probe 证据。
 
+### 6.5 本地向量方案复核
+
+发布约束是 pure-Go、macOS/Linux/Windows 单二进制与一个现有 SQLite Repository；semantic grouping 的单次候选上限又只有 100。按这些现实比较：
+
+- [`sqlite-vec`](https://github.com/asg017/sqlite-vec) 是值得继续观察的本地 SQLite 向量扩展，但当前 Go 路径要么使用 CGO binding，要么改用 `ncruces/go-sqlite3` 的 WASM SQLite；它不能无成本挂到现有 `modernc.org/sqlite` 驱动上，且 pre-1.0 仍允许破坏变化。
+- [`chromem-go`](https://github.com/philippgille/chromem-go) 是纯 Go embedded vector database，也内置多种 embedding 入口；但当前 beta 持久化独立于 OmniHub SQLite 事务，MPL-2.0 还会增加发行审阅面。
+- [Qdrant](https://github.com/qdrant/qdrant) 与 [LanceDB](https://github.com/lancedb/lancedb) 适合更大规模或独立检索服务，但会引入额外进程、运行时或数据目录，不符合本地 MVP。
+- [Ollama Embed API](https://docs.ollama.com/api/embed) 可本地批量生成 embedding；OmniHub 只连接用户已有 Endpoint，不自动下载模型或启动 Ollama。
+
+决策：v1 用现有 SQLite 保存 little-endian `float32` BLOB，并对同 provider/model/dimension/index-revision cohort 做精确 cosine；它是本地 embedding store，不宣传为 ANN 向量数据库。单 cohort 达到约一万条，或目标设备语义比较 p95 超过 150ms 时，再重新评估 sqlite-vec 是否已稳定且存在与当前纯 Go驱动兼容的路径；否则根据是否接受独立进程再评估 Qdrant。semantic 只分组，不删除 Item。
+
 ## 7. 明确未采用的方向
 
 - 不把 RSSHub 当本地必装运行时或匿名公共兜底。
