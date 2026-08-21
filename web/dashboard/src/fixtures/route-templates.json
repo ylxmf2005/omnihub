@@ -8,8 +8,7 @@
     "provider": "direct-feed",
     "adapter": "feed",
     "capabilities": [
-      "latest",
-      "search"
+	  "latest"
     ],
     "content_level": "body",
     "pagination": {

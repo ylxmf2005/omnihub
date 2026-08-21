@@ -215,7 +215,7 @@ func managedCredentialError(provider, authKind string) error {
 	if provider == "egress" || authKind == "basic" {
 		return ErrInvalidEgress
 	}
-	if provider == "github-api" || provider == "tavily" || provider == "xurl" {
+	if provider == "github-api" || provider == "tavily" || provider == "xurl" || provider == "discourse" {
 		return ErrInvalidProviderConfig
 	}
 	if provider == "embedding" || authKind == "bearer" {
@@ -233,6 +233,7 @@ func validateManagedCredential(provider, authKind, value string) error {
 	case provider == "rsshub" && authKind == "api_key",
 		provider == "github-api" && authKind == "token",
 		provider == "tavily" && authKind == "api_key",
+		provider == "discourse" && authKind == "user_api_key",
 		provider == "xurl" && authKind == "app_only":
 		if strings.TrimSpace(value) != "" && strings.IndexFunc(value, unicode.IsControl) < 0 {
 			return nil
@@ -263,6 +264,7 @@ func (service Service) ListCredentialSummaries(ctx context.Context) ([]core.Cred
 			credential.Provider == "egress" && credential.AuthKind == "basic" ||
 			credential.Provider == "github-api" && credential.AuthKind == "token" ||
 			credential.Provider == "tavily" && credential.AuthKind == "api_key" ||
+			credential.Provider == "discourse" && credential.AuthKind == "user_api_key" ||
 			credential.Provider == "xurl" && credential.AuthKind == "app_only" ||
 			credential.Provider == "embedding" && credential.AuthKind == "bearer" ||
 			credential.AuthKind == "chrome_cookie" && service.supportsChromeCookieCredential(credential.Provider) {
@@ -829,7 +831,19 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	if input.ExpectedRevision < 0 {
 		return core.Channel{}, fmt.Errorf("%w: expected revision must not be negative", ErrInvalidDirectFeed)
 	}
-	canonicalURL, parsedFeedURL, err := normalizeHTTPURL(input.URL)
+	// 官方 Feed 预设把 URL 固定在 RouteTemplate 中。Dashboard 不再要求用户
+	// 重填已知地址，其他 API 客户端也可以只提交模板与网络出口。
+	rawFeedURL := input.URL
+	if templateID := strings.TrimSpace(input.RouteTemplateID); templateID != "" {
+		template, templateErr := service.directFeedTemplate(templateID)
+		if templateErr != nil {
+			return core.Channel{}, templateErr
+		}
+		if fixedURL, ok := fixedDirectFeedURL(template); ok && strings.TrimSpace(rawFeedURL) == "" {
+			rawFeedURL = fixedURL
+		}
+	}
+	canonicalURL, parsedFeedURL, err := normalizeHTTPURL(rawFeedURL)
 	if err != nil {
 		return core.Channel{}, fmt.Errorf("%w: feed URL: %v", ErrInvalidDirectFeed, err)
 	}
@@ -882,6 +896,12 @@ func (service Service) ApplyDirectFeed(ctx context.Context, input ApplyDirectFee
 	template, err := service.directFeedTemplate(templateID)
 	if err != nil {
 		return core.Channel{}, err
+	}
+	if fixedURL, ok := fixedDirectFeedURL(template); ok {
+		fixedCanonicalURL, _, normalizeErr := normalizeHTTPURL(fixedURL)
+		if normalizeErr != nil || canonicalURL != fixedCanonicalURL {
+			return core.Channel{}, fmt.Errorf("%w: template %s requires its official feed URL", ErrInvalidDirectFeed, template.RouteTemplateID)
+		}
 	}
 
 	sourceID := strings.TrimSpace(input.SourceID)
@@ -1202,6 +1222,19 @@ func (service Service) directFeedTemplate(id string) (core.RouteTemplate, error)
 		return core.RouteTemplate{}, fmt.Errorf("%w: route template %s uses adapter %s, want feed", ErrUnsupportedTemplate, templateID, template.Adapter)
 	}
 	return template, nil
+}
+
+func fixedDirectFeedURL(template core.RouteTemplate) (string, bool) {
+	properties, ok := template.ParametersSchema["properties"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	urlSchema, ok := properties["url"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	fixedURL, ok := urlSchema["const"].(string)
+	return fixedURL, ok && strings.TrimSpace(fixedURL) != ""
 }
 
 func (service Service) rssHubTemplate(id string) (core.RouteTemplate, error) {

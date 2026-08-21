@@ -44,6 +44,8 @@ import type {
   RoutePolicy,
   RouteSelector,
   SearchInput,
+	SearchContentField,
+	SearchSort,
 } from '../api/types'
 import { EnvelopeView, OPERATION_COPY } from '../components/EnvelopeView'
 import { RunBadge } from '../components/display'
@@ -88,6 +90,13 @@ export function Workbench() {
   const [operation, setOperation] = useState<OperationKind>('latest')
   const [selected, setSelected] = useState<string[]>([])
   const [query, setQuery] = useState('')
+	const [from, setFrom] = useState('')
+	const [to, setTo] = useState('')
+	const [sort, setSort] = useState<SearchSort>('relevance')
+	const [authors, setAuthors] = useState('')
+	const [categories, setCategories] = useState('')
+	const [tags, setTags] = useState('')
+	const [contentFields, setContentFields] = useState<SearchContentField[]>([])
   const [target, setTarget] = useState('')
   const [limit, setLimit] = useState(20)
   const [dedupe, setDedupe] = useState<'none' | 'exact'>('exact')
@@ -141,7 +150,30 @@ export function Workbench() {
     similarity_grouping: 'off',
     deadline_ms: deadline,
   }
-  const searchBody: SearchInput = { ...latestBody, query: query.trim() }
+	const searchTime = {
+		...(from ? { from: new Date(from).toISOString() } : {}),
+		...(to ? { to: new Date(to).toISOString() } : {}),
+	}
+	const splitConstraint = (value: string) =>
+		value.split(',').map((part) => part.trim()).filter(Boolean)
+	const searchBody: SearchInput = {
+		schema_version: '1.0',
+		query: query.trim(),
+		scope: { channels: scope },
+		route_policy: routePolicy,
+		limit,
+		constraints: {
+			...(Object.keys(searchTime).length > 0 ? { time: { field: 'published_at', ...searchTime } } : {}),
+			authors: splitConstraint(authors),
+			categories: splitConstraint(categories),
+			tags: splitConstraint(tags),
+			content_fields: contentFields,
+		},
+		sort,
+		identity_dedupe: dedupe,
+		similarity_grouping: 'off',
+		deadline_ms: deadline,
+	}
   const fetchBody: FetchInput = {
     schema_version: '1.0',
     target: target.trim(),
@@ -235,14 +267,20 @@ export function Workbench() {
             />
 
             {operation === 'search' && (
-              <TextInput
-                label="关键词"
-                description="在选中线路的可搜索范围内匹配。"
-                placeholder="svg"
-                value={query}
-                onChange={(event) => setQuery(event.currentTarget.value)}
-                required
-              />
+			  <Stack gap="sm">
+				<TextInput label="关键词" description="只作为文本交给上游；不会解析 Provider 私有限定语法。" placeholder="svg" value={query} onChange={(event) => setQuery(event.currentTarget.value)} required />
+				<Group grow align="flex-start">
+				  <TextInput type="datetime-local" label="发布时间从" value={from} onChange={(event) => setFrom(event.currentTarget.value)} />
+				  <TextInput type="datetime-local" label="发布时间到" value={to} onChange={(event) => setTo(event.currentTarget.value)} />
+				  <Select label="排序" data={[{ value: 'relevance', label: '相关度' }, { value: 'newest', label: '最新优先' }]} value={sort} onChange={(value) => setSort((value as SearchSort) ?? 'relevance')} allowDeselect={false} />
+				</Group>
+				<Group grow align="flex-start">
+				  <TextInput label="作者" description="多个值用逗号分隔，按 AND 解释。" value={authors} onChange={(event) => setAuthors(event.currentTarget.value)} />
+				  <TextInput label="分类" description="多个值用逗号分隔。" value={categories} onChange={(event) => setCategories(event.currentTarget.value)} />
+				  <TextInput label="标签" description="多个值用逗号分隔。" value={tags} onChange={(event) => setTags(event.currentTarget.value)} />
+				</Group>
+				<MultiSelect label="内容字段" data={[{ value: 'title', label: '标题' }, { value: 'body', label: '正文' }, { value: 'first_post', label: '首帖' }]} value={contentFields} onChange={(value) => setContentFields(value as SearchContentField[])} clearable />
+			  </Stack>
             )}
 
             {operation === 'fetch' && (

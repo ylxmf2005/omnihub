@@ -527,6 +527,7 @@ func cloneProvider(value core.Provider) core.Provider {
 func cloneRouteTemplate(value core.RouteTemplate) core.RouteTemplate {
 	value.SourceConstraint.Values = slices.Clone(value.SourceConstraint.Values)
 	value.Capabilities = slices.Clone(value.Capabilities)
+	value.SearchConstraints.Sorts = slices.Clone(value.SearchConstraints.Sorts)
 	value.Auth.PermissionOrigins = slices.Clone(value.Auth.PermissionOrigins)
 	if value.Auth.CookieScope != nil {
 		cookieScope := *value.Auth.CookieScope

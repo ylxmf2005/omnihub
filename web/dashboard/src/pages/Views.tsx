@@ -92,7 +92,9 @@ interface ViewOperationBody {
   scope: { channels: string[] }
   route_policy: { mode: 'auto'; aggregate: boolean; allow_fallback: boolean }
   limit: number
-  time_range: Record<string, never>
+  time_range?: Record<string, never>
+	constraints?: Record<string, never>
+	sort?: 'relevance' | 'newest'
   identity_dedupe: 'exact' | 'none'
   similarity_grouping: 'off'
   deadline_ms: number
@@ -429,11 +431,11 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
           scope: { channels: channelIds },
           route_policy: { mode: 'auto', aggregate: false, allow_fallback: false },
           limit,
-          time_range: {},
+		  ...(effectiveKind === 'latest' ? { time_range: {} } : {}),
           identity_dedupe: dedupe,
           similarity_grouping: 'off',
           deadline_ms: 30_000,
-          ...(effectiveKind === 'search' ? { query: query.trim() } : {}),
+		  ...(effectiveKind === 'search' ? { query: query.trim(), constraints: {}, sort: 'relevance' as const } : {}),
           ...(effectiveKind === 'fetch' ? { target: target.trim() } : {}),
         },
       })

@@ -178,6 +178,9 @@ func filterReason(catalog *registry.Catalog, operation core.Operation, channel c
 	if !slices.Contains(template.Capabilities, string(operation.Operation)) {
 		return "capability_mismatch"
 	}
+	if reason := searchConstraintReason(operation, template); reason != "" {
+		return reason
+	}
 	if len(operation.Scope.Channels) > 0 && !slices.Contains(operation.Scope.Channels, channel.ID) {
 		return "outside_channel_scope"
 	}
@@ -197,6 +200,49 @@ func filterReason(catalog *registry.Catalog, operation core.Operation, channel c
 		return "excluded_by_policy"
 	}
 	return ""
+}
+
+func searchConstraintReason(operation core.Operation, template core.RouteTemplate) string {
+	if operation.Operation != core.OperationSearch {
+		return ""
+	}
+	descriptor := template.SearchConstraints
+	if operation.Constraints.Time.From != nil || operation.Constraints.Time.To != nil {
+		if !constraintSupported(descriptor.Time) || descriptor.Time.Field != core.SearchTimePublishedAt {
+			return "constraint_time_unsupported"
+		}
+	}
+	for _, requested := range []struct {
+		values     int
+		descriptor core.ConstraintDescriptor
+		reason     string
+	}{
+		{len(operation.Constraints.Authors), descriptor.Authors, "constraint_authors_unsupported"},
+		{len(operation.Constraints.Categories), descriptor.Categories, "constraint_categories_unsupported"},
+		{len(operation.Constraints.Tags), descriptor.Tags, "constraint_tags_unsupported"},
+		{len(operation.Constraints.ContentFields), descriptor.ContentFields, "constraint_content_fields_unsupported"},
+	} {
+		if requested.values > 0 && !constraintSupported(requested.descriptor) {
+			return requested.reason
+		}
+	}
+	sort := operation.Sort
+	if sort == "" {
+		sort = core.SearchSortRelevance
+	}
+	if !slices.Contains(descriptor.Sorts, sort) {
+		return "sort_unsupported"
+	}
+	return ""
+}
+
+func constraintSupported(descriptor core.ConstraintDescriptor) bool {
+	switch descriptor.Mode {
+	case "native_exact", "native_coarse", "post_filter":
+		return true
+	default:
+		return false
+	}
 }
 
 func preflightReason(catalog *registry.Catalog, channel core.Channel, template core.RouteTemplate) string {

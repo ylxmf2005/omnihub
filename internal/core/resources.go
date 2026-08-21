@@ -15,21 +15,22 @@ import (
 var ErrInvalidRoutingCatalog = errors.New("invalid routing catalog")
 
 type RouteTemplate struct {
-	RouteTemplateID  string               `json:"route_template_id" yaml:"route_template_id"`
-	Origin           string               `json:"origin" yaml:"origin"`
-	SourceConstraint SourceConstraint     `json:"source_constraint" yaml:"source_constraint"`
-	Provider         string               `json:"provider"`
-	Adapter          string               `json:"adapter"`
-	Capabilities     []string             `json:"capabilities"`
-	ContentLevel     string               `json:"content_level" yaml:"content_level"`
-	Pagination       PaginationDescriptor `json:"pagination"`
-	TimeRange        TimeRangeDescriptor  `json:"time_range" yaml:"time_range"`
-	Auth             AuthDescriptor       `json:"auth"`
-	EndpointRequired bool                 `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
-	ParametersSchema map[string]any       `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
-	Cost             string               `json:"cost"`
-	Trust            string               `json:"trust"`
-	Limitations      []string             `json:"limitations,omitempty"`
+	RouteTemplateID   string                      `json:"route_template_id" yaml:"route_template_id"`
+	Origin            string                      `json:"origin" yaml:"origin"`
+	SourceConstraint  SourceConstraint            `json:"source_constraint" yaml:"source_constraint"`
+	Provider          string                      `json:"provider"`
+	Adapter           string                      `json:"adapter"`
+	Capabilities      []string                    `json:"capabilities"`
+	ContentLevel      string                      `json:"content_level" yaml:"content_level"`
+	Pagination        PaginationDescriptor        `json:"pagination"`
+	TimeRange         TimeRangeDescriptor         `json:"time_range" yaml:"time_range"`
+	SearchConstraints SearchConstraintsDescriptor `json:"search_constraints,omitempty" yaml:"search_constraints,omitempty"`
+	Auth              AuthDescriptor              `json:"auth"`
+	EndpointRequired  bool                        `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
+	ParametersSchema  map[string]any              `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
+	Cost              string                      `json:"cost"`
+	Trust             string                      `json:"trust"`
+	Limitations       []string                    `json:"limitations,omitempty"`
 }
 
 type PaginationDescriptor struct {
@@ -40,6 +41,21 @@ type PaginationDescriptor struct {
 type TimeRangeDescriptor struct {
 	Kind  string `json:"kind"`
 	Value string `json:"value,omitempty"`
+}
+
+type SearchConstraintsDescriptor struct {
+	Time          ConstraintDescriptor `json:"time,omitempty" yaml:"time,omitempty"`
+	Authors       ConstraintDescriptor `json:"authors,omitempty" yaml:"authors,omitempty"`
+	Categories    ConstraintDescriptor `json:"categories,omitempty" yaml:"categories,omitempty"`
+	Tags          ConstraintDescriptor `json:"tags,omitempty" yaml:"tags,omitempty"`
+	ContentFields ConstraintDescriptor `json:"content_fields,omitempty" yaml:"content_fields,omitempty"`
+	Sorts         []SearchSort         `json:"sorts,omitempty" yaml:"sorts,omitempty"`
+}
+
+type ConstraintDescriptor struct {
+	Mode      string          `json:"mode,omitempty" yaml:"mode,omitempty"`
+	Field     SearchTimeField `json:"field,omitempty" yaml:"field,omitempty"`
+	Precision string          `json:"precision,omitempty" yaml:"precision,omitempty"`
 }
 
 type SourceConstraint struct {
@@ -654,20 +670,21 @@ type BundleProvider struct {
 }
 
 type BundleRouteTemplate struct {
-	RouteTemplateID  string               `json:"route_template_id" yaml:"route_template_id"`
-	SourceConstraint SourceConstraint     `json:"source_constraint" yaml:"source_constraint"`
-	Provider         string               `json:"provider" yaml:"provider"`
-	Adapter          string               `json:"adapter" yaml:"adapter"`
-	Capabilities     []string             `json:"capabilities" yaml:"capabilities"`
-	ContentLevel     string               `json:"content_level" yaml:"content_level"`
-	Pagination       PaginationDescriptor `json:"pagination" yaml:"pagination"`
-	TimeRange        TimeRangeDescriptor  `json:"time_range" yaml:"time_range"`
-	Auth             AuthDescriptor       `json:"auth" yaml:"auth"`
-	EndpointRequired bool                 `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
-	ParametersSchema map[string]any       `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
-	Cost             string               `json:"cost" yaml:"cost"`
-	Trust            string               `json:"trust" yaml:"trust"`
-	Limitations      []string             `json:"limitations,omitempty" yaml:"limitations,omitempty"`
+	RouteTemplateID   string                      `json:"route_template_id" yaml:"route_template_id"`
+	SourceConstraint  SourceConstraint            `json:"source_constraint" yaml:"source_constraint"`
+	Provider          string                      `json:"provider" yaml:"provider"`
+	Adapter           string                      `json:"adapter" yaml:"adapter"`
+	Capabilities      []string                    `json:"capabilities" yaml:"capabilities"`
+	ContentLevel      string                      `json:"content_level" yaml:"content_level"`
+	Pagination        PaginationDescriptor        `json:"pagination" yaml:"pagination"`
+	TimeRange         TimeRangeDescriptor         `json:"time_range" yaml:"time_range"`
+	SearchConstraints SearchConstraintsDescriptor `json:"search_constraints,omitempty" yaml:"search_constraints,omitempty"`
+	Auth              AuthDescriptor              `json:"auth" yaml:"auth"`
+	EndpointRequired  bool                        `json:"endpoint_required,omitempty" yaml:"endpoint_required,omitempty"`
+	ParametersSchema  map[string]any              `json:"parameters_schema,omitempty" yaml:"parameters_schema,omitempty"`
+	Cost              string                      `json:"cost" yaml:"cost"`
+	Trust             string                      `json:"trust" yaml:"trust"`
+	Limitations       []string                    `json:"limitations,omitempty" yaml:"limitations,omitempty"`
 }
 
 type Run struct {

@@ -1,6 +1,6 @@
 ---
 name: omnihub
-description: 通过 OmniHub MCP 或全局 CLI 在已配置的 Feed、RSSHub、GitHub、Tavily、X 等 Channel 中执行可追溯的 search、latest 与 fetch。用户要求多来源搜索、查最近更新、读取仓库元数据、限定网站检索、返回来源链接，或需要说明检索覆盖与失败时使用。
+description: 通过 OmniHub MCP 或全局 CLI 在已配置的 Discourse、arXiv、Hacker News、GitHub、Tavily、X、Feed 等 Channel 中执行可追溯的 search、latest 与 fetch。用户要求多来源搜索、查最近更新、读取仓库元数据、限定网站检索、返回来源链接，或需要说明检索覆盖与失败时使用。
 ---
 
 # OmniHub
@@ -25,7 +25,8 @@ MCP 参数使用 Tool 暴露的 Schema。CLI 将对应 JSON 对象完整写入 s
   "scope": {"sources": ["github"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
   "limit": 20,
-  "time_range": {},
+  "constraints": {"time": {"field": "published_at", "from": "2026-08-01T00:00:00Z"}},
+  "sort": "newest",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "deadline_ms": 30000
@@ -41,7 +42,8 @@ MCP 参数使用 Tool 暴露的 Schema。CLI 将对应 JSON 对象完整写入 s
   "scope": {"domains": ["example.com"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": false},
   "limit": 10,
-  "time_range": {},
+  "constraints": {},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "deadline_ms": 30000
@@ -69,7 +71,8 @@ GitHub fetch 示例：
   "scope": {"sources": ["github"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
   "limit": 20,
-  "time_range": {},
+  "constraints": {},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "semantic",
   "semantic_profile_id": "semantic_local",
@@ -84,7 +87,7 @@ GitHub fetch 示例：
    - `partial`：保留成功 Item，同时必须说明失败或缺失的路线。
    - `failed`：不得把空 `items` 解释为“没有相关内容”。
 2. 逐项检查 `executions`，确认实际使用的 Channel、Provider、RouteTemplate、Endpoint 与 Egress。
-3. 读取每条 `coverage` 的 `scope`、`truncated` 与 `limitations`。Feed window、GitHub 首页、X recent window 和 Tavily candidate 都不是全量搜索。
+3. 读取每条 `coverage` 的 `scope`、`truncated` 与 `limitations`。Feed 只代表 latest window；GitHub、Discourse、arXiv、HN Algolia 首屏、X recent window 和 Tavily candidate 都不自动等于全量历史。
 4. 读取 `errors`；遇到配置、凭据或依赖问题时运行 doctor，不自行切换未知代理、公共实例或第三方 Provider。
 5. semantic 请求仍处理返回的全部 Item，不得只保留组代表；逐项报告 `item.similarity.group_id`、`score`、`strategy` 与 provenance。出现 `similarity_unavailable` 时保留并引用未分组 Item，同时披露顶层 `partial`；不得把分组失败解释成检索失败或删除 Item。
 6. JSONL 必须消费到 `type=end`；只看中间 Item 会遗漏最终 coverage、error 与 status。

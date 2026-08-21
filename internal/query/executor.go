@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	localFeedWindowLimitation   = "local_feed_window_only"
 	unknownItemTimeLimitation   = "item_time_unknown_excluded"
 	nonUniqueUpstreamLimitation = "upstream_id_not_unique_in_feed"
 	identityClusterPrefix       = "idn_"
@@ -58,6 +57,18 @@ type XURLExecutor interface {
 	Execute(context.Context, adapter.XURLRequest) core.AdapterResult
 }
 
+type DiscourseExecutor interface {
+	Execute(context.Context, adapter.DiscourseRequest) core.AdapterResult
+}
+
+type ArxivExecutor interface {
+	Execute(context.Context, adapter.ArxivRequest) core.AdapterResult
+}
+
+type HNAlgoliaExecutor interface {
+	Execute(context.Context, adapter.HNAlgoliaRequest) core.AdapterResult
+}
+
 // CookieReader 是 Query Plane 对当前用户 Chrome Bridge 的唯一依赖。
 // scope 只能由已经选中的 RouteTemplate 生成，不能接受 Adapter 自报范围。
 type CookieReader interface {
@@ -85,6 +96,9 @@ type Service struct {
 	GitHub        GitHubExecutor
 	Tavily        TavilyExecutor
 	XURL          XURLExecutor
+	Discourse     DiscourseExecutor
+	Arxiv         ArxivExecutor
+	HNAlgolia     HNAlgoliaExecutor
 	CookieReader  CookieReader
 	BrowserCookie BrowserCookieExecutor
 	Semantic      SemanticGrouper
@@ -319,6 +333,30 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Credential: credential, Egress: egress,
 		})
+	case "discourse":
+		if run.service.Discourse == nil {
+			return false, fmt.Errorf("%w: Discourse executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.Discourse.Execute(childContext, adapter.DiscourseRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "arxiv":
+		if run.service.Arxiv == nil {
+			return false, fmt.Errorf("%w: arXiv executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.Arxiv.Execute(childContext, adapter.ArxivRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "hn_algolia":
+		if run.service.HNAlgolia == nil {
+			return false, fmt.Errorf("%w: HN Algolia executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.HNAlgolia.Execute(childContext, adapter.HNAlgoliaRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Egress: egress, EgressCredential: egressCredential,
+		})
 	case "browser_cookie":
 		// 先确认明确的 consumer，避免配置错误时仍读取用户 Cookie。Reader
 		// 离线属于当前 Channel 的可观察失败，不应中止 aggregate 的其他路径。
@@ -381,7 +419,11 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 	}
 	examinedFallback := len(result.Items)
 	var unknownTimeExcluded bool
-	result.Items, unknownTimeExcluded = filterTimeRange(result.Items, run.operation.TimeRange)
+	timeRange := run.operation.TimeRange
+	if run.operation.Operation == core.OperationSearch && decision.RouteTemplate.SearchConstraints.Time.Mode == "post_filter" {
+		timeRange = core.TimeRange{From: run.operation.Constraints.Time.From, To: run.operation.Constraints.Time.To}
+	}
+	result.Items, unknownTimeExcluded = filterTimeRange(result.Items, timeRange)
 	if unknownTimeExcluded {
 		result.Limitations = appendUnique(result.Limitations, unknownItemTimeLimitation)
 		for index := range result.Coverage {
@@ -390,14 +432,6 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			result.Coverage[index].Exhaustive = &exhaustive
 		}
 	}
-	if run.operation.Operation == core.OperationSearch && (decision.RouteTemplate.Adapter == "feed" || decision.RouteTemplate.Adapter == "rsshub") {
-		result.Items = filterSearchWindow(result.Items, *run.operation.Query)
-		result.Limitations = appendUnique(result.Limitations, localFeedWindowLimitation)
-		for index := range result.Coverage {
-			result.Coverage[index].Limitations = appendUnique(result.Coverage[index].Limitations, localFeedWindowLimitation)
-		}
-	}
-
 	execution.DurationMS = elapsedMilliseconds(started, run.now().UTC())
 	execution.Examined = examinedCount(result.Coverage, examinedFallback)
 	execution.Limitations = mergeLimitations(decision.RouteTemplate.Limitations, result.Limitations)
@@ -683,42 +717,6 @@ func filterTimeRange(items []core.Item, timeRange core.TimeRange) ([]core.Item, 
 	return filtered, unknownExcluded
 }
 
-// filterSearchWindow 是 Feed 本地 search 语义的唯一入口。它只在已取得的
-// bounded window 内按 Unicode 小写后的空白词项做 AND 匹配，不暗示源站全量搜索。
-func filterSearchWindow(items []core.Item, query string) []core.Item {
-	filtered := make([]core.Item, 0, len(items))
-	for _, item := range items {
-		if matchesSearch(item, query) {
-			filtered = append(filtered, item)
-		}
-	}
-	return filtered
-}
-
-func matchesSearch(item core.Item, query string) bool {
-	terms := strings.Fields(strings.ToLower(query))
-	parts := []string{item.Title}
-	if item.Summary != nil {
-		// Feed 的 description/summary 经常是 HTML，即使同时映射到
-		// Content.HTML 也不能把原始 markup 再当纯文本搜索，否则 hidden、
-		// script 等节点会通过 summary 旁路重新命中。
-		parts = append(parts, visibleHTMLText(*item.Summary))
-	}
-	if item.Content.Text != nil {
-		parts = append(parts, *item.Content.Text)
-	}
-	if item.Content.HTML != nil {
-		parts = append(parts, visibleHTMLText(*item.Content.HTML))
-	}
-	haystack := strings.ToLower(strings.Join(parts, "\n"))
-	for _, term := range terms {
-		if !strings.Contains(haystack, term) {
-			return false
-		}
-	}
-	return true
-}
-
 func visibleHTMLText(raw string) string {
 	document, err := webhtml.Parse(strings.NewReader(raw))
 	if err != nil {
@@ -773,7 +771,7 @@ func finalizeItems(items []routedItem, operation core.Operation) ([]core.Item, m
 	if operation.IdentityDedupe == core.IdentityExact {
 		items = dedupeExact(items)
 	}
-	sortItems(items, operation.Operation)
+	sortItems(items, operation)
 
 	globallyTruncated := make(map[string]bool)
 	if len(items) > operation.Limit {
@@ -962,13 +960,13 @@ func exactContentSeed(item core.Item) string {
 	return strings.Join(parts, "\x00")
 }
 
-func sortItems(items []routedItem, operation core.OperationKind) {
+func sortItems(items []routedItem, operation core.Operation) {
 	slices.SortStableFunc(items, func(left, right routedItem) int {
-		if operation == core.OperationLatest {
+		if operation.Operation == core.OperationLatest || operation.Operation == core.OperationSearch && operation.Sort == core.SearchSortNewest {
 			if compared := compareItemTime(itemSortTime(left.item), itemSortTime(right.item)); compared != 0 {
 				return compared
 			}
-		} else if operation == core.OperationSearch {
+		} else if operation.Operation == core.OperationSearch {
 			if compared := compareRank(bestRank(left.item), bestRank(right.item)); compared != 0 {
 				return compared
 			}

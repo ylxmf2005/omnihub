@@ -132,19 +132,35 @@ export interface TimeRange {
   to?: string
 }
 
+export type SearchContentField = 'title' | 'body' | 'first_post'
+export type SearchSort = 'relevance' | 'newest'
+
+export interface SearchConstraints {
+  time?: { field?: 'published_at'; from?: string; to?: string }
+  authors?: string[]
+  categories?: string[]
+  tags?: string[]
+  content_fields?: SearchContentField[]
+}
+
 export interface Operation {
   schema_version: '1.0'
   operation: OperationKind
   scope: OperationScope
   route_policy: RoutePolicy
   limit: number
-  time_range: TimeRange
+	/** `latest` only. */
+  time_range?: TimeRange
   identity_dedupe: 'none' | 'exact'
   similarity_grouping: 'off' | 'semantic'
   semantic_profile_id?: string | null
   deadline_ms: number
   /** `search` only. */
   query?: string
+	/** `search` only. */
+  constraints?: SearchConstraints
+	/** `search` only. */
+  sort?: SearchSort
   /** `fetch` only. The field is `target`, matching the fetch endpoint. */
   target?: string
 }
@@ -171,7 +187,6 @@ interface QueryInputBase {
 
 interface RankedQueryInput extends QueryInputBase {
   limit: number
-  time_range: TimeRange
   identity_dedupe: 'none' | 'exact'
   similarity_grouping: 'off' | 'semantic'
   /** Required by the schema when `similarity_grouping` is `semantic`. */
@@ -181,9 +196,13 @@ interface RankedQueryInput extends QueryInputBase {
 
 export interface SearchInput extends RankedQueryInput {
   query: string
+  constraints: SearchConstraints
+  sort: SearchSort
 }
 
-export type LatestInput = RankedQueryInput
+export interface LatestInput extends RankedQueryInput {
+  time_range: TimeRange
+}
 
 export interface FetchInput extends QueryInputBase {
   target: string
@@ -580,6 +599,14 @@ export interface RouteTemplate {
   content_level: 'body' | 'summary' | 'metadata' | 'snippet' | string
   pagination: { kind: string; globally_mergeable: boolean }
   time_range: { kind: string }
+  search_constraints: {
+    time?: { mode?: string; field?: string; precision?: string }
+    authors?: { mode?: string }
+    categories?: { mode?: string }
+    tags?: { mode?: string }
+    content_fields?: { mode?: string }
+    sorts?: SearchSort[]
+  }
   auth: { kind: string; required: boolean }
   /** Absent on templates whose parameters are fixed by their Provider. */
   parameters_schema?: Record<string, unknown>

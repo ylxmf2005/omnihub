@@ -150,7 +150,8 @@ func TestContractEnvelopeSelectionCanBeProducedByRouter(t *testing.T) {
 			RouteTemplateID:  execution.RouteTemplateID,
 			SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{execution.Source}},
 			Provider:         execution.Provider, Capabilities: []string{execution.Capability},
-			Auth: core.AuthDescriptor{Required: execution.Auth.Required},
+			SearchConstraints: core.SearchConstraintsDescriptor{Sorts: []core.SearchSort{core.SearchSortRelevance}},
+			Auth:              core.AuthDescriptor{Required: execution.Auth.Required},
 		})
 		channels = append(channels, core.Channel{
 			ID: execution.ChannelID, Source: execution.Source, RouteTemplateID: execution.RouteTemplateID,
@@ -581,12 +582,18 @@ func TestStage1RouterAndReadinessContracts(t *testing.T) {
 func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 	builtin := registry.BuiltinCatalog()
 	provider, ok := builtin.Provider("direct-feed")
-	if !ok || !slices.Contains(provider.Capabilities, "latest") || !slices.Contains(provider.Capabilities, "search") {
+	if !ok || !slices.Contains(provider.Capabilities, "latest") || slices.Contains(provider.Capabilities, "search") {
 		t.Fatalf("direct-feed provider = %#v, %v", provider, ok)
 	}
 	template, ok := builtin.RouteTemplate("direct-feed-window")
 	if !ok || template.Adapter != "feed" || template.SourceConstraint.Kind != "any_registered" {
 		t.Fatalf("generic direct-feed template = %#v, %v", template, ok)
+	}
+	nodeseekTemplate, ok := builtin.RouteTemplate("nodeseek-direct-latest")
+	properties, propertiesOK := nodeseekTemplate.ParametersSchema["properties"].(map[string]any)
+	urlSchema, urlSchemaOK := properties["url"].(map[string]any)
+	if !ok || nodeseekTemplate.SourceConstraint.Kind != "exact" || !slices.Equal(nodeseekTemplate.SourceConstraint.Values, []string{"nodeseek"}) || !propertiesOK || !urlSchemaOK || urlSchema["const"] != "https://rss.nodeseek.com/" {
+		t.Fatalf("NodeSeek official feed template = %#v, %v", nodeseekTemplate, ok)
 	}
 
 	withEgress, err := builtin.WithEgressProfile(core.EgressProfile{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true})
@@ -606,15 +613,19 @@ func TestStage2DirectFeedRegistryContracts(t *testing.T) {
 	if _, ok := builtin.Channel("channel_example_feed"); ok {
 		t.Fatal("WithSourceAndChannel mutated the original catalog")
 	}
-	query := "agent"
 	operation := core.Operation{
-		SchemaVersion: core.SchemaVersion, Operation: core.OperationSearch, Query: &query,
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationLatest,
 		Scope: core.Scope{Channels: []string{"channel_example_feed"}}, RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto},
 		Limit: 20, IdentityDedupe: core.IdentityExact, SimilarityGrouping: core.SimilarityOff, DeadlineMS: 30000,
 	}
 	plan, err := router.Build(transient, operation)
 	if err != nil || len(plan.Selected) != 1 || plan.Selected[0].Channel.ID != "channel_example_feed" {
-		t.Fatalf("Build(transient feed search) = %#v, %v", plan, err)
+		t.Fatalf("Build(transient feed latest) = %#v, %v", plan, err)
+	}
+	query := "agent"
+	operation.Operation, operation.Query = core.OperationSearch, &query
+	if _, err := router.Build(transient, operation); !errors.Is(err, router.ErrNoRoute) {
+		t.Fatalf("Build(transient feed search) error = %v, want no route", err)
 	}
 
 	health := readiness.Doctor(transient, time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC))
@@ -646,7 +657,7 @@ func TestStageBFeedSampleBundleStaysSourceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceIDs := []string{"arxiv", "hacker-news", "youtube", "newsletter", "podcast"}
+	sourceIDs := []string{"youtube", "newsletter", "podcast"}
 	for _, sourceID := range sourceIDs {
 		source, ok := catalog.Source(sourceID)
 		if !ok || source.Origin != "imported" || !source.Enabled || !slices.Contains(source.Tags, "feed") {
@@ -806,10 +817,10 @@ func stage2QueryCatalog(t *testing.T, channels []core.Channel) *registry.Catalog
 	}
 	catalog, err := registry.NewCatalog(
 		sources,
-		[]core.Provider{{ID: "fixture-feed", Capabilities: []string{"search", "latest"}, Enabled: true}},
+		[]core.Provider{{ID: "fixture-feed", Capabilities: []string{"latest"}, Enabled: true}},
 		[]core.RouteTemplate{{
 			RouteTemplateID: "fixture-feed-window", SourceConstraint: core.SourceConstraint{Kind: "any_registered"},
-			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search", "latest"},
+			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"latest"},
 		}},
 		channels, nil, []core.EgressProfile{{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}}, nil, nil,
 		nil, nil,
@@ -901,9 +912,9 @@ func stageBQueryCatalog(t *testing.T) *registry.Catalog {
 			{ID: "xurl", Capabilities: []string{"search"}, Enabled: true},
 		},
 		[]core.RouteTemplate{
-			{RouteTemplateID: "github", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "github", Capabilities: []string{"search", "fetch"}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "token"}, Limitations: []string{"github_repository_metadata_only"}},
-			{RouteTemplateID: "tavily", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"tavily-discovery"}}, Provider: "tavily", Adapter: "tavily", Capabilities: []string{"search"}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "api_key", Required: true}},
-			{RouteTemplateID: "xurl", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "xurl", Capabilities: []string{"search"}, Auth: core.AuthDescriptor{Kind: "app_only", Required: true}},
+			{RouteTemplateID: "github", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"github"}}, Provider: "github-api", Adapter: "github", Capabilities: []string{"search", "fetch"}, SearchConstraints: core.SearchConstraintsDescriptor{Sorts: []core.SearchSort{core.SearchSortRelevance}}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "token"}, Limitations: []string{"github_repository_metadata_only"}},
+			{RouteTemplateID: "tavily", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"tavily-discovery"}}, Provider: "tavily", Adapter: "tavily", Capabilities: []string{"search"}, SearchConstraints: core.SearchConstraintsDescriptor{Sorts: []core.SearchSort{core.SearchSortRelevance}}, EndpointRequired: true, Auth: core.AuthDescriptor{Kind: "api_key", Required: true}},
+			{RouteTemplateID: "xurl", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"x"}}, Provider: "xurl", Adapter: "xurl", Capabilities: []string{"search"}, SearchConstraints: core.SearchConstraintsDescriptor{Sorts: []core.SearchSort{core.SearchSortRelevance}}, Auth: core.AuthDescriptor{Kind: "app_only", Required: true}},
 		},
 		[]core.Channel{
 			{ID: "github", Source: "github", RouteTemplateID: "github", EndpointProfileID: "github-endpoint", CredentialID: "github-credential", Priority: 100, Enabled: true},
@@ -1958,24 +1969,12 @@ func TestStage2QueryServicePublicAPIContracts(t *testing.T) {
 		}
 	})
 
-	t.Run("search only uses visible HTML", func(t *testing.T) {
+	t.Run("feed search is rejected before execution", func(t *testing.T) {
 		catalog := stage2QueryCatalog(t, []core.Channel{{ID: "search", Source: "source", EgressProfileID: "egress-direct", Enabled: true}})
-		hiddenHTML := `<script>needle</script><div hidden>needle</div><p>ordinary text</p>`
-		visibleHTML := `<style>.hidden{display:none}</style><span aria-hidden="true">needle</span><p>Visible needle</p>`
-		hiddenID, visibleID := "hidden", "visible"
-		feed := &fakeFeedExecutor{results: map[string]core.AdapterResult{
-			"search": successfulFeedResult(
-				core.Item{Title: "Hidden only", Summary: &hiddenHTML, Content: core.Content{HTML: &hiddenHTML}, Observations: []core.Observation{{UpstreamID: &hiddenID, Verification: core.VerificationBody}}},
-				core.Item{Title: "Visible", Summary: &visibleHTML, Content: core.Content{HTML: &visibleHTML}, Observations: []core.Observation{{UpstreamID: &visibleID, Verification: core.VerificationBody}}},
-			),
-		}}
-
-		envelope, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationSearch, []string{"search"}, 10))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(envelope.Items) != 1 || envelope.Items[0].Title != "Visible" || !slices.Contains(envelope.Executions[0].Limitations, "local_feed_window_only") {
-			t.Fatalf("visible HTML search envelope = %#v", envelope)
+		feed := &fakeFeedExecutor{}
+		_, err := (queryservice.Service{Feed: feed, Now: func() time.Time { return fixedNow }}).Execute(context.Background(), catalog, stage2Operation(core.OperationSearch, []string{"search"}, 10))
+		if !errors.Is(err, router.ErrNoRoute) || len(feed.requests) != 0 {
+			t.Fatalf("feed search error = %v, requests = %d", err, len(feed.requests))
 		}
 	})
 
@@ -2171,6 +2170,26 @@ func stage2ManagementService(t *testing.T) (management.Service, *sqlitestore.Sto
 
 func TestStage2ManagementSQLiteContracts(t *testing.T) {
 	ctx := context.Background()
+
+	t.Run("official feed preset supplies and protects its URL", func(t *testing.T) {
+		service, _ := stage2ManagementService(t)
+		if _, err := service.ApplyEgressProfile(ctx, management.ApplyEgressProfileInput{ID: "egress-direct", Mode: core.EgressModeDirect, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		created, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "nodeseek", ChannelID: "channel-nodeseek", RouteTemplateID: "nodeseek-direct-latest",
+			EgressProfileID: "egress-direct", Priority: 100,
+		})
+		if err != nil || created.Parameters["url"] != "https://rss.nodeseek.com/" {
+			t.Fatalf("ApplyDirectFeed(NodeSeek preset) = %#v, %v", created, err)
+		}
+		if _, err := service.ApplyDirectFeed(ctx, management.ApplyDirectFeedInput{
+			SourceID: "nodeseek", ChannelID: "channel-other", RouteTemplateID: "nodeseek-direct-latest",
+			EgressProfileID: "egress-direct", URL: "https://example.com/feed.xml", Priority: 100,
+		}); !errors.Is(err, management.ErrInvalidDirectFeed) {
+			t.Fatalf("ApplyDirectFeed(NodeSeek override) error = %v, want ErrInvalidDirectFeed", err)
+		}
+	})
 
 	t.Run("apply update CAS disable and preserve fallback", func(t *testing.T) {
 		service, store := stage2ManagementService(t)
@@ -2407,7 +2426,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 
 		githubChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
 			ID: "channel-github", DisplayName: "GitHub anonymous", SourceID: "github", RouteTemplateID: "github-native-search",
-			EndpointProfileID: githubEndpoint.ID, Priority: 100, Enabled: true,
+			Priority: 100, Enabled: true,
 		})
 		if err != nil || githubChannel.Revision != 1 || githubChannel.CredentialID != "" || githubChannel.EndpointProfileID != githubEndpoint.ID || githubChannel.EgressProfileID != "" || githubChannel.Parameters != nil {
 			t.Fatalf("ApplyProviderChannel(GitHub anonymous) = %#v, %v", githubChannel, err)
@@ -2435,6 +2454,13 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 			t.Fatalf("ApplyProviderChannel(Tavily) = %#v, %v", tavilyChannel, err)
 		}
 		assertJSONEquivalent(t, tavilyChannel.Parameters["exclude_domains"], []string{"docs.example.com", "api.example.com"})
+
+		arxivChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
+			ID: "channel-arxiv", SourceID: "arxiv", RouteTemplateID: "arxiv-native-search", Priority: 85, Enabled: true,
+		})
+		if err != nil || arxivChannel.EndpointProfileID == "" || arxivChannel.EgressProfileID != "" {
+			t.Fatalf("ApplyProviderChannel(arXiv auto endpoint) = %#v, %v", arxivChannel, err)
+		}
 
 		xurlChannel, err := service.ApplyProviderChannel(ctx, management.ApplyProviderChannelInput{
 			ID: "channel-xurl", SourceID: "x", RouteTemplateID: "x-xurl-search", EgressProfileID: "egress-direct",
@@ -2472,7 +2498,7 @@ func TestStage2ManagementSQLiteContracts(t *testing.T) {
 		}
 
 		stored, err := store.LoadRoutingCatalog(ctx)
-		if err != nil || len(stored.Endpoints) != 2 || len(stored.Channels) != 3 {
+		if err != nil || len(stored.Endpoints) != 3 || len(stored.Channels) != 4 {
 			t.Fatalf("stored provider resources = %#v, %v", stored, err)
 		}
 		githubTemplate, _ := service.Catalog.RouteTemplate(githubChannel.RouteTemplateID)
@@ -3405,7 +3431,7 @@ func stageESemanticCatalog(t *testing.T, baseURL string, profile core.SemanticPr
 		},
 		[]core.RouteTemplate{{
 			RouteTemplateID: "semantic-feed", SourceConstraint: core.SourceConstraint{Kind: "exact", Values: []string{"semantic-source"}},
-			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search"},
+			Provider: "fixture-feed", Adapter: "feed", Capabilities: []string{"search"}, SearchConstraints: core.SearchConstraintsDescriptor{Sorts: []core.SearchSort{core.SearchSortRelevance}},
 		}},
 		[]core.Channel{{
 			ID: "semantic-channel", Source: "semantic-source", RouteTemplateID: "semantic-feed",

@@ -44,6 +44,8 @@ import {
   useCreate,
   useDelete,
   useEgressProfiles,
+  useCredentials,
+  useEndpointProfiles,
   useProbeChannel,
   useReadiness,
   useRouteTemplates,
@@ -51,7 +53,7 @@ import {
   useSources,
 } from '../api/queries'
 import { get } from '../api/client'
-import type { Channel, ChannelInput, ChannelHealth } from '../api/types'
+import type { Channel, ChannelInput, ChannelHealth, RouteTemplate } from '../api/types'
 import { IdChip, ReadinessBadge, RunBadge, Timestamp } from '../components/display'
 import {
   ConfirmDialog,
@@ -68,10 +70,14 @@ import {
 export function Channels() {
   const channels = useChannels()
   const readiness = useReadiness()
+  const templates = useRouteTemplates()
   const [creating, setCreating] = useState(false)
 
   const healthOf = new Map<string, ChannelHealth>(
     (readiness.data?.channels ?? []).map((entry) => [entry.channel_id, entry]),
+  )
+  const templateOf = new Map<string, RouteTemplate>(
+    (templates.data ?? []).map((template) => [template.route_template_id, template]),
   )
   const list = channels.data ?? []
 
@@ -144,6 +150,7 @@ export function Channels() {
                     key={channel.id}
                     channel={channel}
                     health={healthOf.get(channel.id)}
+                    probeable={['feed', 'rsshub'].includes(templateOf.get(channel.route_template_id)?.adapter ?? '')}
                   />
                 ))}
               </Table.Tbody>
@@ -157,7 +164,15 @@ export function Channels() {
   )
 }
 
-function ChannelRow({ channel, health }: { channel: Channel; health?: ChannelHealth }) {
+function ChannelRow({
+  channel,
+  health,
+  probeable,
+}: {
+  channel: Channel
+  health?: ChannelHealth
+  probeable: boolean
+}) {
   const probe = useProbeChannel()
   const [deleting, setDeleting] = useState(false)
 
@@ -213,16 +228,22 @@ function ChannelRow({ channel, health }: { channel: Channel; health?: ChannelHea
         </Table.Td>
         <Table.Td>
           <Group gap={4} wrap="nowrap" justify="flex-end">
-            <Button
-              variant="default"
-              size="compact-sm"
-              leftSection={<IconStethoscope size={13} />}
-              disabled={READ_ONLY}
-              loading={probe.isPending}
-              onClick={() => probe.mutate(channel.id)}
-            >
-              检查
-            </Button>
+            {probeable ? (
+              <Button
+                variant="default"
+                size="compact-sm"
+                leftSection={<IconStethoscope size={13} />}
+                disabled={READ_ONLY}
+                loading={probe.isPending}
+                onClick={() => probe.mutate(channel.id)}
+              >
+                检查
+              </Button>
+            ) : (
+              <Text fz="xs" c="dimmed">
+                由实际查询验证
+              </Text>
+            )}
             <Button
               variant="subtle"
               color="red"
@@ -305,15 +326,37 @@ function DeleteChannelDialog({
   )
 }
 
+const ROUTE_LABELS: Record<string, string> = {
+  'direct-feed-window': '公开 RSS / Atom',
+  'v2ex-direct-latest': 'V2EX 最新主题',
+  'nodeseek-direct-latest': 'NodeSeek 最新主题',
+  'github-native-search': 'GitHub 官方搜索',
+  'tavily-search': 'Tavily Web Search',
+  'v2ex-web-search': 'V2EX Web Search',
+  'x-xurl-search': 'X 官方搜索',
+  'linux-do-discourse-search': 'linux.do 官方搜索',
+  'arxiv-native-search': 'arXiv 官方搜索',
+  'hn-algolia-search': 'Hacker News Search',
+}
+
+function fixedFeedURL(template?: RouteTemplate): string | undefined {
+  const properties = template?.parameters_schema?.properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return undefined
+  const urlSchema = (properties as Record<string, unknown>).url
+  if (!urlSchema || typeof urlSchema !== 'object' || Array.isArray(urlSchema)) return undefined
+  const value = (urlSchema as Record<string, unknown>).const
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
 /**
- * Creation form. Scoped to the shape a person can actually fill in by hand — a
- * feed-backed Channel — because the generic `parameters` bag differs per
- * RouteTemplate and inventing inputs for schemas we have not read would produce
- * requests the Backend rejects.
+ * 默认流程只收集业务选择。固定官方 Endpoint 由 Backend 在同一事务中复用
+ * 或创建；只有真实需要身份或自定义网络出口时才出现对应字段。
  */
 function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () => void }) {
   const create = useCreate<ChannelInput, Channel>('/v1/channels', [keys.channels])
   const egress = useEgressProfiles()
+  const credentials = useCredentials()
+  const endpoints = useEndpointProfiles()
   const sources = useSources()
   const templates = useRouteTemplates()
 
@@ -323,12 +366,30 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
   const [templateId, setTemplateId] = useState('')
   const [url, setUrl] = useState('')
   const [egressId, setEgressId] = useState('')
+  const [credentialId, setCredentialId] = useState('')
   const [priority, setPriority] = useState<number>(100)
   const [enabled, setEnabled] = useState(true)
 
-  // Only templates whose parameters this form actually knows how to fill.
-  const feedTemplates = (templates.data ?? []).filter(
-    (template) => template.adapter === 'feed' || template.provider.includes('feed'),
+  const manageableTemplates = (templates.data ?? []).filter((template) =>
+    ['feed', 'github', 'tavily', 'xurl', 'discourse', 'arxiv', 'hn_algolia'].includes(template.adapter),
+  )
+  const selectedTemplate = manageableTemplates.find((template) => template.route_template_id === templateId)
+  const fixedSource = selectedTemplate?.source_constraint.kind === 'exact'
+    ? selectedTemplate.source_constraint.values?.[0]
+    : undefined
+  const isFeed = selectedTemplate?.adapter === 'feed'
+  const presetFeedURL = isFeed ? fixedFeedURL(selectedTemplate) : undefined
+  const usesEndpoint = selectedTemplate?.endpoint_required === true
+  const matchingEndpoints = (endpoints.data ?? []).filter(
+    (endpoint) => endpoint.provider === selectedTemplate?.provider && endpoint.enabled,
+  )
+  const enabledEgress = (egress.data ?? []).filter((profile) => profile.enabled)
+  const needsEndpointEgressChoice = usesEndpoint && (
+    matchingEndpoints.length > 1 || matchingEndpoints.length === 0 && enabledEgress.length > 1
+  )
+  const usesEgress = isFeed || selectedTemplate?.adapter === 'xurl' || needsEndpointEgressChoice
+  const matchingCredentials = (credentials.data ?? []).filter(
+    (credential) => credential.provider === selectedTemplate?.provider && credential.enabled,
   )
 
   const reset = () => {
@@ -338,6 +399,7 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
     setTemplateId('')
     setUrl('')
     setEgressId('')
+    setCredentialId('')
     setPriority(100)
     setEnabled(true)
     create.reset()
@@ -352,8 +414,10 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
         priority,
         enabled,
         display_name: displayName.trim() || undefined,
-        url: url.trim() || undefined,
-        egress_profile_id: egressId || undefined,
+        url: isFeed ? presetFeedURL ?? (url.trim() || undefined) : undefined,
+        egress_profile_id: usesEgress ? egressId || undefined : undefined,
+        credential_id: credentialId || undefined,
+        parameters: templateId === 'v2ex-web-search' ? { include_domains: ['v2ex.com'] } : undefined,
       })
       reset()
       onClose()
@@ -362,7 +426,9 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
     }
   }
 
-  const ready = id.trim() !== '' && sourceId.trim() !== '' && templateId !== '' && url.trim() !== ''
+  const ready = id.trim() !== '' && sourceId.trim() !== '' && templateId !== '' &&
+    (!isFeed || presetFeedURL !== undefined || url.trim() !== '') && (!usesEgress || egressId !== '') &&
+    (selectedTemplate?.auth.required !== true || credentialId !== '')
 
   return (
     <Modal opened={opened} onClose={onClose} title="新建 Channel" size="lg" centered>
@@ -381,51 +447,89 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
           value={displayName}
           onChange={(event) => setDisplayName(event.currentTarget.value)}
         />
-        <Group grow align="flex-start">
+        <Select
+          label="接入方式"
+          description="官方服务地址会自动复用或创建，不需要另外配置 Endpoint。"
+          placeholder={templates.isLoading ? '正在读取…' : '选择一种接入方式'}
+          data={manageableTemplates.map((template) => ({
+            value: template.route_template_id,
+            label: ROUTE_LABELS[template.route_template_id] ?? template.route_template_id,
+          }))}
+          value={templateId}
+          onChange={(value) => {
+            const nextTemplateId = value ?? ''
+            const nextTemplate = manageableTemplates.find(
+              (template) => template.route_template_id === nextTemplateId,
+            )
+            const nextFixedSource = nextTemplate?.source_constraint.kind === 'exact'
+              ? nextTemplate.source_constraint.values?.[0]
+              : undefined
+            setTemplateId(nextTemplateId)
+            setSourceId(nextFixedSource ?? '')
+            setUrl('')
+            setEgressId('')
+            setCredentialId('')
+          }}
+          required
+        />
+        {fixedSource ? (
+          <Text fz="xs" c="dimmed">
+            内容来源：{fixedSource}
+          </Text>
+        ) : selectedTemplate ? (
           <Select
-            label="Source"
-            description="内容归属的站点。"
-            placeholder={sources.isLoading ? '正在读取…' : '选择 Source'}
-            data={(sources.data ?? []).map((source) => ({ value: source.id, label: source.id }))}
+            label="内容来源"
+            description="选择这条线路归属的站点。"
+            placeholder={sources.isLoading ? '正在读取…' : '选择来源'}
+            data={(sources.data ?? []).map((source) => ({
+              value: source.id,
+              label: source.display_name || source.id,
+            }))}
             value={sourceId}
             onChange={(value) => setSourceId(value ?? '')}
             searchable
             required
           />
-          <Select
-            label="RouteTemplate"
-            description="决定用哪个 Provider 与 Adapter 取数。"
-            placeholder={templates.isLoading ? '正在读取…' : '选择模板'}
-            data={feedTemplates.map((template) => ({
-              value: template.route_template_id,
-              label: template.route_template_id,
-            }))}
-            value={templateId}
-            onChange={(value) => setTemplateId(value ?? '')}
-            required
-          />
-        </Group>
-        <TextInput
+        ) : null}
+        {isFeed && !presetFeedURL && <TextInput
           label="Feed 地址"
           description="公开可访问的 RSS 或 Atom 地址。"
           placeholder="https://www.v2ex.com/index.xml"
           value={url}
           onChange={(event) => setUrl(event.currentTarget.value)}
           required
-        />
+        />}
+        {presetFeedURL && <Text fz="xs" c="dimmed">
+          官方 Feed：{presetFeedURL}
+        </Text>}
+        {selectedTemplate && selectedTemplate.auth.kind !== 'none' && <Select
+          label={selectedTemplate.auth.required ? '访问凭据' : '访问凭据（可选）'}
+          description={selectedTemplate.auth.required ? '这个来源要求凭据。' : '匿名访问受限时再选择凭据。'}
+          placeholder={matchingCredentials.length === 0 ? '暂无可用凭据' : '选择凭据'}
+          data={matchingCredentials.map((credential) => ({
+            value: credential.id,
+            label: credential.label || credential.id,
+          }))}
+          value={credentialId}
+          onChange={(value) => setCredentialId(value ?? '')}
+          clearable={!selectedTemplate.auth.required}
+          required={selectedTemplate.auth.required}
+        />}
         <Group grow align="flex-start">
-          <Select
-            label="Egress"
-            description="出站线路。留空表示由后端按默认规则选择。"
-            placeholder={egress.isLoading ? '正在读取…' : '选择 Egress'}
-            data={(egress.data ?? []).map((profile) => ({
+          {usesEgress && <Select
+            label="网络出口"
+            description={needsEndpointEgressChoice
+              ? '存在多条可用线路，请选择官方服务使用的出口。'
+              : 'Feed 和本机命令需要显式选择网络出口。'}
+            placeholder={egress.isLoading ? '正在读取…' : '选择网络出口'}
+            data={enabledEgress.map((profile) => ({
               value: profile.id,
               label: profile.display_name || profile.id,
             }))}
             value={egressId}
             onChange={(value) => setEgressId(value ?? '')}
-            clearable
-          />
+            clearable={false}
+          />}
           <NumberInput
             label="优先级"
             description="同一 Source 下数值大的先被选用。"
@@ -444,7 +548,7 @@ function CreateChannelModal({ opened, onClose }: { opened: boolean; onClose: () 
         {create.error ? <ErrorAlert error={create.error} /> : null}
 
         <Text fz="xs" c="dimmed">
-          创建只写入配置。这条线路是否真的可用，要等一次成功的连通性检查才能确定。
+          创建后可直接在 Query Workbench 运行一次真实查询。Feed 与 RSSHub 还支持单独的连通性检查。
         </Text>
 
         <Group justify="flex-end" gap="xs" mt="xs">

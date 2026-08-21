@@ -13,7 +13,7 @@
 - 实际对象：计划中的独立项目 `/Users/ethan/Desktop/omnihub`；目标 GitHub 仓库为 `ylxmf2005/omnihub`。
 - 初始基线：本地只有 Shape 产物，没有实现、Git 历史或运行基线，远程目标仓库不存在。当前已创建公开仓库 `https://github.com/ylxmf2005/omnihub`，`main` 首个 Stage 0 提交为 `dca316899587478c3792c8dd2a479b3d5398ab6d`。
 - 调查基线：已冷读 AstaNews、`ylxmf2005/mol-news`、`deqiying/onesearch`、`mcncarl/yichen-skills`、RSSHub、FreshRSS、Miniflux、RSS-Bridge 与 SearXNG，并对照 JSON Feed、OPML、MCP、Singer State 和 RFC 9457。
-- 已验证的来源现实：V2EX Direct Atom 与 linux.do Direct RSS 在当前环境可取；RSSHub 当前存在 V2EX Route。NodeSeek 主站和第三方 Feed 在当前环境受到 TLS/403 限制，不能仅凭配置宣称可用。
+- 已验证的来源现实：V2EX Direct Atom 与 linux.do Direct RSS 在当前环境可取；RSSHub 当前存在 V2EX Route。NodeSeek 官方推荐 `https://rss.nodeseek.com/`，但当前本机 DNS 结果与公共 DNS 不一致，Direct Probe 超时，仍不能仅凭内置配置宣称 ready。
 - X 的当前候选：优先接入 X 官方维护的 `xurl`，它提供 recent search、JSON 输出与 MCP bridge，但要求用户自己的 X Developer App；`twscrape` 只作为用户明确授权 cookie/account 后的可选 Provider，不自动回退。
 - RSSHub 现实：它能输出 RSS、Atom、JSON Feed 并暴露 Route 元数据，但 Endpoint 可达不等于具体 Route 已具备 credential、浏览器或反爬条件；X Route 本身也需要 X 鉴权配置。
 - 已确认持久层方向：v1 真实实现使用 SQLite，但领域层通过 Repository/Unit of Work 隔离持久化；Schema、ID、乐观并发、幂等与 Run lease 边界为未来 MySQL 多实例执行留出迁移空间。v1 不同时维护 MySQL Driver，也不宣称已经分布式。
@@ -38,10 +38,16 @@
 - Chrome Bridge 离线或 permission 缺失时，依赖它的 Channel 当前不可执行，readiness 始终为 `blocked`；已有成功 Snapshot 的 View 仍可作为 `stale` 分发。历史 Probe 不能把当前缺失的运行依赖降格成仅 `degraded`。
 - 已确认剩余 MVP 默认值：`serve` 只提供前台 loopback 进程，不实现三平台服务管理器；View 优先遵守上游 freshness hint，无 hint 时使用 15 分钟，不增加 per-View 覆盖项；SQLite 自动执行事务化、仅向前 migration，不支持降级；普通卸载保留用户数据。首个公开版本按 `0.1.x` preview 准备，传输 Schema 保持独立版本，正式 1.0 前完成 compatibility review。
 - Stage E 安全边界：远程 embedding Endpoint 只允许 HTTPS；明文 HTTP 只允许字面 loopback IP 经 direct Egress，用于本机 Ollama。管理写入与执行 preflight 复用同一判断，不允许环境或显式代理承载明文用户内容。
+- 2026-08-21 新运行证据推翻了 Direct Feed Search 的既有收口：`direct-feed-window` 同时声明 `latest/search`，而 Executor 的 Search 只是在已取得的 bounded Feed window 中过滤。用户已确认 0.x 直接纠正且不保留 Feed Search 兼容层；当前实现已把 Feed/RSSHub 收为 latest-only。
+- 2026-08-21 继续核验确认 linux.do 有真实站内 Search：Discourse 官方文档化入口为 `GET /search.json?q=...&page=...`，站内公开语法支持日期范围、作者、分类、标签、内容范围和排序。但当前从普通后端 HTTP Egress 请求该入口会被 Cloudflare challenge 403，补浏览器 UA 仍不能通过；linux.do Search Route 因而需要 User API Key 或 Browser Bridge 的真实运行验证，不能只凭 Endpoint 存在宣称 ready。
+- 原 `Operation.time_range` 与 `RouteTemplate.time_range` 无法表达 Search 的时间字段、精度、作者、分类、标签、内容范围和排序。当前已增加结构化 `constraints/sort` 与逐 Route 支持声明，并由 Router 在发网前拒绝不支持的限定。
+- 2026-08-21 复核 V2EX 当前官方 API 2.0 文档、官方网页搜索实现和常见候选路径后，未发现官方主题全文 Search API：官方前端把全文查询引向 Google `site:v2ex.com/t` 与第三方 SoV2EX。SoV2EX 的公开 Search API 当前可用且支持时间/节点/排序，但只能作为第三方专用索引 Route；V2EX native 仍只承诺 latest/fetch，Search 需要用户显式选择 Web Search 或 SoV2EX。
 
 ## Goal
 
 把 OmniHub 实现并验收到可发布的本地 v1：既支持无状态的一次性 Agent 检索，也能保存 View、分发 Feed、通过 Web Dashboard Backend 管理配置与运行；CLI、HTTP、MCP、Feed 与 Skill 共享同一执行语义，并对每次执行如实返回实际 Provider、Channel、RouteTemplate、Egress、覆盖范围、失败和来源链路。
+
+本轮修订还要让 Search 与 Latest 的公共语义重新可信：Feed/RSSHub 只承担 Latest，Search 必须进入平台官方 Search、平台官方采用的搜索服务或用户显式选择的 Web/第三方索引，并能结构化表达时间、作者、分类、标签、内容范围和排序限定。
 
 ## Scope
 
@@ -55,10 +61,12 @@
 - 定义 Channel、RouteTemplate、Credential 与 Browser Bridge；支持 Dashboard 录入 API Key、用户授权 Chrome 域权限、打开登录页、按执行读取 Cookie、撤销授权并查看分层健康。
 - 规划 Chrome Companion Extension 与 Native Messaging Host 的后端合同；Extension 客户端实现不属于本后端 Task。
 - 实现显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage A，不反向进入 Stage 3 验收。
-- 用代表性路线验证抽象：Direct Feed、RSSHub、GitHub、Tavily 与 X，而不是先堆平台数量。
-- 为 V2EX、linux.do 与 NodeSeek conditional 提供基于 Feed 的真实来源样例；arXiv、YouTube、Hacker News、Newsletter/Podcast 只通过已证明的 Feed/Bundle 类型扩充，不提前增加专用 Adapter。
+- 用代表性路线验证抽象：Direct Feed、RSSHub、GitHub、Tavily、X、Discourse、arXiv Query API 与 HN Algolia，而不是把 Feed window 冒充所有平台的 Search。
+- 为 V2EX、linux.do 与 NodeSeek conditional 保留基于 Feed 的 latest 来源；arXiv 与 Hacker News 增加真实 Search Route，YouTube、Newsletter/Podcast 继续通过已证明的 Feed/Bundle 类型扩充。
 - 提供显式 opt-in 的本地 semantic grouping，以一套 OpenAI-compatible embedding contract 支持本地 Ollama `/v1/embeddings` 与用户配置的兼容 Endpoint；不同模型/维度/revision 不混算，分组不删除 Item。
 - 按可独立验收的纵切完成实现、测试、审核与发布准备。
+- 为 linux.do、arXiv 与 Hacker News 增加真实 Search Route；V2EX Search 走显式 domain Web Search，不把 SoV2EX 内建进首版。
+- 为 Search Operation 增加结构化 constraints/sort，并让 RouteTemplate 在发网前声明和校验每项限定的执行方式、时间字段与精度。
 
 ## Non-goals
 
@@ -76,6 +84,7 @@
 - Stage 3 不实现 EgressProfile、HTTP/SOCKS5 代理或 DNS/TCP/TLS 分层 Probe。后续 Stage A 也不实现真正的 macOS System Proxy/PAC、VPN/TUN 或最快线路自动选择。
 - v1 不引入 sqlite-vec、Chromem、Qdrant、LanceDB 或独立 ANN 服务；当单模型 cohort 达到约一万条，或语义比较 p95 超过 150ms，再依据真实数据重新选择索引。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
+- 不把 Feed window 内关键词过滤保留为 Search 兼容层；不解析调用者塞进 query 的 Provider 私有控制语法；不在首版接入 SoV2EX。
 
 ## Acceptance Evidence
 
@@ -93,16 +102,22 @@
 - Chrome mock Bridge 证明 permission/scope/断线/成功路径，Cookie 不进入 SQLite、HTTP、Run、Error、日志或 fixture；Extension 客户端仍由独立工作流交付。
 - semantic grouping 在固定语料上证明同模型 cohort、阈值边界、Endpoint/Credential/model/index revision 隔离、provider unavailable、dimension/finite/zero-norm 与坏 BLOB fail-closed；所有 Item 保留，功能默认关闭，JSON/RSS/Atom 从 Snapshot 保留同一 similarity metadata。
 - macOS/Linux/Windows 产物、checksum、全新目录安装/doctor、配置示例和扩展文档可重放；最终 Test 与独立 Review 均通过。
+- Direct Feed/RSSHub RouteTemplate 不再声明 Search；旧 Feed Search View 执行时在发网前明确失败，不能静默改成 Latest。
+- 同一组结构化 Search constraints 经 CLI、REST、MCP、View 与 Dashboard 保存后语义一致；Route 不支持请求限定时在选路/执行前明确失败，限定不得静默丢失。
+- linux.do Search 真实进入 Discourse Search 且 Cloudflare/PAT/Browser Bridge 缺口如实呈现；arXiv 真实进入官方 Query API；HN 真实进入 HN 官方网页采用的 Algolia Search；V2EX Web Search 固定 domain=v2ex.com 并披露 Web index coverage。
 
 ## Current Artifacts
 
 - `shape/evidence/reference-study.md`：`ready`，参考项目、标准、许可证与来源实测。
 - `shape/evidence/local-vector-study.md`：`ready`，近期本地向量方案、发布约束与重评阈值。
-- `shape/requirements.md`：`ready`，发布范围、Egress 决策与 semantic grouping 可观察需求。
-- `shape/contract.md`：`ready`，统一请求/结果、固定 Egress 绑定与 semantic grouping 公共关系。
-- `shape/design.md`：`ready`，五个发布纵切和当前系统回答。
-- `plan.md`：`completed`，Stage 0—E 与 0.1.0 发布候选验证完成。
-- `dev/implementation.md`：`completed`，Stage E semantic grouping、公共出口与发布面已实现并通过聚焦反馈。
+- `shape/diagnosis.md`：`ready`，Search 与 Feed window 能力混用的根因、影响面与修订边界。
+- `shape/requirements.md`：`ready`，Search/Latest 分离、官方优先路线与结构化限定已冻结。
+- `shape/contract.md`：`ready`，公共 Search constraints/sort 与 Route 支持模式已修订。
+- `shape/design.md`：`ready`，Registry/Router、官方搜索 Adapter 与 V2EX Web Search 路线已更新。
+- `plan.md`：`completed`，Stage 0—F 的本地实现与聚焦运行验证完成。
+- `dev/implementation.md`：`completed`，Stage E 与 Stage F 实现、公共出口、Dashboard 和本机真实配置已通过聚焦反馈。
+- Dashboard 创建流程增量：`completed`，官方 Endpoint 在 Channel 创建事务中复用/创建，默认前端流程不再暴露 Endpoint，搜索路线不再提供必失败 Probe；宽屏 1920px 与移动 375px 浏览器验证已通过。
+- 官方 Feed 预设增量：`completed`，V2EX/NodeSeek 固定 Feed 由 RouteTemplate 提供，Dashboard 不要求填写；默认 SQLite 已创建 NodeSeek Channel，当前 Direct Probe 为 `failed/timeout`，仍未标记 ready。
 - `test/test-plan.md`：`completed`，TC-E01—E10 已执行并闭合。
 - `test/test-report.md`：`passed`，来源/功能、发布物、三平台 CI 与历史红色均已裁决。
 - `review/review.md`：`approve`，Stage E 合同、安全、迁移、公共出口与发布候选独立复审通过。

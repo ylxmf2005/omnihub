@@ -24,9 +24,21 @@ func (operation Operation) Validate() error {
 		if operation.Target != nil {
 			return fmt.Errorf("%w: search does not accept target", ErrInvalidOperation)
 		}
+		if operation.TimeRange.From != nil || operation.TimeRange.To != nil {
+			return fmt.Errorf("%w: search uses constraints.time instead of time_range", ErrInvalidOperation)
+		}
+		if err := operation.Constraints.validate(); err != nil {
+			return err
+		}
+		if operation.Sort != "" && operation.Sort != SearchSortRelevance && operation.Sort != SearchSortNewest {
+			return fmt.Errorf("%w: unsupported search sort %q", ErrInvalidOperation, operation.Sort)
+		}
 	case OperationLatest:
 		if operation.Query != nil || operation.Target != nil {
 			return fmt.Errorf("%w: latest accepts neither query nor target", ErrInvalidOperation)
+		}
+		if !operation.Constraints.empty() || operation.Sort != "" {
+			return fmt.Errorf("%w: latest does not accept search constraints or sort", ErrInvalidOperation)
 		}
 	case OperationFetch:
 		if operation.Target == nil || strings.TrimSpace(*operation.Target) == "" {
@@ -34,6 +46,9 @@ func (operation Operation) Validate() error {
 		}
 		if operation.Query != nil {
 			return fmt.Errorf("%w: fetch does not accept query", ErrInvalidOperation)
+		}
+		if !operation.Constraints.empty() || operation.Sort != "" || operation.TimeRange.From != nil || operation.TimeRange.To != nil {
+			return fmt.Errorf("%w: fetch does not accept time or search constraints", ErrInvalidOperation)
 		}
 		if !validFetchTarget(*operation.Target) {
 			return fmt.Errorf("%w: fetch target must be an http(s) URL or an upstream identifier", ErrInvalidOperation)
@@ -97,6 +112,41 @@ func (operation Operation) Validate() error {
 		}
 	default:
 		return fmt.Errorf("%w: unsupported similarity_grouping %q", ErrInvalidOperation, operation.SimilarityGrouping)
+	}
+	return nil
+}
+
+func (constraints SearchConstraints) empty() bool {
+	return constraints.Time.Field == "" && constraints.Time.From == nil && constraints.Time.To == nil && len(constraints.Authors) == 0 && len(constraints.Categories) == 0 && len(constraints.Tags) == 0 && len(constraints.ContentFields) == 0
+}
+
+func (constraints SearchConstraints) validate() error {
+	if constraints.Time.From != nil || constraints.Time.To != nil || constraints.Time.Field != "" {
+		if constraints.Time.Field != SearchTimePublishedAt {
+			return fmt.Errorf("%w: search constraints.time.field must be %q", ErrInvalidOperation, SearchTimePublishedAt)
+		}
+		if constraints.Time.From != nil && constraints.Time.To != nil && constraints.Time.From.After(*constraints.Time.To) {
+			return fmt.Errorf("%w: constraints.time.from must not be after constraints.time.to", ErrInvalidOperation)
+		}
+	}
+	for name, values := range map[string][]string{"authors": constraints.Authors, "categories": constraints.Categories, "tags": constraints.Tags} {
+		if len(values) > 20 {
+			return fmt.Errorf("%w: constraints.%s accepts at most 20 values", ErrInvalidOperation, name)
+		}
+		seen := map[string]bool{}
+		for _, value := range values {
+			if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n") || seen[value] {
+				return fmt.Errorf("%w: constraints.%s values must be non-empty, trimmed and unique", ErrInvalidOperation, name)
+			}
+			seen[value] = true
+		}
+	}
+	seenFields := map[SearchContentField]bool{}
+	for _, field := range constraints.ContentFields {
+		if field != SearchContentTitle && field != SearchContentBody && field != SearchContentFirstPost || seenFields[field] {
+			return fmt.Errorf("%w: unsupported or duplicate content field %q", ErrInvalidOperation, field)
+		}
+		seenFields[field] = true
 	}
 	return nil
 }

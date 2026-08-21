@@ -137,7 +137,7 @@ func (service Service) ApplyChannel(ctx context.Context, input ApplyChannelInput
 			FallbackChannelIDs: fallbacks, CollectionIDs: collections, Enabled: input.Enabled,
 			ExpectedRevision: input.ExpectedRevision,
 		})
-	case "github", "tavily", "xurl":
+	case "github", "tavily", "xurl", "discourse", "arxiv", "hn_algolia":
 		if strings.TrimSpace(input.URL) != "" || strings.TrimSpace(input.SourceDisplayName) != "" || strings.TrimSpace(input.SourceCanonicalURL) != "" || input.FeedMetadata != nil {
 			return core.Channel{}, fmt.Errorf("%w: Provider Channel does not accept Direct Feed fields", ErrInvalidChannel)
 		}

@@ -1,6 +1,6 @@
 # OmniHub Public Contract
 
-状态：`ready`
+状态：`ready`（2026-08-21 Search 真实性修订）
 
 本文定义 CLI、HTTP、MCP、View refresh 与 Web Dashboard Backend 共享的领域合同。实现阶段以同一模型生成 JSON Schema、OpenAPI、MCP Tool Schema 和 CLI command manifest；Dashboard 不另造结果状态。
 
@@ -28,7 +28,14 @@
     "allow_fallback": true
   },
   "limit": 20,
-  "time_range": {"from": null, "to": null},
+  "constraints": {
+    "time": {"field": "published_at", "from": null, "to": null},
+    "authors": [],
+    "categories": [],
+    "tags": [],
+    "content_fields": []
+  },
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "continuation": null,
@@ -40,6 +47,8 @@
 
 - `operation` 为 `search | latest | fetch`；`health` 通过 doctor/readiness 合同暴露，`refresh` 是 View 编排操作，不是 Provider Capability。
 - `search` 要求 `query`；`fetch` 要求 HTTP(S) URL 或由所选 Adapter 进一步校验的稳定上游标识；`latest` 不接受 query。
+- `constraints` 与 `sort` 只用于 search。首批时间字段固定为 `published_at`，边界使用 RFC3339 UTC 闭区间；列表限定均为 AND，`content_fields` 只允许 `title | body | first_post`。`sort` 只允许 `relevance | newest`。
+- `query` 不解析 Discourse qualifier、GitHub qualifier、Algolia numeric filter 等 Provider 私有控制语法；Adapter 只从结构化 constraints/sort 生成上游请求。
 - `scope` 至少给出 Channel、Source、Provider、Domain 或 Collection 之一。非空 `domains` 只允许 search，最多 20 个不重复 hostname，并且 Router 只选择 `allows_global_discovery=true` 的 Provider；v1 由 Tavily 映射为 `include_domains`，不会广播给 Feed、GitHub 或 xurl。
 - `scope.sources` 表示内容来源，`scope.providers` 表示允许使用的检索服务/工具，两者不可混为一个枚举。
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
@@ -61,7 +70,8 @@
     "scope": {"providers": ["github-api", "tavily"]},
     "route_policy": {"mode": "auto", "aggregate": true, "allow_fallback": true},
     "limit": 20,
-    "time_range": {},
+    "constraints": {},
+    "sort": "relevance",
     "identity_dedupe": "exact",
     "similarity_grouping": "off",
     "deadline_ms": 30000
@@ -255,7 +265,9 @@ Item 借用 JSON Feed 1.1 的内容语义，但保留搜索与聚合所需字段
 - 最终 Item 至少保留一条 Observation；Adapter 返回无 Observation 的 Item 属于内部合同错误，不能输出不可追溯链接。
 - `search` 默认按归一化 Channel rank 合并并稳定打破平局；`latest` 默认按时间排序。跨 Provider score 不被假设为同一量纲。
 
-Stage 2 Direct Feed 的 `search` 只在已取得的 bounded Feed window 内执行：query 经 Unicode lowercase 后按空白分词，在 title、summary、text 与可见 HTML text 上做 AND 匹配，并写入 `local_feed_window_only`。显式时间范围为闭区间 `[from,to]`；Item 优先使用 `published_at`，缺失时回退 `modified_at`，时间仍未知则排除并写入 `item_time_unknown_excluded`。这不等于源站全量 search。
+Direct Feed 与 RSSHub 只提供 Latest。对它们发起 Search 在 Router/Adapter 发网前返回无可用 Search Route；已有 Feed Search View 不自动改成 Latest，也不保留兼容性本地过滤。
+
+RouteTemplate 的 `search_constraints` 为每个字段声明 `native_exact | native_coarse | post_filter | unsupported`，时间另含 `field=published_at` 与 `precision=second|minute|day|provider_defined`。GitHub、linux.do、arXiv 与 HN Algolia 先扩大到上游精度，再按响应中的规范化 Item 时间精确收口，因此声明 `post_filter`；Tavily 响应没有 publish/update timestamp，只能按官方日期参数声明 `native_coarse`。未穷尽分页时 Coverage 为 truncated；限定不能被静默删除。
 
 Observation 记录每条获取路径：
 

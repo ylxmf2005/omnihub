@@ -234,11 +234,18 @@ func (adapter GitHubAdapter) requestURL(request GitHubRequest) (*url.URL, error)
 			return nil, errors.New("GitHub repository search requires a query and limit from 1 to 100")
 		}
 		if request.Operation.TimeRange.From != nil || request.Operation.TimeRange.To != nil {
-			return nil, errors.New("GitHub repository search does not support the generic time range")
+			return nil, errors.New("GitHub repository search uses constraints.time, not time_range")
 		}
 		base.Path = strings.TrimRight(base.Path, "/") + "/search/repositories"
 		parameters := base.Query()
-		parameters.Set("q", *request.Operation.Query)
+		query := `"` + strings.ReplaceAll(strings.TrimSpace(*request.Operation.Query), `"`, `\"`) + `"`
+		if from := request.Operation.Constraints.Time.From; from != nil {
+			query += " created:>=" + from.UTC().AddDate(0, 0, -1).Format(time.DateOnly)
+		}
+		if to := request.Operation.Constraints.Time.To; to != nil {
+			query += " created:<=" + to.UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+		}
+		parameters.Set("q", query)
 		parameters.Set("per_page", strconv.Itoa(request.Operation.Limit))
 		parameters.Set("page", "1")
 		base.RawQuery = parameters.Encode()

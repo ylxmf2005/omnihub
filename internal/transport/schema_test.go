@@ -127,7 +127,7 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	validSearch := map[string]any{
 		"schema_version": core.SchemaVersion, "query": "agent search", "scope": map[string]any{"sources": []any{"github"}},
 		"route_policy": map[string]any{"mode": "auto", "aggregate": false, "allow_fallback": true}, "limit": float64(20),
-		"time_range": map[string]any{}, "identity_dedupe": "exact", "similarity_grouping": "off", "deadline_ms": float64(30000),
+		"constraints": map[string]any{}, "sort": "relevance", "identity_dedupe": "exact", "similarity_grouping": "off", "deadline_ms": float64(30000),
 	}
 	if err := searchSchema.Validate(&validSearch); err != nil {
 		t.Fatalf("valid search schema input failed: %v", err)
@@ -139,8 +139,11 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 		t.Fatalf("valid semantic search schema input failed: %v", err)
 	}
 	latestSchema := resolvedSchema(t, artifacts.CLI.Commands[1].InputSchema)
-	validSemanticLatest := cloneJSONMap(t, validSemantic)
-	delete(validSemanticLatest, "query")
+	validSemanticLatest := map[string]any{
+		"schema_version": core.SchemaVersion, "scope": map[string]any{"sources": []any{"github"}},
+		"route_policy": map[string]any{"mode": "auto", "aggregate": false, "allow_fallback": true}, "limit": float64(20),
+		"time_range": map[string]any{}, "identity_dedupe": "exact", "similarity_grouping": "semantic", "semantic_profile_id": "semantic_local", "deadline_ms": float64(30000),
+	}
 	if err := latestSchema.Validate(&validSemanticLatest); err != nil {
 		t.Fatalf("valid semantic latest schema input failed: %v", err)
 	}
@@ -383,7 +386,7 @@ func TestFrozenContractFieldsAreProjected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertProperties(t, artifacts.Schemas.RouteTemplate, "route_template_id", "origin", "source_constraint", "provider", "adapter", "capabilities", "content_level", "pagination", "time_range", "auth", "cost", "trust", "limitations")
+	assertProperties(t, artifacts.Schemas.RouteTemplate, "route_template_id", "origin", "source_constraint", "provider", "adapter", "capabilities", "content_level", "pagination", "time_range", "search_constraints", "auth", "cost", "trust", "limitations")
 	assertProperties(t, artifacts.Schemas.Envelope, "schema_version", "request_id", "status", "request", "selected_channel_ids", "executions", "items", "coverage", "errors", "continuation", "meta")
 	envelopeProperties := schemaObject(t, artifacts.Schemas.Envelope)["properties"].(map[string]any)
 	executionProperties := envelopeProperties["executions"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
@@ -575,7 +578,7 @@ func TestDashboardOpenAPIProjectsImplementedSurface(t *testing.T) {
 	invalidNested := map[string]any{
 		"schema_version": core.SchemaVersion, "operation": "search", "query": "agent search", "scope": map[string]any{"sources": []any{"github"}},
 		"route_policy": map[string]any{"mode": "auto", "aggregate": false, "allow_fallback": true}, "limit": float64(20),
-		"time_range": map[string]any{}, "identity_dedupe": "exact", "similarity_grouping": "semantic", "deadline_ms": float64(30000),
+		"constraints": map[string]any{}, "sort": "relevance", "identity_dedupe": "exact", "similarity_grouping": "semantic", "deadline_ms": float64(30000),
 	}
 	if err := resolvedSchema(t, nestedRaw).Validate(&invalidNested); err == nil {
 		t.Fatal("Run input nested Operation accepts semantic grouping without profile")

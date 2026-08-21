@@ -22,7 +22,7 @@
 - 没有引入向量数据库。`modernc.org/sqlite v1.56.0` 虽能加载 sqlite-vec，但当前最多 100 Item 的请求内 exact grouping 不需要虚拟表、shadow table 或 ANN。单 cohort 接近 10,000 条、p95 超过 150 ms，或出现跨 Snapshot KNN 时再重新评估。
 - embedding failure 不回退云端，也不把检索判成失败；已取得的 Item 全部保留，未获得向量的 Item 保持 `similarity.strategy=off`，Envelope 为 `partial`。
 - Dashboard REST 资源由 `/v1` 与 OpenAPI 版本化，不在裸资源和数组重复 `schema_version`；Operation、Envelope、CLI catalog 与 JSONL 终态继续携带该字段。
-- Chrome Companion Extension、Dashboard 前端、真实 Tavily/X 凭据与 NodeSeek 可达性不由 fixture 冒充。NodeSeek 当前真实 Probe 在 TLS 层失败，状态继续为 conditional。
+- Chrome Companion Extension、真实 Tavily/X 凭据与 NodeSeek 可达性不由 fixture 冒充。NodeSeek 已确认使用官方推荐 Feed，但当前本机网络 Probe 仍失败，状态继续为 conditional。
 - Ponytail full：不增加 ANN、模型安装、云端 fallback、Agent 私有目录探测、自动 PATH 修改、包管理器或第二份 Probe 状态。
 
 ## 聚焦反馈
@@ -30,7 +30,7 @@
 - `go test ./... -count=1`、`go test -race ./... -count=1`、`go vet ./...`、`gofmt -l cmd internal skills`、`git diff --check`：允许 loopback 的工作树上通过；最终冻结提交仍由 Test 阶段重跑。
 - 100 Item cache-hit exact grouping：最终提交上 30 次采样 p95 `1.913791ms`，全部 100 Item/100 group 保留，embedding 上游请求总数保持 1。
 - 真实 binary E2E：CLI JSONL、REST、MCP stdio、View/Run/Snapshot/items、JSON/RSS/Atom Feed 均保留同两条 Item 与相同 semantic group/score；跨入口 embedding 请求仍为 1。
-- Live smoke：V2EX Atom、linux.do RSS、GitHub 匿名 Repository Search 和 metadata Fetch 成功；NodeSeek Probe 输出 DNS/TCP passed、TLS failed、HTTP/Feed parse `not_run`。
+- Live smoke：V2EX Atom、linux.do RSS、GitHub 匿名 Repository Search 和 metadata Fetch 成功；NodeSeek 旧分层 Probe 在 TLS 层失败，本轮官方 Feed Channel Probe 终态为 `failed/timeout`，没有把内置配置冒充 ready。
 - Skill forward-test：隔离 Agent 首轮网络受限时按 Skill 如实返回 failed 且不换工具；允许 OmniHub 公开网络后返回两个实际 GitHub URL，并披露 metadata verification、partial、first-page/truncated 与匿名配额限制。
 - 管理 API 与运行 preflight 均拒绝远程 HTTP 和 loopback+environment；Credential rotation 产生新 cache/group cohort，JSON/RSS/Atom 从 Snapshot 保留相同 similarity；聚焦回归通过。
 
@@ -39,3 +39,20 @@
 - 已证明：冻结提交的全量 test/race/vet、三平台 Actions、archive/checksum/fresh install、SQLite v5 初始化、`go install @commit`、来源/功能矩阵与最终独立 Stage E Review。
 - 剩余风险：真实 Tavily/X 配额、Chrome Extension/Windows Chrome 实机与 NodeSeek 网络条件仍是明确的条件性边界，不阻塞 fixture/contract 已证明的 preview。
 - 下一入口：以 `test/test-report.md` 和 `review/review.md` 作为发布前证据；未经新增授权不创建 Tag、GitHub Release 或修改 `main`。
+
+## Stage F 增量：Search 真实性与官方优先路线
+
+- 删除 Direct Feed/RSSHub 的 Search capability、Executor 本地 Feed 关键词过滤和 `search --feed-url`；Feed 现在只承担 latest，旧 Feed Search 在 Router 发网前明确无路可走。
+- Core Search 改为 `query + constraints + sort`：首批支持 `published_at` 时间闭区间、authors、categories、tags、`title|body|first_post` 与 `relevance|newest`；RouteTemplate 逐项声明 `native_exact|native_coarse|post_filter|unsupported`，Router 不静默忽略限定。
+- 新增 linux.do Discourse、arXiv Query API、HN Algolia 三个 Adapter，并接入 Registry、Query Service、Endpoint/Channel 管理、CLI、REST/MCP schema、Subscription 归一化与 Dashboard。GitHub 时间条件改走 `created:` qualifier；Tavily 映射官方 `start_date/end_date` 与 Channel/Operation domain 交集；V2EX Web Search 固定 `include_domains=["v2ex.com"]`。
+- Dashboard Workbench 可填写时间、排序、作者、分类、标签与内容字段；Connections/Channels 可配置三条新增官方路线。生产静态资源已重建，本机页面真实显示三个已配置 Channel 并从 Workbench 返回 arXiv 结果。
+- 本机真实证据：arXiv 与 HN 各按 `from + newest` 返回 2 条真实 Item；linux.do 官方 `/search.json` 返回 Cloudflare HTTP 403，Envelope 保持 `failed/upstream_error`，没有回退 Feed Search。Tavily/V2EX 因本机没有 Tavily Credential，只保留协议与 fixture 证据。
+- 聚焦验证：新增三 Adapter 的请求映射/归一化测试并更新既有 Feed Search 断言；`go test ./...`、Dashboard lint/build 通过。只扩展既有 `binding_test.go` 与 `model_test.go`，没有新增测试文件。
+
+## Dashboard 创建流程与本地运行增量
+
+- 官方 HTTP Provider 的 Channel 创建现在可省略 Endpoint 引用：Backend 在同一份 RoutingCatalog CAS 中复用等价官方 Endpoint；不存在时仅在唯一可用 Egress 下自动创建。更新仍保留原 Endpoint，多个候选保持显式冲突，不静默改绑。
+- Channel 创建弹窗改为先选“接入方式”，固定 Source 自动带出，官方 Endpoint 不再暴露；Credential 只在路线支持认证时出现，多条网络线路确实需要裁决时才显示出口选择。
+- Channels 列表不再向不支持分层 Probe 的搜索路线提供“检查”按钮，改为提示由实际查询验证，避免生成必然失败的 `probe_unsupported` Run。
+- Dashboard 主内容区使用导航之外的完整宽度，移除 1280px 左对齐上限；项目 `AGENTS.md` 固定 Backend 与前端开发服务器使用 `screen` 常驻及重启后的最小回读要求。
+- `v2ex-direct-latest` 与新增 `nodeseek-direct-latest` 通过 RouteTemplate JSON Schema 的 `const` 保存固定官方 Feed；Backend 在 URL 省略时自动补入并拒绝覆盖，Dashboard 隐藏地址输入但保留 Egress 选择。默认 SQLite 已真实创建 `channel_nodeseek_latest`，保存 URL 为 `https://rss.nodeseek.com/`；当前 Direct Probe 因本机网络超时失败，状态如实保留。

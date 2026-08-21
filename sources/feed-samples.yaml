@@ -1,12 +1,6 @@
 apiVersion: omnihub.dev/v1alpha1
 kind: SourceBundle
 sources:
-  - id: arxiv
-    tags: [research, feed]
-    enabled: true
-  - id: hacker-news
-    tags: [technology, feed]
-    enabled: true
   - id: youtube
     tags: [media, feed]
     enabled: true

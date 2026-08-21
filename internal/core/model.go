@@ -15,7 +15,9 @@ type Operation struct {
 	Scope              Scope              `json:"scope" jsonschema:"允许执行的 Channel、Source、Provider、Domain 或 Collection 范围。"`
 	RoutePolicy        RoutePolicy        `json:"route_policy" jsonschema:"Channel 选择、排除、聚合和回退策略。"`
 	Limit              int                `json:"limit" jsonschema:"每次执行希望返回的最大条目数。"`
-	TimeRange          TimeRange          `json:"time_range" jsonschema:"可选的 UTC 时间范围。"`
+	TimeRange          TimeRange          `json:"time_range,omitzero" jsonschema:"latest 可选的 UTC 时间范围。"`
+	Constraints        SearchConstraints  `json:"constraints,omitzero" jsonschema:"search 的结构化结果限定。"`
+	Sort               SearchSort         `json:"sort,omitempty" jsonschema:"search 排序：relevance 或 newest。"`
 	IdentityDedupe     IdentityDedupe     `json:"identity_dedupe" jsonschema:"身份去重策略。"`
 	SimilarityGrouping SimilarityGrouping `json:"similarity_grouping" jsonschema:"相似内容仅分组，不删除 Item。"`
 	SemanticProfileID  *string            `json:"semantic_profile_id,omitempty" jsonschema:"semantic 分组使用的 embedding profile；其他模式省略。"`
@@ -30,7 +32,8 @@ type SearchInput struct {
 	Scope              Scope              `json:"scope"`
 	RoutePolicy        RoutePolicy        `json:"route_policy"`
 	Limit              int                `json:"limit"`
-	TimeRange          TimeRange          `json:"time_range"`
+	Constraints        SearchConstraints  `json:"constraints"`
+	Sort               SearchSort         `json:"sort"`
 	IdentityDedupe     IdentityDedupe     `json:"identity_dedupe"`
 	SimilarityGrouping SimilarityGrouping `json:"similarity_grouping"`
 	SemanticProfileID  *string            `json:"semantic_profile_id,omitempty"`
@@ -39,7 +42,7 @@ type SearchInput struct {
 }
 
 func (input SearchInput) OperationRequest() Operation {
-	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationSearch, Query: &input.Query, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, TimeRange: input.TimeRange, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, SemanticProfileID: input.SemanticProfileID, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
+	return Operation{SchemaVersion: input.SchemaVersion, Operation: OperationSearch, Query: &input.Query, Scope: input.Scope, RoutePolicy: input.RoutePolicy, Limit: input.Limit, Constraints: input.Constraints, Sort: input.Sort, IdentityDedupe: input.IdentityDedupe, SimilarityGrouping: input.SimilarityGrouping, SemanticProfileID: input.SemanticProfileID, Continuation: input.Continuation, DeadlineMS: input.DeadlineMS}
 }
 
 type LatestInput struct {
@@ -121,6 +124,39 @@ type TimeRange struct {
 	From *time.Time `json:"from,omitempty"`
 	To   *time.Time `json:"to,omitempty"`
 }
+
+type SearchConstraints struct {
+	Time          SearchTimeConstraint `json:"time,omitempty"`
+	Authors       []string             `json:"authors,omitempty"`
+	Categories    []string             `json:"categories,omitempty"`
+	Tags          []string             `json:"tags,omitempty"`
+	ContentFields []SearchContentField `json:"content_fields,omitempty"`
+}
+
+type SearchTimeConstraint struct {
+	Field SearchTimeField `json:"field,omitempty"`
+	From  *time.Time      `json:"from,omitempty"`
+	To    *time.Time      `json:"to,omitempty"`
+}
+
+type SearchTimeField string
+
+const SearchTimePublishedAt SearchTimeField = "published_at"
+
+type SearchContentField string
+
+const (
+	SearchContentTitle     SearchContentField = "title"
+	SearchContentBody      SearchContentField = "body"
+	SearchContentFirstPost SearchContentField = "first_post"
+)
+
+type SearchSort string
+
+const (
+	SearchSortRelevance SearchSort = "relevance"
+	SearchSortNewest    SearchSort = "newest"
+)
 
 type IdentityDedupe string
 

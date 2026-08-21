@@ -55,6 +55,8 @@ type tavilySearchPayload struct {
 	IncludeImages     bool     `json:"include_images"`
 	AutoParameters    bool     `json:"auto_parameters"`
 	IncludeUsage      bool     `json:"include_usage"`
+	StartDate         string   `json:"start_date,omitempty"`
+	EndDate           string   `json:"end_date,omitempty"`
 }
 
 type tavilySearchResponse struct {
@@ -160,7 +162,7 @@ func tavilyPayload(request TavilyRequest) (tavilySearchPayload, *core.Error) {
 		return tavilySearchPayload{}, &core.Error{Code: core.ErrorParameter, Message: "Tavily only supports a non-empty search operation"}
 	}
 	if request.Operation.TimeRange.From != nil || request.Operation.TimeRange.To != nil {
-		return tavilySearchPayload{}, &core.Error{Code: core.ErrorParameter, Message: "Tavily search does not support the generic time range"}
+		return tavilySearchPayload{}, &core.Error{Code: core.ErrorParameter, Message: "Tavily search uses constraints.time, not time_range"}
 	}
 	if request.RouteTemplate.Provider != "tavily" || request.RouteTemplate.Adapter != "tavily" || request.RouteTemplate.RouteTemplateID == "" || request.Channel.RouteTemplateID != request.RouteTemplate.RouteTemplateID {
 		return tavilySearchPayload{}, &core.Error{Code: core.ErrorConfig, Message: "RouteTemplate is not bound to Tavily"}
@@ -171,6 +173,7 @@ func tavilyPayload(request TavilyRequest) (tavilySearchPayload, *core.Error) {
 
 	searchDepth := "basic"
 	excludeDomains := []string{}
+	configuredDomains := []string{}
 	for name, value := range request.Channel.Parameters {
 		switch name {
 		case "search_depth":
@@ -189,14 +192,29 @@ func tavilyPayload(request TavilyRequest) (tavilySearchPayload, *core.Error) {
 			if err != nil {
 				return tavilySearchPayload{}, &core.Error{Code: core.ErrorConfig, Message: "Tavily exclude_domains contains an invalid domain"}
 			}
+		case "include_domains":
+			values, ok := tavilyStringSlice(value)
+			if !ok {
+				return tavilySearchPayload{}, &core.Error{Code: core.ErrorConfig, Message: "Tavily include_domains must be a string array"}
+			}
+			var err error
+			configuredDomains, err = normalizeTavilyDomains(values)
+			if err != nil || len(configuredDomains) == 0 {
+				return tavilySearchPayload{}, &core.Error{Code: core.ErrorConfig, Message: "Tavily include_domains contains an invalid domain"}
+			}
 		default:
 			return tavilySearchPayload{}, &core.Error{Code: core.ErrorConfig, Message: fmt.Sprintf("Tavily Channel contains unsupported parameter %q", name)}
 		}
 	}
-	includeDomains, err := normalizeTavilyDomains(request.Operation.Scope.Domains)
+	scopeDomains, err := normalizeTavilyDomains(request.Operation.Scope.Domains)
 	if err != nil {
 		return tavilySearchPayload{}, &core.Error{Code: core.ErrorParameter, Message: "Tavily domain scope contains an invalid domain"}
 	}
+	includeDomains := intersectTavilyDomains(configuredDomains, scopeDomains)
+	if len(configuredDomains) > 0 && len(scopeDomains) > 0 && len(includeDomains) == 0 {
+		return tavilySearchPayload{}, &core.Error{Code: core.ErrorParameter, Message: "Tavily domain scope does not intersect the Channel domain restriction"}
+	}
+	startDate, endDate := tavilyDateWindow(request.Operation.Constraints.Time)
 	return tavilySearchPayload{
 		Query:             strings.TrimSpace(*request.Operation.Query),
 		SearchDepth:       searchDepth,
@@ -208,7 +226,43 @@ func tavilyPayload(request TavilyRequest) (tavilySearchPayload, *core.Error) {
 		IncludeImages:     false,
 		AutoParameters:    false,
 		IncludeUsage:      true,
+		StartDate:         startDate,
+		EndDate:           endDate,
 	}, nil
+}
+
+// Tavily 的日期边界只有天精度。这里向两侧各放宽一天，再由 Query Plane
+// 按原始 timestamp 做闭区间过滤，避免把边界日内的合法结果漏掉。
+func tavilyDateWindow(constraint core.SearchTimeConstraint) (string, string) {
+	var startDate, endDate string
+	if constraint.From != nil {
+		startDate = constraint.From.UTC().AddDate(0, 0, -1).Format(time.DateOnly)
+	}
+	if constraint.To != nil {
+		endDate = constraint.To.UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	}
+	return startDate, endDate
+}
+
+func intersectTavilyDomains(configured, scoped []string) []string {
+	if len(configured) == 0 {
+		return scoped
+	}
+	if len(scoped) == 0 {
+		return configured
+	}
+	result := make([]string, 0, min(len(configured), len(scoped)))
+	for _, fixed := range configured {
+		for _, requested := range scoped {
+			switch {
+			case fixed == requested, strings.HasSuffix(requested, "."+fixed):
+				result = appendUnique(result, requested)
+			case strings.HasSuffix(fixed, "."+requested):
+				result = appendUnique(result, fixed)
+			}
+		}
+	}
+	return result
 }
 
 func (adapter TavilyAdapter) targetURL(request TavilyRequest) (string, error) {

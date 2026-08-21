@@ -138,7 +138,7 @@ Source tags 只用于发现；没有封闭类别枚举。RouteTemplate Descripto
 
 ### 4.3 一般优先级
 
-- Direct Feed：适合低成本 `latest`，也可以在已经取得的 bounded Feed window 内提供明确降级标记的本地 `search`；不等价于源站全量索引。
+- Direct Feed：只适合低成本 `latest`；当前窗口内关键词过滤不再作为公共 `search`。
 - Native API/official CLI：适合 `search`、结构化 metadata、指标和真实分页。
 - RSSHub：适合把没有官方 Feed 的来源变成增量 Feed；不默认等价于平台搜索。
 - Specialized command/MCP：适合 X 等已有专项工具的来源。
@@ -164,13 +164,13 @@ type Adapter interface {
 
 - `feed`：RSS/Atom/JSON Feed discovery、conditional GET、解析和 bounded window。
 - `rsshub`：Endpoint 鉴权、Route metadata、Feed 获取与 Route 级诊断。
-- `github`、`tavily`：首批高价值 Provider 的窄专用 HTTP Adapter，直接表达各自鉴权、分页、rate limit 与 provenance。
+- `github`、`tavily`、`discourse`、`arxiv`、`hn-algolia`：窄专用 HTTP Adapter，直接表达各自鉴权、限定、分页、rate limit 与 provenance。
 
 v1 不先实现通用 `http-json` mapping DSL；等第二个已验证 API 与现有专用 Adapter 真正同形时再抽取共同请求/解析逻辑。
 
 v1 不内建通用 HTML/CSS scraping DSL：RSSHub/RSS-Bridge 已经解决这类扩展，OmniHub 若再造会迅速背上反爬和浏览器维护成本。
 
-Stage 2 的 `feed` Adapter 只接受无 userinfo/credential query 的绝对 HTTP(S) URL，HTML discovery 只跟随一跳明确的 alternate Feed。文件缓存按 Channel、RouteTemplate、参数与额外分区生成 key，保存已成功解析的受限 body、ETag、Last-Modified 和 freshness；Query Plane 在 Adapter 之后统一做本地 search、闭区间 TimeRange、exact identity、排序与全局 limit，避免每个 Feed parser 各自解释请求。
+Stage 2 的 `feed` Adapter 只接受无 userinfo/credential query 的绝对 HTTP(S) URL，HTML discovery 只跟随一跳明确的 alternate Feed。文件缓存按 Channel、RouteTemplate、参数与额外分区生成 key，保存已成功解析的受限 body、ETag、Last-Modified 和 freshness；Query Plane 在 Adapter 之后统一做 exact identity、排序与全局 limit。Search constraints 由真实 Search Adapter 原生执行，只有 RouteTemplate 明示的 coarse/post-filter 才进入统一精确后过滤。
 
 ### 5.2 Command binding
 
@@ -401,12 +401,16 @@ omnihub doctor --channel channel_x_official --format json
 |---|---|---|---|
 | 任意 Feed、V2EX、linux.do | Direct Feed | RSSHub 可选 | Feed parse、conditional GET、window coverage |
 | V2EX | Direct Atom Channel | RSSHub latest Channel | 同 Source 多 Channel、fallback、Endpoint optional |
+| V2EX Search | Tavily domain=v2ex.com | SoV2EX 不进入首版 | Web index coverage、日期限定、不冒充 native |
+| linux.do Search | Discourse Search | 无 Feed Search fallback | Cloudflare/PAT/Bridge、日期/作者/分类/标签 |
+| arXiv Search | 官方 Query API | Web discovery 可选 | submitted date、字段查询、分页 |
+| Hacker News Search | HN 官方页面采用的 Algolia | 官方 Firebase 只用于 latest/fetch | epoch 时间、tags、派生索引边界 |
 | GitHub | 官方 REST API | Tavily discovery | repository search、first-window coverage、rate limit、metadata |
 | Open Web | Tavily | 无 | Provider 与目标 Source、candidate coverage |
 | X | xurl command | RSSHub latest；twscrape opt-in | 官方 recent search、固定 argv、auth、第三方边界；OmniHub MCP 只是公共出口 |
-| NodeSeek | 当前 unavailable probe | 用户配置第三方 Feed | 不能把 Manifest/URL 当 readiness |
+| NodeSeek | 官方 `rss.nodeseek.com` Direct Feed | 内建固定 Feed 预设，用户选择 Egress | 当前本机 Probe 失败，不能把官方 URL 当 readiness |
 
-arXiv、YouTube、Hacker News、Newsletter、Podcast 等主要用于后续扩充 Source Bundle，不阻塞核心 v1。
+YouTube、Newsletter、Podcast 等继续通过 Source Bundle 扩充；arXiv 与 Hacker News 在本轮加入真实 Search Route。
 
 ## 17. 当前取舍表
 

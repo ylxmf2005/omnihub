@@ -79,15 +79,18 @@ tar -xzf "omnihub_${VERSION}_darwin_arm64.tar.gz"
 
 | 路线 | Operation | 凭据/依赖 | 当前证据与边界 |
 | --- | --- | --- | --- |
-| Direct Feed | `latest`、Feed window 内本地 `search` | 无 | 自动化覆盖 RSS/Atom/JSON Feed；不是源站全量索引 |
+| Direct Feed | `latest` | 无 | 自动化覆盖 RSS/Atom/JSON Feed；不承担 Search |
 | RSSHub | `latest` | 用户 Endpoint；access key 可选 | 认证 fixture 已验证；不安装实例、不选公共默认实例 |
 | GitHub API | Repository `search`、metadata `fetch` | Token 可选 | 自动化与匿名公开仓库 smoke；不搜索 code/issue/PR/README |
+| arXiv API | `search` | 无 | 官方 Query API live verified；首屏结果与 minute 时间精度 |
+| HN Algolia | `search` | 无 | 官网采用的派生索引 live verified；不是 HN 原始数据库 |
+| linux.do Discourse | `search` | User API Key 可选 | 官方接口已接；当前匿名真实请求被 Cloudflare 403 阻断 |
 | Tavily | `search` | API Key 必需 | 协议 fixture；最多 20 个 candidate/snippet，不取 answer/raw content/images |
 | X/xurl | recent `search` | `xurl` + app-only Token | 协议 fixture；无 continuation，未使用用户真实 X quota 做发布 gate |
 | Semantic | Search/Latest 结果分组 | OpenAI-compatible Endpoint | loopback fixture + SQLite cache；默认关闭，不删除或 rerank Item |
 | Chrome Cookie | Browser Bridge 后端 | Companion Extension + origin permission | Host/IPC/mock consumer 已验证；仓库不包含 Extension，也没有来源可据此标为 ready |
 
-Source 声明、Channel 配置与 runtime ready 是三件事。V2EX、linux.do 可通过 Direct Feed 使用；NodeSeek 保持 conditional，只有用户配置的真实 Channel Probe 成功后才显示 ready。`sources/feed-samples.yaml` 中的 arXiv、Hacker News、YouTube、Newsletter 与 Podcast 只是逻辑来源样例，不会自动创建订阅或证明可达。
+Source 声明、Channel 配置与 runtime ready 是三件事。V2EX 和 NodeSeek 提供固定官方 Feed 的内建 RouteTemplate，创建 Channel 时无需重填地址；linux.do 也可通过 Direct Feed 获取最新内容。NodeSeek 在当前本机网络仍保持 conditional，只有所选 Egress 上的真实 Channel Probe 成功后才显示 ready。`sources/feed-samples.yaml` 中的 YouTube、Newsletter 与 Podcast 只是逻辑来源样例，不会自动创建订阅或证明可达；arXiv 与 Hacker News 已由内建 Search Route 管理。
 
 ## 配置 Provider
 
@@ -131,7 +134,8 @@ Repository Search；同一 typed input 也可以保存为 `github-search.json`�
   "scope": {"sources": ["github"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": false},
   "limit": 5,
-  "time_range": {},
+  "constraints": {},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "deadline_ms": 30000
@@ -181,7 +185,8 @@ JSON
   "scope": {"domains": ["go.dev"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": false},
   "limit": 5,
-  "time_range": {},
+  "constraints": {"time": {"field": "published_at", "from": "2026-08-01T00:00:00Z"}},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "deadline_ms": 30000
@@ -190,6 +195,47 @@ JSON
 ```
 
 Tavily 结果的 Provider 始终是 `tavily`，Item Source 则取结果 URL 的 hostname；`verification=candidate` 不代表 OmniHub 已读取正文。`advanced` 必须由 Channel 显式配置，不会自动升级或隐式重试计费请求。
+
+V2EX 没有官方全文 Search API。要搜索 V2EX，复用 Tavily Endpoint/Credential，并创建固定域名 Channel；这个限制不能被 Operation 放宽：
+
+```bash
+./omnihub channels apply-provider <<'JSON'
+{"id":"channel_v2ex_search","display_name":"V2EX Web Search","source_id":"v2ex","route_template_id":"v2ex-web-search","endpoint_profile_id":"endpoint_tavily","credential_id":"cred_tavily","parameters":{"include_domains":["v2ex.com"]},"priority":100,"enabled":true,"expected_revision":0}
+JSON
+```
+
+### arXiv、Hacker News 与 linux.do
+
+三条路线都先固定官方或官网实际采用的 Endpoint，再创建 Channel。arXiv 使用官方 Query API；Hacker News 使用官网搜索跳转到的 Algolia 派生索引；linux.do 使用官方 Discourse `/search.json`，但匿名请求可能被 Cloudflare 403 拦截，此时 `failed` 不能解释成“没有结果”。
+
+```bash
+./omnihub endpoints apply-provider <<'JSON'
+{"id":"endpoint_arxiv","provider":"arxiv-api","base_url":"https://export.arxiv.org","egress_profile_id":"egress_direct","expected_revision":0}
+JSON
+./omnihub channels apply-provider <<'JSON'
+{"id":"channel_arxiv_search","source_id":"arxiv","route_template_id":"arxiv-native-search","endpoint_profile_id":"endpoint_arxiv","priority":100,"enabled":true,"expected_revision":0}
+JSON
+
+./omnihub endpoints apply-provider <<'JSON'
+{"id":"endpoint_hn_algolia","provider":"hn-algolia","base_url":"https://hn.algolia.com","egress_profile_id":"egress_direct","expected_revision":0}
+JSON
+./omnihub channels apply-provider <<'JSON'
+{"id":"channel_hn_search","source_id":"hacker-news","route_template_id":"hn-algolia-search","endpoint_profile_id":"endpoint_hn_algolia","priority":100,"enabled":true,"expected_revision":0}
+JSON
+
+./omnihub endpoints apply-provider <<'JSON'
+{"id":"endpoint_linux_do","provider":"discourse","base_url":"https://linux.do","egress_profile_id":"egress_direct","expected_revision":0}
+JSON
+./omnihub channels apply-provider <<'JSON'
+{"id":"channel_linux_do_search","source_id":"linux.do","route_template_id":"linux-do-discourse-search","endpoint_profile_id":"endpoint_linux_do","priority":100,"enabled":true,"expected_revision":0}
+JSON
+```
+
+CLI 的快捷 Search 入口直接映射同一份 typed contract，例如：
+
+```bash
+./omnihub search --source arxiv --query "agent systems" --from 2025-01-01T00:00:00Z --sort newest --limit 5
+```
 
 ### X / xurl
 
@@ -213,7 +259,8 @@ JSON
   "scope": {"sources": ["x"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": false},
   "limit": 10,
-  "time_range": {},
+  "constraints": {},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "off",
   "deadline_ms": 30000
@@ -265,7 +312,8 @@ JSON
   "scope": {"sources": ["github"]},
   "route_policy": {"mode": "auto", "aggregate": false, "allow_fallback": true},
   "limit": 20,
-  "time_range": {},
+  "constraints": {},
+  "sort": "relevance",
   "identity_dedupe": "exact",
   "similarity_grouping": "semantic",
   "semantic_profile_id": "semantic_local",
@@ -277,7 +325,7 @@ JSON
 
 ## Feed、RSSHub 与 OPML
 
-一次性 Feed 的 `search` 只在当前 Feed window 内执行 Unicode lowercase + 空白分词 AND 匹配，并在 Coverage 中披露 `local_feed_window_only`。需要复用时，可用 `channels apply` 保存为 Direct Feed Channel。View 的 JSON Feed `_omnihub` 与 RSS/Atom `omnihub` 扩展保留 identity、provenance 和 semantic `group_id/strategy/score`；投影不会重新分组或删除同组 Item。
+Direct Feed 与 RSSHub 只提供 `latest`，不承担历史 Search。Search 必须走 RouteTemplate 明确声明的上游搜索能力；Feed Channel 会在网络请求前被 Router 排除。View 的 JSON Feed `_omnihub` 与 RSS/Atom `omnihub` 扩展保留 identity、provenance 和 semantic `group_id/strategy/score`；投影不会重新分组或删除同组 Item。
 
 OmniHub 不安装或托管 RSSHub，也不默认选择公共实例：
 

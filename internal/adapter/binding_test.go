@@ -1310,7 +1310,7 @@ func TestGitHubAdapterSearchAndFetchContracts(t *testing.T) {
 			var requests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				requests.Add(1)
-				if request.Method != http.MethodGet || request.URL.Path != "/search/repositories" || request.URL.Query().Get("q") != query || request.URL.Query().Get("per_page") != "2" || request.URL.Query().Get("page") != "1" {
+				if request.Method != http.MethodGet || request.URL.Path != "/search/repositories" || request.URL.Query().Get("q") != `"agent search in:name"` || request.URL.Query().Get("per_page") != "2" || request.URL.Query().Get("page") != "1" {
 					t.Errorf("GitHub search request = %s %s", request.Method, request.URL.String())
 				}
 				wantAuthorization := ""
@@ -1743,6 +1743,80 @@ func TestTavilyAdapterRejectsInvalidConfigurationBeforeNetwork(t *testing.T) {
 	if requests.Load() != 0 {
 		t.Fatalf("invalid Tavily requests reached network %d times", requests.Load())
 	}
+}
+
+func TestOfficialSearchAdaptersMapTypedConstraintsAndResults(t *testing.T) {
+	fixed := time.Date(2026, 8, 21, 3, 0, 0, 0, time.UTC)
+	from := time.Date(2026, 8, 1, 12, 34, 56, 0, time.UTC)
+	query := "agent order:latest"
+	egressProfile := core.EgressProfile{ID: "direct", Mode: core.EgressModeDirect, Enabled: true}
+
+	t.Run("discourse", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			search := request.URL.Query().Get("q")
+			if request.URL.Path != "/search.json" || !strings.Contains(search, `"agent order:latest"`) || !strings.Contains(search, "after:2026-07-31") || !strings.Contains(search, "order:latest") {
+				t.Errorf("Discourse request = %s", request.URL.String())
+			}
+			writeJSONFixture(t, writer, map[string]any{
+				"posts":                 []any{map[string]any{"id": 10, "topic_id": 20, "post_number": 1, "username": "alice", "created_at": "2026-08-20T10:00:00Z", "blurb": "result body"}},
+				"topics":                []any{map[string]any{"id": 20, "title": "Result", "slug": "result", "category_id": 3}},
+				"grouped_search_result": map[string]any{"more_posts": false, "more_topics": false},
+			})
+		}))
+		defer server.Close()
+		request := DiscourseRequest{
+			Operation:     core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5, Sort: core.SearchSortNewest, Constraints: core.SearchConstraints{Time: core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: &from}}},
+			Channel:       core.Channel{ID: "linux", Source: "linux.do", RouteTemplateID: "linux-search", EndpointProfileID: "linux-endpoint"},
+			RouteTemplate: core.RouteTemplate{RouteTemplateID: "linux-search", Provider: "discourse", Adapter: "discourse"},
+			Endpoint:      core.EndpointProfile{ID: "linux-endpoint", Provider: "discourse", BaseURL: "https://linux.do", EgressProfileID: "direct", Enabled: true}, Egress: egressProfile,
+		}
+		result := (DiscourseAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), request)
+		if len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://linux.do/t/result/20/1" || result.Items[0].PublishedAt == nil {
+			t.Fatalf("Discourse result = %#v", result)
+		}
+	})
+
+	t.Run("arxiv", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			search := request.URL.Query().Get("search_query")
+			if request.URL.Path != "/api/query" || !strings.Contains(search, `all:"agent order:latest"`) || !strings.Contains(search, "submittedDate:[202608011233 TO 999912312359]") || request.URL.Query().Get("sortBy") != "submittedDate" {
+				t.Errorf("arXiv request = %s", request.URL.String())
+			}
+			writer.Header().Set("Content-Type", "application/atom+xml")
+			_, _ = fmt.Fprint(writer, `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"><opensearch:totalResults>1</opensearch:totalResults><entry><id>http://arxiv.org/abs/2608.12345v1</id><updated>2026-08-20T11:00:00Z</updated><published>2026-08-20T10:00:00Z</published><title>Agent Systems</title><summary>Paper summary</summary><author><name>Alice</name></author><category term="cs.AI"/></entry></feed>`)
+		}))
+		defer server.Close()
+		request := ArxivRequest{
+			Operation:     core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5, Sort: core.SearchSortNewest, Constraints: core.SearchConstraints{Time: core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: &from}}},
+			Channel:       core.Channel{ID: "arxiv", Source: "arxiv", RouteTemplateID: "arxiv-search", EndpointProfileID: "arxiv-endpoint"},
+			RouteTemplate: core.RouteTemplate{RouteTemplateID: "arxiv-search", Provider: "arxiv-api", Adapter: "arxiv"},
+			Endpoint:      core.EndpointProfile{ID: "arxiv-endpoint", Provider: "arxiv-api", BaseURL: "https://export.arxiv.org", EgressProfileID: "direct", Enabled: true}, Egress: egressProfile,
+		}
+		result := (ArxivAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), request)
+		if len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://arxiv.org/abs/2608.12345v1" || result.Items[0].Summary == nil || *result.Items[0].Summary != "Paper summary" {
+			t.Fatalf("arXiv result = %#v", result)
+		}
+	})
+
+	t.Run("hn_algolia", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.URL.Path != "/api/v1/search_by_date" || request.URL.Query().Get("query") != query || request.URL.Query().Get("numericFilters") != "created_at_i>=1785587696" || request.URL.Query().Get("tags") != "author_alice,story" {
+				t.Errorf("HN Algolia request = %s", request.URL.String())
+			}
+			writeJSONFixture(t, writer, map[string]any{"hits": []any{map[string]any{"objectID": "123", "created_at": "2026-08-20T10:00:00Z", "created_at_i": 1787220000, "title": "Agent story", "url": "https://example.com/story", "author": "alice", "points": 5, "num_comments": 2, "_tags": []any{"story", "author_alice"}}}, "nbHits": 1, "page": 0, "nbPages": 1})
+		}))
+		defer server.Close()
+		request := HNAlgoliaRequest{
+			Operation:     core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5, Sort: core.SearchSortNewest, Constraints: core.SearchConstraints{Time: core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: &from}, Authors: []string{"alice"}, Categories: []string{"story"}}},
+			Channel:       core.Channel{ID: "hn", Source: "hacker-news", RouteTemplateID: "hn-search", EndpointProfileID: "hn-endpoint"},
+			RouteTemplate: core.RouteTemplate{RouteTemplateID: "hn-search", Provider: "hn-algolia", Adapter: "hn_algolia"},
+			Endpoint:      core.EndpointProfile{ID: "hn-endpoint", Provider: "hn-algolia", BaseURL: "https://hn.algolia.com", EgressProfileID: "direct", Enabled: true}, Egress: egressProfile,
+		}
+		result := (HNAlgoliaAdapter{Now: func() time.Time { return fixed }, testBaseURL: server.URL}).Execute(context.Background(), request)
+		if len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://news.ycombinator.com/item?id=123" || result.Items[0].ExternalURL == nil || *result.Items[0].ExternalURL != "https://example.com/story" {
+			t.Fatalf("HN Algolia result = %#v", result)
+		}
+	})
 }
 
 func TestXURLAdapterUsesFixedCommandsIsolatedHomeAndMapsResults(t *testing.T) {

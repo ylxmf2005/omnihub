@@ -789,6 +789,14 @@ func normalizeOperation(operation core.Operation) (core.Operation, error) {
 		value := operation.TimeRange.To.UTC()
 		operation.TimeRange.To = &value
 	}
+	if operation.Constraints.Time.From != nil {
+		value := operation.Constraints.Time.From.UTC()
+		operation.Constraints.Time.From = &value
+	}
+	if operation.Constraints.Time.To != nil {
+		value := operation.Constraints.Time.To.UTC()
+		operation.Constraints.Time.To = &value
+	}
 	if err := operation.Validate(); err != nil {
 		return core.Operation{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}

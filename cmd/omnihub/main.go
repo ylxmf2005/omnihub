@@ -71,7 +71,7 @@ const usage = `usage:
   omnihub fetch < fetch.json
   omnihub latest|search|fetch --format jsonl < operation.json
   omnihub latest --feed-url URL --source ID --egress-mode direct|environment [--limit N] [--format json|jsonl]
-  omnihub search --feed-url URL --source ID --egress-mode direct|environment --query QUERY [--limit N] [--format json|jsonl]
+  omnihub search --source ID --query QUERY [--from RFC3339] [--to RFC3339] [--sort relevance|newest] [--limit N] [--format json|jsonl]
   omnihub refresh VIEW_ID --idempotency-key KEY
   omnihub maintenance prune [--apply]
   omnihub chrome-host run
@@ -1174,7 +1174,8 @@ func executeCatalogOperationWithStore(ctx context.Context, catalog *registry.Cat
 	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
 	service := query.Service{
 		Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}, GitHub: adapter.GitHubAdapter{},
-		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, CookieReader: browser.NewClient(paths.RuntimeDir),
+		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, Discourse: adapter.DiscourseAdapter{},
+		Arxiv: adapter.ArxivAdapter{}, HNAlgolia: adapter.HNAlgoliaAdapter{}, CookieReader: browser.NewClient(paths.RuntimeDir),
 	}
 	if operation.SimilarityGrouping == core.SimilaritySemantic {
 		if store == nil {
@@ -1316,13 +1317,16 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	if kind == core.OperationFetch {
 		return core.Operation{}, nil, errors.New("fetch only accepts typed JSON input")
 	}
+	if kind == core.OperationSearch {
+		operation, err := searchFlagOperation(args, stderr)
+		return operation, nil, err
+	}
 	flags := flag.NewFlagSet(string(kind), flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	options := directFeedFlags{}
 	flags.StringVar(&options.feedURL, "feed-url", "", "absolute RSS, Atom, JSON Feed, or discovery page URL")
 	flags.StringVar(&options.source, "source", "", "logical source ID")
 	flags.StringVar(&options.egressMode, "egress-mode", "", "explicit transient egress (direct or environment)")
-	flags.StringVar(&options.query, "query", "", "bounded-window search query")
 	flags.StringVar(&options.format, "format", "json", "output format (json or jsonl)")
 	flags.StringVar(&options.identity, "identity-dedupe", string(core.IdentityExact), "identity dedupe mode (exact or none)")
 	flags.StringVar(&options.from, "from", "", "inclusive RFC3339 lower time bound")
@@ -1344,12 +1348,6 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 	}
 	if options.format != "json" && options.format != "jsonl" {
 		return core.Operation{}, nil, fmt.Errorf("unsupported format %q", options.format)
-	}
-	if kind == core.OperationSearch && strings.TrimSpace(options.query) == "" {
-		return core.Operation{}, nil, errors.New("--query is required for search")
-	}
-	if kind == core.OperationLatest && options.query != "" {
-		return core.Operation{}, nil, errors.New("--query is only valid for search")
 	}
 	normalizedURL, err := adapter.NormalizeFeedURL(options.feedURL)
 	if err != nil {
@@ -1375,10 +1373,6 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 		SimilarityGrouping: core.SimilarityOff,
 		DeadlineMS:         options.deadlineMS,
 	}
-	if kind == core.OperationSearch {
-		query := strings.TrimSpace(options.query)
-		operation.Query = &query
-	}
 	if err := operation.Validate(); err != nil {
 		return core.Operation{}, nil, err
 	}
@@ -1392,6 +1386,74 @@ func queryOperation(kind core.OperationKind, args []string, stdin io.Reader, std
 		egress: core.EgressProfile{ID: egressID, Mode: egressMode, Enabled: true, Revision: 1},
 		format: options.format,
 	}, nil
+}
+
+func searchFlagOperation(args []string, stderr io.Writer) (core.Operation, error) {
+	flags := flag.NewFlagSet("search", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var source, query, from, to, sort, authors, categories, tags, contentFields, identity string
+	var limit, deadlineMS int
+	flags.StringVar(&source, "source", "", "logical source ID")
+	flags.StringVar(&query, "query", "", "text query")
+	flags.StringVar(&from, "from", "", "inclusive RFC3339 published_at lower bound")
+	flags.StringVar(&to, "to", "", "inclusive RFC3339 published_at upper bound")
+	flags.StringVar(&sort, "sort", string(core.SearchSortRelevance), "result sort (relevance or newest)")
+	flags.StringVar(&authors, "authors", "", "comma-separated authors")
+	flags.StringVar(&categories, "categories", "", "comma-separated categories")
+	flags.StringVar(&tags, "tags", "", "comma-separated tags")
+	flags.StringVar(&contentFields, "content-fields", "", "comma-separated title,body,first_post")
+	flags.StringVar(&identity, "identity-dedupe", string(core.IdentityExact), "identity dedupe mode (exact or none)")
+	flags.IntVar(&limit, "limit", 20, "maximum returned items")
+	flags.IntVar(&deadlineMS, "deadline-ms", 30000, "whole-operation deadline in milliseconds")
+	if err := flags.Parse(args); err != nil {
+		return core.Operation{}, err
+	}
+	if flags.NArg() != 0 {
+		return core.Operation{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(query) == "" {
+		return core.Operation{}, errors.New("--source and --query are required for search")
+	}
+	timeRange, err := parseTimeRange(from, to)
+	if err != nil {
+		return core.Operation{}, err
+	}
+	queryText := strings.TrimSpace(query)
+	operation := core.Operation{
+		SchemaVersion: core.SchemaVersion, Operation: core.OperationSearch,
+		Scope:       core.Scope{Sources: []string{strings.TrimSpace(source)}},
+		RoutePolicy: core.RoutePolicy{Mode: core.RouteAuto, Aggregate: false, AllowFallback: true},
+		Query:       &queryText, Limit: limit,
+		Constraints: core.SearchConstraints{
+			Time:    core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: timeRange.From, To: timeRange.To},
+			Authors: splitSearchFlag(authors), Categories: splitSearchFlag(categories), Tags: splitSearchFlag(tags),
+		},
+		Sort: core.SearchSort(strings.TrimSpace(sort)), IdentityDedupe: core.IdentityDedupe(identity), SimilarityGrouping: core.SimilarityOff, DeadlineMS: deadlineMS,
+	}
+	for _, field := range splitSearchFlag(contentFields) {
+		operation.Constraints.ContentFields = append(operation.Constraints.ContentFields, core.SearchContentField(field))
+	}
+	if operation.Constraints.Time.From == nil && operation.Constraints.Time.To == nil {
+		operation.Constraints.Time.Field = ""
+	}
+	if err := operation.Validate(); err != nil {
+		return core.Operation{}, err
+	}
+	return operation, nil
+}
+
+func splitSearchFlag(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func parseTimeRange(from, to string) (core.TimeRange, error) {

@@ -15,7 +15,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/repository"
 )
 
-// ApplyProviderEndpointInput 管理首批 HTTP Provider Endpoint。GitHub/Tavily
+// ApplyProviderEndpointInput 管理首批 HTTP Provider Endpoint。官方搜索 Provider
 // 固定官方 origin；embedding 由用户显式给出 OpenAI-compatible BaseURL。
 type ApplyProviderEndpointInput struct {
 	ID               string `json:"id"`
@@ -25,8 +25,9 @@ type ApplyProviderEndpointInput struct {
 	ExpectedRevision int64  `json:"expected_revision"`
 }
 
-// ApplyProviderChannelInput 是 GitHub、Tavily 与 xurl 共用的窄管理输入。
-// HTTP Provider 绑定 Endpoint；xurl 直接绑定 Egress，二者不能同时出现。
+// ApplyProviderChannelInput 是内建搜索 Provider 共用的窄管理输入。
+// HTTP Provider 最终绑定 Endpoint；创建时可省略，让服务复用或创建官方
+// Endpoint。xurl 直接绑定 Egress，二者不能同时出现。
 type ApplyProviderChannelInput struct {
 	ID                 string         `json:"id"`
 	DisplayName        string         `json:"display_name,omitempty"`
@@ -134,7 +135,7 @@ func (service Service) ApplyProviderEndpoint(ctx context.Context, input ApplyPro
 	return core.EndpointProfile{}, fmt.Errorf("save routing catalog: endpoint %s missing from saved snapshot", id)
 }
 
-// ApplyProviderChannel 只装配已内建的 GitHub、Tavily 与 xurl 模板。执行凭据
+// ApplyProviderChannel 只装配已内建的搜索 Provider 模板。执行凭据
 // 在写入前解析，但 Channel 只保存 credential ID，不复制 secret。
 func (service Service) ApplyProviderChannel(ctx context.Context, input ApplyProviderChannelInput) (core.Channel, error) {
 	if err := service.requireStore(); err != nil {
@@ -165,22 +166,42 @@ func (service Service) ApplyProviderChannel(ctx context.Context, input ApplyProv
 		return core.Channel{}, fmt.Errorf("load routing catalog: %w", err)
 	}
 	working := cloneRoutingCatalog(routing)
+	channelIndex := indexChannels(working.Channels)
+	index, exists := channelIndex[channelID]
+	if exists {
+		existing := working.Channels[index]
+		if existing.Revision != input.ExpectedRevision {
+			return core.Channel{}, fmt.Errorf("%w: channel %s revision is %d, expected %d", repository.ErrConflict, channelID, existing.Revision, input.ExpectedRevision)
+		}
+		_, existingSpec, existingErr := service.managedProviderTemplate(existing.RouteTemplateID)
+		if existingErr != nil {
+			return core.Channel{}, fmt.Errorf("%w: existing channel %s is not a managed provider channel", ErrUnsupportedTemplate, channelID)
+		}
+		if existingSpec.provider != spec.provider {
+			return core.Channel{}, fmt.Errorf("%w: channel %s cannot change provider", ErrInvalidProviderConfig, channelID)
+		}
+	} else if input.ExpectedRevision != 0 {
+		return core.Channel{}, fmt.Errorf("%w: channel %s does not exist at revision %d", repository.ErrConflict, channelID, input.ExpectedRevision)
+	}
+
 	endpointID, egressID := strings.TrimSpace(input.EndpointProfileID), strings.TrimSpace(input.EgressProfileID)
 	if spec.endpointBaseURL != "" {
-		if endpointID == "" || egressID != "" {
-			return core.Channel{}, fmt.Errorf("%w: HTTP provider requires only an endpoint binding", ErrInvalidProviderConfig)
+		// 更新仍保持完整替换语义；创建时才允许省略内部连接引用。这样
+		// Dashboard 的默认流程可以按 Provider 复用或创建官方 Endpoint，
+		// 而不会让一次更新静默改绑到另一条出站线路。
+		if exists && endpointID == "" {
+			endpointID = working.Channels[index].EndpointProfileID
 		}
-		endpointIndex, exists := indexEndpoints(working.Endpoints)[endpointID]
-		if !exists {
-			return core.Channel{}, fmt.Errorf("%w: provider endpoint %s", repository.ErrNotFound, endpointID)
+		if endpointID != "" && egressID != "" {
+			return core.Channel{}, fmt.Errorf("%w: specify an endpoint or an egress, not both", ErrInvalidProviderConfig)
 		}
-		endpoint := working.Endpoints[endpointIndex]
-		if !endpoint.Enabled || endpoint.Provider != spec.provider || !matchesOfficialEndpoint(endpoint.BaseURL, spec.endpointBaseURL) {
-			return core.Channel{}, fmt.Errorf("%w: provider endpoint is incompatible or disabled", ErrInvalidProviderConfig)
+		endpointID, err = resolveOfficialChannelEndpoint(&working, spec, endpointID, egressID)
+		if err != nil {
+			return core.Channel{}, err
 		}
-		if _, err := enabledEgressProfile(working, endpoint.EgressProfileID); err != nil {
-			return core.Channel{}, fmt.Errorf("%w: endpoint egress is unavailable: %v", ErrInvalidProviderConfig, err)
-		}
+		// HTTP Channel 永远只保存 Endpoint 绑定；这里的 egress 只用于新建
+		// Endpoint，不能成为第二条运行时出口来源。
+		egressID = ""
 	} else {
 		if endpointID != "" || egressID == "" {
 			return core.Channel{}, fmt.Errorf("%w: xurl requires only an egress binding", ErrInvalidProviderConfig)
@@ -202,24 +223,6 @@ func (service Service) ApplyProviderChannel(ctx context.Context, input ApplyProv
 	}
 	if !service.sourceExists(routing, sourceID) {
 		return core.Channel{}, fmt.Errorf("%w: source %s", repository.ErrNotFound, sourceID)
-	}
-
-	channelIndex := indexChannels(working.Channels)
-	index, exists := channelIndex[channelID]
-	if exists {
-		existing := working.Channels[index]
-		if existing.Revision != input.ExpectedRevision {
-			return core.Channel{}, fmt.Errorf("%w: channel %s revision is %d, expected %d", repository.ErrConflict, channelID, existing.Revision, input.ExpectedRevision)
-		}
-		_, existingSpec, existingErr := service.managedProviderTemplate(existing.RouteTemplateID)
-		if existingErr != nil {
-			return core.Channel{}, fmt.Errorf("%w: existing channel %s is not a managed provider channel", ErrUnsupportedTemplate, channelID)
-		}
-		if existingSpec.provider != spec.provider {
-			return core.Channel{}, fmt.Errorf("%w: channel %s cannot change provider", ErrInvalidProviderConfig, channelID)
-		}
-	} else if input.ExpectedRevision != 0 {
-		return core.Channel{}, fmt.Errorf("%w: channel %s does not exist at revision %d", repository.ErrConflict, channelID, input.ExpectedRevision)
 	}
 
 	channel := core.Channel{
@@ -251,6 +254,73 @@ func (service Service) ApplyProviderChannel(ctx context.Context, input ApplyProv
 	return core.Channel{}, fmt.Errorf("save routing catalog: channel %s missing from saved snapshot", channelID)
 }
 
+// resolveOfficialChannelEndpoint 保留 Endpoint 的独立生命周期，但不把它暴露
+// 给常用创建流程。显式 Endpoint 优先；否则复用等价的官方 Endpoint。只有
+// 唯一可用 Egress 时，才自动创建缺失的官方 Endpoint。
+func resolveOfficialChannelEndpoint(catalog *core.RoutingCatalog, spec providerSpec, endpointID, egressID string) (string, error) {
+	if endpointID != "" {
+		endpointIndex, exists := indexEndpoints(catalog.Endpoints)[endpointID]
+		if !exists {
+			return "", fmt.Errorf("%w: provider endpoint %s", repository.ErrNotFound, endpointID)
+		}
+		endpoint := catalog.Endpoints[endpointIndex]
+		if !endpoint.Enabled || endpoint.Provider != spec.provider || !matchesOfficialEndpoint(endpoint.BaseURL, spec.endpointBaseURL) {
+			return "", fmt.Errorf("%w: provider endpoint is incompatible or disabled", ErrInvalidProviderConfig)
+		}
+		if _, err := enabledEgressProfile(*catalog, endpoint.EgressProfileID); err != nil {
+			return "", fmt.Errorf("%w: endpoint egress is unavailable: %v", ErrInvalidProviderConfig, err)
+		}
+		return endpoint.ID, nil
+	}
+
+	// 复用按 Provider 与可选 Egress 收窄。多个匹配项可能带不同 options 或
+	// 信任历史，不能靠排序静默替用户选择。
+	matches := make([]core.EndpointProfile, 0, 1)
+	for _, endpoint := range catalog.Endpoints {
+		if endpoint.Enabled && endpoint.Provider == spec.provider && matchesOfficialEndpoint(endpoint.BaseURL, spec.endpointBaseURL) && (egressID == "" || endpoint.EgressProfileID == egressID) {
+			if _, err := enabledEgressProfile(*catalog, endpoint.EgressProfileID); err == nil {
+				matches = append(matches, endpoint)
+			}
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("%w: multiple compatible provider endpoints; choose one explicitly", ErrInvalidProviderConfig)
+	}
+
+	if egressID == "" {
+		for _, profile := range catalog.EgressProfiles {
+			if !profile.Enabled {
+				continue
+			}
+			if egressID != "" {
+				return "", fmt.Errorf("%w: multiple enabled egress profiles; choose one before creating the channel", ErrInvalidProviderConfig)
+			}
+			egressID = profile.ID
+		}
+	}
+	if _, err := enabledEgressProfile(*catalog, egressID); err != nil {
+		return "", fmt.Errorf("%w: provider endpoint egress is unavailable: %v", ErrInvalidProviderConfig, err)
+	}
+
+	normalizeID := strings.NewReplacer("-", "_", ".", "_")
+	generatedID := "endpoint_" + normalizeID.Replace(spec.provider) + "_" + normalizeID.Replace(egressID)
+	if existingIndex, collision := indexEndpoints(catalog.Endpoints)[generatedID]; collision {
+		existing := catalog.Endpoints[existingIndex]
+		if existing.Provider != spec.provider || existing.EgressProfileID != egressID || !matchesOfficialEndpoint(existing.BaseURL, spec.endpointBaseURL) {
+			return "", fmt.Errorf("%w: generated endpoint id %s is already in use", ErrInvalidProviderConfig, generatedID)
+		}
+		return existing.ID, nil
+	}
+	catalog.Endpoints = append(catalog.Endpoints, core.EndpointProfile{
+		ID: generatedID, Provider: spec.provider, BaseURL: spec.endpointBaseURL,
+		EgressProfileID: egressID, Trust: "official", Enabled: true, Revision: 1,
+	})
+	return generatedID, nil
+}
+
 func (service Service) managedProviderTemplate(id string) (core.RouteTemplate, providerSpec, error) {
 	if service.Catalog == nil {
 		return core.RouteTemplate{}, providerSpec{}, errors.New("management catalog is required")
@@ -268,6 +338,12 @@ func (service Service) managedProviderTemplate(id string) (core.RouteTemplate, p
 		spec = providerSpec{provider: "tavily", authKind: "api_key", credentialRequired: true, endpointBaseURL: "https://api.tavily.com"}
 	case "xurl":
 		spec = providerSpec{provider: "xurl", authKind: "app_only", credentialRequired: true}
+	case "discourse":
+		spec = providerSpec{provider: "discourse", authKind: "user_api_key", endpointBaseURL: "https://linux.do"}
+	case "arxiv":
+		spec = providerSpec{provider: "arxiv-api", authKind: "none", endpointBaseURL: "https://export.arxiv.org"}
+	case "hn_algolia":
+		spec = providerSpec{provider: "hn-algolia", authKind: "none", endpointBaseURL: "https://hn.algolia.com"}
 	default:
 		return core.RouteTemplate{}, providerSpec{}, fmt.Errorf("%w: adapter %s is not managed here", ErrUnsupportedTemplate, template.Adapter)
 	}
@@ -314,6 +390,12 @@ func officialProviderEndpoint(provider string) (string, bool) {
 		return "https://api.github.com", true
 	case "tavily":
 		return "https://api.tavily.com", true
+	case "discourse":
+		return "https://linux.do", true
+	case "arxiv-api":
+		return "https://export.arxiv.org", true
+	case "hn-algolia":
+		return "https://hn.algolia.com", true
 	default:
 		return "", false
 	}
@@ -344,17 +426,17 @@ func normalizeProviderParameters(adapter string, input map[string]any) (map[stri
 				return nil, fmt.Errorf("%w: Tavily search_depth must be basic or advanced", ErrInvalidProviderConfig)
 			}
 			result[name] = depth
-		case "exclude_domains":
+		case "exclude_domains", "include_domains":
 			domains, ok := providerStringSlice(value)
 			if !ok || len(domains) > 20 {
-				return nil, fmt.Errorf("%w: Tavily exclude_domains must contain at most 20 hostnames", ErrInvalidProviderConfig)
+				return nil, fmt.Errorf("%w: Tavily %s must contain at most 20 hostnames", ErrInvalidProviderConfig, name)
 			}
 			normalized := make([]string, 0, len(domains))
 			seen := make(map[string]bool, len(domains))
 			for _, domain := range domains {
 				domain, ok = normalizeProviderHostname(domain)
 				if !ok {
-					return nil, fmt.Errorf("%w: Tavily exclude_domains contains an invalid hostname", ErrInvalidProviderConfig)
+					return nil, fmt.Errorf("%w: Tavily %s contains an invalid hostname", ErrInvalidProviderConfig, name)
 				}
 				if !seen[domain] {
 					seen[domain] = true

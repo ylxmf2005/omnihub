@@ -131,6 +131,18 @@
 
 完成证据：全来源/功能测试矩阵通过；test/race/vet/schema/OpenAPI/MCP/Skill/Feed/Chrome/Egress/semantic E2E 与三平台构建通过；README 不把 Feed window/Tavily/conditional Source 写成平台全量搜索或 runtime ready。
 
+## Stage F：Search 真实性与官方优先路线（已完成本地实现与验证）
+
+- Direct Feed/RSSHub RouteTemplate 改为 `latest` only，删除一次性 `search --feed-url`；旧 Feed Search View 在发网前显式失败。
+- Core SearchInput 增加结构化 `constraints` 与 `sort`；RouteTemplate 逐项声明限定执行方式、时间字段和精度，Router 不允许静默降级。
+- Tavily 映射官方 `start_date/end_date` 与 domain filter；新增 linux.do Discourse、arXiv Query API、HN Algolia 三条 Search Adapter/Route。
+- V2EX Search 使用显式 Tavily domain Route 并披露 Web index coverage；SoV2EX 不进入首版。
+- 更新 CLI、REST、MCP、View、Dashboard、Schema/OpenAPI/Skill 与文档，并用 fixture 和可用公开端点做聚焦运行验证。
+
+完成证据：Feed Channel 不再出现在 Search 候选；所有公共出口保留同一 constraints/sort；不支持限定在发网前失败；arXiv/HN 真实 Search 成功；linux.do 的 Cloudflare/PAT 缺口如实返回；V2EX Web Search 的 Provider/Source/Coverage 不互相冒充。
+
+当前证据：全量 `go test ./...`、Dashboard `tsc --noEmit` 与 production build 通过；本机已配置并在 CLI/Workbench 真实执行 arXiv 与 HN Search，linux.do 官方 Discourse 路线真实返回 Cloudflare HTTP 403 并保持 `failed/upstream_error`；当前无 Tavily Credential，因此 V2EX Web Search 只完成官方协议、域名锁定和 fixture 证据，不宣称真实额度 E2E。
+
 ## 实施止损点
 
 1. Stage 0 合同未冻结，不批量写 Source Manifest。

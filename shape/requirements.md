@@ -50,7 +50,11 @@ CLI、HTTP、MCP 和 View refresh 必须调用同一个 Operation Service。Feed
 
 ### REQ-004：查询范围诚实
 
-请求可用 `channels`、`sources`、`collection`、`providers` 或 `domains` 限定范围。保存的 Collection 以 Channel 为成员；除显式允许 global discovery 的 Provider 外，至少需要一个范围选择器。Feed/latest window、Web index 与平台原生搜索不能互相冒充。
+请求可用 `channels`、`sources`、`collection`、`providers` 或 `domains` 限定路由范围。保存的 Collection 以 Channel 为成员；除显式允许 global discovery 的 Provider 外，至少需要一个范围选择器。Search 的 `query` 只表达匹配文本，结构化 `constraints` 表达时间、作者、分类、标签与内容范围，`sort` 表达排序；调用方不得依赖 Provider 私有 query 语法创造公共语义。
+
+Feed/RSSHub Route 只提供 Latest，不再通过当前窗口的本地关键词过滤获得 Search Capability。Search 必须进入平台官方 Search、平台官方采用的搜索服务、声明语料与刷新边界的专项索引，或用户显式选择的 domain Web Search。Feed/latest window、Web index、专项索引与平台原生搜索不能互相冒充。
+
+RouteTemplate 必须逐项声明 Search 限定为 `native_exact | native_coarse | post_filter | unsupported`，并为时间限定声明统一时间字段与上游精度。`native_coarse` 表示上游只能按声明精度执行，若响应没有可核验时间（如 Tavily）就如实保留粗粒度结果；`post_filter` 表示 Adapter 先扩大上游范围，再由 Query Plane 按规范化 Item 时间精确收口。未穷尽上游分页时必须标记 truncated；任何不支持的限定必须在发网前失败，不能静默忽略。
 
 ### REQ-005：RSSHub 是可选依赖
 
@@ -217,7 +221,9 @@ v0.1 只实现 OpenAI-compatible embedding wire contract；用户已有的 Ollam
 
 ### REQ-032：代表 Provider 的窄能力
 
-GitHub v1 只提供 Repository Search 与 Repository metadata fetch；Credential 可省略以访问公开数据，但匿名低配额和私有数据不可见必须进入执行限制。Tavily 默认 `basic`、单次最多 20 条，只允许显式 `advanced`，并固定关闭 answer、raw content、images 与 auto parameters；其结果只作为 candidate/snippet，Source 由结果 URL 的规范化 hostname 推导，Provider 始终为 `tavily`。xurl 只支持 `direct | environment | http_proxy` 子进程环境，SOCKS5 在发进程前失败；命令路线不得伪造 DNS/TCP/TLS 分层事实。
+GitHub v1 只提供 Repository Search 与 Repository metadata fetch；Credential 可省略以访问公开数据，但匿名低配额和私有数据不可见必须进入执行限制。Tavily 默认 `basic`、单次最多 20 条，只允许显式 `advanced`，并固定关闭 answer、raw content、images 与 auto parameters；支持用官方 `start_date/end_date` 和 `include_domains` 执行日期/domain 限定，其结果只作为 candidate/snippet，Source 由结果 URL 的规范化 hostname 推导，Provider 始终为 `tavily`。xurl 只支持 `direct | environment | http_proxy` 子进程环境，SOCKS5 在发进程前失败；命令路线不得伪造 DNS/TCP/TLS 分层事实。
+
+linux.do Search 使用 Discourse 官方文档化的 `/search.json`，并把日期、作者、分类、标签、内容范围和排序映射到上游语法；普通 HTTP 被 Cloudflare challenge 阻断时保持 blocked，不回退 Feed Search。arXiv Search 使用官方 Query API；Hacker News Search 使用 HN 官方网页采用的 Algolia 服务，并标记为派生索引。V2EX 官方 API/Atom 只提供 latest/fetch；Search 使用用户显式配置的 Tavily domain Web Search，固定 `v2ex.com`，不内建 SoV2EX。
 
 ### REQ-033：Dashboard 同源、删除与健康默认值
 
@@ -253,6 +259,7 @@ v1 不按平台数量验收，而用五条互补路径证实架构：
 3. **GitHub**：官方 REST API Route；验证 search、首页覆盖、鉴权、rate limit 和结构化 metadata。
 4. **Open Web**：Tavily；验证 Provider 与目标 Source 分离，以及 candidate/coverage 语义。
 5. **X**：官方 `xurl` command 为首选 Provider，验证 recent search、固定 argv 与隔离凭据；OmniHub 自身 MCP 出口可调用该 Channel，但 v1 不实现第三方 xurl MCP client binding。`twscrape` 仅作为用户明确授权的可选 Provider。
+6. **官方优先 Search**：linux.do/Discourse、arXiv Query API、HN Algolia 与 V2EX domain Web Search；验证结构化时间等限定、Provider 信任分级和真实 Coverage。
 
 Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSeek 等接到已证明的 Route 类型上；没有真实探测证据时不标记 ready。
 
@@ -267,7 +274,7 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 7. **Dashboard 运行体验**：Refresh 与 Query Workbench 创建持久 Run，返回 `202 + run_id`；v1 轮询 Run，不引入 SSE/WebSocket。Workbench 必须显式选择 scope/Provider 并展示费用、信任和 coverage。
 8. **RSSHub 生命周期**：只连接用户配置的本地/远程 Endpoint，不自动安装/启动，也不提供默认公共实例。
 9. **Provider 扩展**：采用内建 Adapter + Manifest + 固定 command/MCP binding；不新增 External Adapter Protocol，不采用 Go plugin。
-10. **首批验证与 X**：Direct Feed、RSSHub/V2EX、GitHub、Tavily、X/xurl；twscrape 只 opt-in，NodeSeek 先作为 unavailable/readiness 样本。
+10. **首批验证与 X**：Direct Feed、RSSHub/V2EX、GitHub、Tavily、X/xurl；twscrape 只 opt-in。NodeSeek 使用官方推荐 Feed 的内建预设，但在当前网络仍作为 unavailable/readiness 样本。
 11. **测试边界**：每个宣称来源与功能都要有可重放测试；本 Task 只扩展已有 `*_test.go` 与合同 fixture，不新增 test 文件。
 12. **渠道与 Chrome 授权方向**：Channel 是 Dashboard 一级管理对象；需要 Cookie 的 Channel 在用户授予 Chrome origin permission 后按每次执行直接读取，Cookie 不持久化。Dashboard 可打开登录链接并显示分层健康；Chrome Extension 客户端由独立 Agent/工作流实现，本 Task 负责后端 Bridge/合同。
 13. **本地 MVP Credential**：Dashboard 直接录入 API Key/Token，SQLite 保存真实值，不使用 Keychain、受保护 secret store 或 opaque handle。Credential 列表只返回掩码；只有 detail 请求显式传入 `include_value=true` 时才返回完整值，并设置 `Cache-Control: no-store`。日志、Run 与诊断不回显原值。

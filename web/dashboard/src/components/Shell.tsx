@@ -184,12 +184,9 @@ export function Shell({ children }: { children: ReactNode }) {
       </AppShell.Navbar>
 
       <AppShell.Main>
-        {/*
-          Capped and left-aligned. A fluid column read correctly at 1280px but at
-          2000px it stretched three stat cards to ~500px each around a two-digit
-          number; centring the cap instead detached content from its navigation.
-        */}
-        <Box p={{ base: 'md', sm: 'lg' }} style={{ maxWidth: 1280 }}>
+        {/* Dashboard 的表格、Workbench 与详情面板需要使用导航之外的完整
+            可用宽度；阅读型文案在各组件内部自行限制行宽。 */}
+        <Box p={{ base: 'md', sm: 'lg' }} style={{ width: '100%' }}>
           {children}
         </Box>
       </AppShell.Main>

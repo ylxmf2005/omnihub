@@ -32,9 +32,30 @@ func TestOperationValidation(t *testing.T) {
 		wantError bool
 	}{
 		{name: "search", operation: base},
+		{name: "search constraints", operation: replace(base, func(value *Operation) {
+			from, to := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+			value.Constraints = SearchConstraints{Time: SearchTimeConstraint{Field: SearchTimePublishedAt, From: &from, To: &to}, Authors: []string{"alice"}, ContentFields: []SearchContentField{SearchContentTitle}}
+			value.Sort = SearchSortNewest
+		})},
+		{name: "search legacy time range", operation: replace(base, func(value *Operation) {
+			from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+			value.TimeRange.From = &from
+		}), wantError: true},
+		{name: "search inverted constraint time", operation: replace(base, func(value *Operation) {
+			from, to := time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+			value.Constraints.Time = SearchTimeConstraint{Field: SearchTimePublishedAt, From: &from, To: &to}
+		}), wantError: true},
+		{name: "search unknown content field", operation: replace(base, func(value *Operation) {
+			value.Constraints.ContentFields = []SearchContentField{"comments"}
+		}), wantError: true},
 		{name: "search without query", operation: replace(base, func(value *Operation) { value.Query = nil }), wantError: true},
 		{name: "latest", operation: replace(base, func(value *Operation) { value.Operation = OperationLatest; value.Query = nil })},
 		{name: "latest with query", operation: replace(base, func(value *Operation) { value.Operation = OperationLatest }), wantError: true},
+		{name: "latest with search constraints", operation: replace(base, func(value *Operation) {
+			value.Operation = OperationLatest
+			value.Query = nil
+			value.Constraints.Authors = []string{"alice"}
+		}), wantError: true},
 		{name: "fetch", operation: replace(base, func(value *Operation) { value.Operation = OperationFetch; value.Query = nil; value.Target = &target })},
 		{name: "fetch secret query", operation: replace(base, func(value *Operation) {
 			secretTarget := "https://example.com/post?access_token=must-not-enter-envelope"

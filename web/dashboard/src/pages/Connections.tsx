@@ -131,6 +131,24 @@ const ENDPOINT_KINDS: {
     description: '官方地址固定，不可更改。',
     officialOrigin: 'https://api.tavily.com',
   },
+	{
+		provider: 'discourse',
+		label: 'linux.do Discourse Search',
+		description: 'linux.do 官方站内搜索接口；可能受 Cloudflare 挑战影响。',
+		officialOrigin: 'https://linux.do',
+	},
+	{
+		provider: 'arxiv-api',
+		label: 'arXiv Query API',
+		description: 'arXiv 官方检索接口。',
+		officialOrigin: 'https://export.arxiv.org',
+	},
+	{
+		provider: 'hn-algolia',
+		label: 'Hacker News Algolia',
+		description: 'Hacker News 官网采用的 Algolia 派生索引。',
+		officialOrigin: 'https://hn.algolia.com',
+	},
 ]
 
 /**

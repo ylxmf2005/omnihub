@@ -64,7 +64,7 @@ func Load(ctx context.Context, store catalogStore, importedBundlePath string) (*
 			importedTemplateValues[index] = core.RouteTemplate{
 				RouteTemplateID: template.RouteTemplateID, Origin: "imported", SourceConstraint: template.SourceConstraint,
 				Provider: template.Provider, Adapter: template.Adapter, Capabilities: slices.Clone(template.Capabilities), ContentLevel: template.ContentLevel,
-				Pagination: template.Pagination, TimeRange: template.TimeRange, Auth: template.Auth, EndpointRequired: template.EndpointRequired,
+				Pagination: template.Pagination, TimeRange: template.TimeRange, SearchConstraints: template.SearchConstraints, Auth: template.Auth, EndpointRequired: template.EndpointRequired,
 				ParametersSchema: template.ParametersSchema, Cost: template.Cost, Trust: template.Trust, Limitations: slices.Clone(template.Limitations),
 			}
 		}

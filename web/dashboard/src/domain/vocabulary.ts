@@ -175,13 +175,23 @@ export function describeProblem(code: string): { text: string; hint?: string } {
  */
 export const LIMITATION_COPY: Record<string, string> = {
   upstream_retention_unknown: '来源未说明保留多久的历史内容',
-  local_feed_window_only: '仅在当前 Feed 窗口内搜索',
   web_index_coverage_unknown: '网页索引的覆盖范围未知',
   candidate_results_only: '返回的是候选结果，不保证完整',
   tavily_max_20: '这个来源单次最多返回 20 条',
   x_recent_search_window: '只能搜索近期内容，历史范围有限',
   xurl_shortcut_no_continuation: '这条捷径不支持继续翻页',
   github_repository_metadata_only: '只返回仓库元数据，不含正文',
+	github_search_date_precision_day: 'GitHub 搜索时间只有天级精度，结果已按真实时间收口',
+	discourse_search_date_precision_day: 'Discourse 上游时间只有天级精度',
+	linux_do_cloudflare_challenge_possible: 'linux.do 可能要求通过 Cloudflare 浏览器挑战',
+	arxiv_api_rate_guidance: 'arXiv 要求客户端控制请求频率',
+	arxiv_search_time_precision_minute: 'arXiv 上游搜索时间只有分钟精度',
+	arxiv_api_first_page: '只读取了 arXiv 搜索首屏',
+	algolia_derived_index: '这是官网采用的 Algolia 派生索引，不是 HN 原始数据库',
+	hn_algolia_time_precision_second: 'HN Algolia 上游时间只有秒级精度',
+	hn_algolia_first_page: '只读取了 HN Algolia 搜索首屏',
+	discourse_search_first_page: '只读取了 Discourse 搜索首屏',
+	v2ex_not_native_search: 'V2EX 没有官方全文 Search，这条路线使用限定域名的 Web 索引',
   rsshub_route_metadata_version_dependent: '字段随 RSSHub 路由版本变化',
 }
 
