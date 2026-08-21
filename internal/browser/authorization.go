@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"github.com/ylxmf2005/omnihub/internal/core"
 	"github.com/ylxmf2005/omnihub/internal/registry"
 )
 
@@ -16,6 +17,15 @@ func AuthorizationForChannel(catalog *registry.Catalog, channelID string) (Autho
 	template, ok := catalog.RouteTemplate(channel.RouteTemplateID)
 	if !ok || !catalog.TemplateEnabled(channel.RouteTemplateID) || !catalog.TemplateTrusted(channel.RouteTemplateID) {
 		return AuthorizationDescriptor{}, bridgeError(ErrorScopeInvalid, "browser cookie route template is unavailable or untrusted")
+	}
+	return AuthorizationForChannelCatalog(channel, template)
+}
+
+// AuthorizationForChannelCatalog projects the already selected, trusted
+// Channel/template pair without making an Adapter depend on the full Catalog.
+func AuthorizationForChannelCatalog(channel core.Channel, template core.RouteTemplate) (AuthorizationDescriptor, error) {
+	if !channel.Enabled || channel.RouteTemplateID != template.RouteTemplateID {
+		return AuthorizationDescriptor{}, bridgeError(ErrorScopeInvalid, "browser cookie route selection is invalid")
 	}
 	auth := template.Auth
 	if auth.Kind != "browser_cookie" || !auth.Required || auth.Browser != "chrome" || len(auth.PermissionOrigins) != 1 || auth.CookieScope == nil {

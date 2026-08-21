@@ -12,16 +12,16 @@
     </header>
 
     <section>
-      <h2>Allow a site</h2>
+      <h2>Allow linux.do</h2>
       <p class="hint">
-        Log in to the site first, then enter its exact host. OmniHub can only read the cookies its
-        route template declares for hosts you allow here.
+        Log in to linux.do first, then authorize this exact origin. OmniHub only runs its built-in
+        first-page search request in this Chrome session and does not store your cookies.
       </p>
       <form id="grant-form" autocomplete="off">
         <label class="sr-only" for="host-input">Site host</label>
         <div class="row">
           <span class="prefix">https://</span>
-          <input id="host-input" type="text" placeholder="x.com" spellcheck="false" />
+          <input id="host-input" type="text" value="linux.do" readonly spellcheck="false" />
           <button type="submit" id="grant-button">允许此站点</button>
         </div>
       </form>

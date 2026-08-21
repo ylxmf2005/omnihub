@@ -56,11 +56,11 @@ import {
   useChannel,
   useChannels,
   useChromeDescriptor,
-  useCredentials,
   useDelete,
   useEgressProfiles,
   useProbeChannel,
   useReadiness,
+  useRouteTemplates,
   useRun,
   useRuns,
   useUpdate,
@@ -654,19 +654,20 @@ function ConfigPanel({ channel }: { channel: Channel }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Only Cookie-backed Channels have a descriptor; for everything else the
- * Backend answers `409 scope_invalid`. Rather than render a broken panel, the
- * request is gated on the Channel actually holding a `chrome_cookie`
- * Credential, so a Feed Channel never asks in the first place.
+ * Only browser-backed Channels have a descriptor; for everything else the
+ * Backend answers `409 scope_invalid`. Gate the request on RouteTemplate auth,
+ * because a Chrome session permission is not a stored Credential.
  */
 function ChromePanel({ channel }: { channel: Channel }) {
-  const credentials = useCredentials()
+  const templates = useRouteTemplates()
 
-  const cookieBacked = useMemo(() => {
-    if (!channel.credential_id) return false
-    const credential = (credentials.data ?? []).find((entry) => entry.id === channel.credential_id)
-    return credential?.auth_kind === 'chrome_cookie'
-  }, [channel.credential_id, credentials.data])
+  const cookieBacked = useMemo(
+    () =>
+      (templates.data ?? []).find(
+        (entry) => entry.route_template_id === channel.route_template_id,
+      )?.auth.kind === 'browser_cookie',
+    [channel.route_template_id, templates.data],
+  )
 
   const descriptor = useChromeDescriptor(cookieBacked ? channel.id : undefined)
 
@@ -679,8 +680,8 @@ function ChromePanel({ channel }: { channel: Channel }) {
       <CardRow>
         <Stack gap="sm">
           <Caveat>
-            这里描述的是这条 Channel 需要哪些 Cookie，它本身不是一份授权。真正的授权必须由你在
-            Chrome 扩展里对该 origin 批准，OmniHub 无法代替你同意。
+            这条 Channel 会在当前 Chrome 登录会话中发出受限请求。真正的授权必须由你在 Chrome
+            扩展里对该 origin 批准，OmniHub 无法代替你同意，也不会保存 Cookie。
           </Caveat>
           <FieldList
             fields={[
@@ -702,7 +703,7 @@ function ChromePanel({ channel }: { channel: Channel }) {
                 hint: '需要在扩展里批准的范围',
               },
               {
-                label: 'Cookie 地址',
+                label: '会话地址',
                 value: (
                   <Text fz="sm" ff="monospace">
                     {cookie_scope.url}
@@ -710,7 +711,7 @@ function ChromePanel({ channel }: { channel: Channel }) {
                 ),
               },
               { label: '涉及域名', value: cookie_scope.allowed_domains.join('，') || '未限定' },
-              { label: 'Cookie 名称', value: cookie_scope.names.join('，') || '未限定' },
+              { label: '登录 Cookie', value: cookie_scope.names.join('，') || '未限定' },
               { label: '存储区', value: cookie_scope.store },
             ]}
           />

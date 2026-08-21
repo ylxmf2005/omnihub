@@ -124,18 +124,25 @@ func (adapter DiscourseAdapter) Execute(ctx context.Context, request DiscourseRe
 }
 
 func (adapter DiscourseAdapter) requestURL(request DiscourseRequest) (*url.URL, *core.Error) {
-	if request.Operation.Operation != core.OperationSearch || request.Operation.Query == nil || request.RouteTemplate.Adapter != "discourse" || request.RouteTemplate.Provider != "discourse" || request.Channel.RouteTemplateID != request.RouteTemplate.RouteTemplateID {
+	return discourseRequestURL(request, "discourse", adapter.testBaseURL)
+}
+
+func discourseRequestURL(request DiscourseRequest, adapterName, testBaseURL string) (*url.URL, *core.Error) {
+	if request.Operation.Operation != core.OperationSearch || request.Operation.Query == nil || request.RouteTemplate.Adapter != adapterName || request.RouteTemplate.Provider != "discourse" || request.Channel.RouteTemplateID != request.RouteTemplate.RouteTemplateID {
 		return nil, &core.Error{Code: core.ErrorConfig, Message: "request is not bound to Discourse search"}
 	}
-	if request.Endpoint.Provider != "discourse" || !request.Endpoint.Enabled || request.Channel.EndpointProfileID != request.Endpoint.ID || request.Endpoint.EgressProfileID != request.Egress.ID {
+	if request.Endpoint.Provider != "discourse" || !request.Endpoint.Enabled || request.Channel.EndpointProfileID != request.Endpoint.ID {
 		return nil, &core.Error{Code: core.ErrorConfig, Message: "Discourse endpoint binding is invalid"}
+	}
+	if adapterName == "discourse" && request.Endpoint.EgressProfileID != request.Egress.ID {
+		return nil, &core.Error{Code: core.ErrorConfig, Message: "Discourse endpoint egress binding is invalid"}
 	}
 	base, err := url.Parse(request.Endpoint.BaseURL)
 	if err != nil || base.Scheme != "https" || base.Host != "linux.do" || base.Path != "" && base.Path != "/" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return nil, &core.Error{Code: core.ErrorConfig, Message: "Discourse endpoint must be https://linux.do"}
 	}
-	if adapter.testBaseURL != "" {
-		base, err = officialSearchLoopbackURL(adapter.testBaseURL)
+	if testBaseURL != "" {
+		base, err = officialSearchLoopbackURL(testBaseURL)
 		if err != nil || request.Egress.Mode != core.EgressModeDirect {
 			return nil, &core.Error{Code: core.ErrorConfig, Message: "Discourse test endpoint must be direct loopback"}
 		}

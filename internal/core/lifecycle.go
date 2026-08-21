@@ -313,6 +313,8 @@ func validExecutionEgress(egress ExecutionEgress) bool {
 		return true
 	case EgressModeDirect:
 		return !egress.Proxied
+	case EgressModeBrowser:
+		return !egress.Proxied
 	case EgressModeHTTPProxy, EgressModeSOCKS5:
 		return true
 	default:

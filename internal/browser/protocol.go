@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	protocolVersion = "1.0"
-	maxMessageSize  = 1 << 20
+	protocolVersion         = "1.0"
+	maxMessageSize          = 1 << 20
+	maxBrowserResponseBytes = 512 << 10
 )
 
 type messageType string
@@ -22,6 +23,7 @@ const (
 	messagePermissionsChanged messageType = "permissions_changed"
 	messageStatus             messageType = "status"
 	messageReadCookies        messageType = "read_cookies"
+	messageDiscourseSearch    messageType = "discourse_search"
 	messageRevokePermission   messageType = "revoke_permission"
 	messageResult             messageType = "result"
 	messageError              messageType = "error"
@@ -38,6 +40,9 @@ type wireMessage struct {
 	PermissionOriginPattern string       `json:"permission_origin_pattern,omitempty"`
 	CookieScope             *CookieScope `json:"cookie_scope,omitempty"`
 	Cookies                 []Cookie     `json:"cookies,omitempty"`
+	URL                     string       `json:"url,omitempty"`
+	HTTPStatus              int          `json:"http_status,omitempty"`
+	Body                    string       `json:"body,omitempty"`
 	Error                   *BridgeError `json:"error,omitempty"`
 }
 
@@ -175,7 +180,7 @@ func validateWireBase(message wireMessage) error {
 		return err
 	}
 	switch message.Type {
-	case messageHello, messagePermissionsChanged, messageStatus, messageReadCookies, messageRevokePermission, messageResult, messageError:
+	case messageHello, messagePermissionsChanged, messageStatus, messageReadCookies, messageDiscourseSearch, messageRevokePermission, messageResult, messageError:
 		return nil
 	default:
 		return bridgeError(ErrorProtocol, "unknown browser bridge message type")

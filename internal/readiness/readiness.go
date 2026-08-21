@@ -267,29 +267,36 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 		}
 	}
 
-	egress, _, egressReason := router.ResolveEgress(catalog, channel)
-	if egressReason == "" {
-		addCheck("egress_configured", CheckPassed, nil)
-		if egress.CredentialID != "" {
-			addCheck("egress_credential_resolved", CheckPassed, nil)
-		}
-	} else if strings.HasPrefix(egressReason, "preflight_egress_credential_") {
-		addCheck("egress_configured", CheckPassed, nil)
-		code := strings.TrimPrefix(egressReason, "preflight_")
-		addCheck("egress_credential_resolved", CheckFailed, &code)
-		configured = false
-		if egressReason == "preflight_egress_credential_unresolved" {
-			result.Readiness = StateBlocked
-		}
-	} else {
-		code := strings.TrimPrefix(egressReason, "preflight_")
-		addCheck("egress_configured", CheckFailed, &code)
-		configured = false
-		if egressReason == "preflight_egress_disabled" {
-			result.Readiness = StateBlocked
+	if template.Adapter != "discourse_browser" {
+		egress, _, egressReason := router.ResolveEgress(catalog, channel)
+		if egressReason == "" {
+			addCheck("egress_configured", CheckPassed, nil)
+			if egress.CredentialID != "" {
+				addCheck("egress_credential_resolved", CheckPassed, nil)
+			}
+		} else if strings.HasPrefix(egressReason, "preflight_egress_credential_") {
+			addCheck("egress_configured", CheckPassed, nil)
+			code := strings.TrimPrefix(egressReason, "preflight_")
+			addCheck("egress_credential_resolved", CheckFailed, &code)
+			configured = false
+			if egressReason == "preflight_egress_credential_unresolved" {
+				result.Readiness = StateBlocked
+			}
+		} else {
+			code := strings.TrimPrefix(egressReason, "preflight_")
+			addCheck("egress_configured", CheckFailed, &code)
+			configured = false
+			if egressReason == "preflight_egress_disabled" {
+				result.Readiness = StateBlocked
+			}
 		}
 	}
-	if template.Auth.Required && channel.CredentialID == "" {
+	if template.Adapter == "discourse_browser" && channel.CredentialID != "" {
+		code := "browser_credential_unsupported"
+		addCheck("credential_resolved", CheckFailed, &code)
+		result.Readiness = StateBlocked
+		configured = false
+	} else if template.Auth.Required && template.Auth.Kind != "browser_cookie" && channel.CredentialID == "" {
 		code := "credential_missing"
 		addCheck("credential_resolved", CheckFailed, &code)
 		result.Readiness = StateBlocked
@@ -328,7 +335,7 @@ func inspect(catalog *registry.Catalog, channel core.Channel, now time.Time) Cha
 		addCheck("dependency_installed", CheckPassed, nil)
 		code := "upstream_not_probed"
 		addCheck("channel_probe", CheckUnknown, &code)
-	case template.Origin == "builtin" && (template.Adapter == "github" || template.Adapter == "tavily"):
+	case template.Origin == "builtin" && (template.Adapter == "github" || template.Adapter == "tavily" || template.Adapter == "discourse_browser"):
 		addCheck("dependency_installed", CheckPassed, nil)
 		code := "probe_unsupported"
 		addCheck("channel_probe", CheckUnknown, &code)

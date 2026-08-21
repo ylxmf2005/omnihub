@@ -1172,10 +1172,12 @@ func executeCatalogOperationWithStore(ctx context.Context, catalog *registry.Cat
 		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
 	}
 	feedAdapter := adapter.FeedAdapter{Cache: adapter.NewFileFeedCache(filepath.Join(paths.CacheDir, "feeds"))}
+	browserClient := browser.NewClient(paths.RuntimeDir)
 	service := query.Service{
 		Feed: feedAdapter, RSSHub: adapter.RSSHubAdapter{Feed: feedAdapter}, GitHub: adapter.GitHubAdapter{},
 		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, Discourse: adapter.DiscourseAdapter{},
-		Arxiv: adapter.ArxivAdapter{}, HNAlgolia: adapter.HNAlgoliaAdapter{}, CookieReader: browser.NewClient(paths.RuntimeDir),
+		DiscourseBrowser: adapter.DiscourseBrowserAdapter{Browser: browserClient},
+		Arxiv:            adapter.ArxivAdapter{}, HNAlgolia: adapter.HNAlgoliaAdapter{}, CookieReader: browserClient,
 	}
 	if operation.SimilarityGrouping == core.SimilaritySemantic {
 		if store == nil {

@@ -20,6 +20,7 @@ const (
 	ErrorBrowserUnavailable       ErrorCode = "browser_unavailable"
 	ErrorBrowserPermissionMissing ErrorCode = "browser_permission_missing"
 	ErrorCookieMissing            ErrorCode = "cookie_missing"
+	ErrorBrowserRequestFailed     ErrorCode = "browser_request_failed"
 	ErrorScopeInvalid             ErrorCode = "scope_invalid"
 	ErrorBridgeAlreadyActive      ErrorCode = "bridge_already_active"
 	ErrorProtocol                 ErrorCode = "protocol_error"
@@ -50,6 +51,7 @@ var (
 	ErrBrowserUnavailable       = &BridgeError{Code: ErrorBrowserUnavailable}
 	ErrBrowserPermissionMissing = &BridgeError{Code: ErrorBrowserPermissionMissing}
 	ErrCookieMissing            = &BridgeError{Code: ErrorCookieMissing}
+	ErrBrowserRequestFailed     = &BridgeError{Code: ErrorBrowserRequestFailed}
 	ErrScopeInvalid             = &BridgeError{Code: ErrorScopeInvalid}
 	ErrBridgeAlreadyActive      = &BridgeError{Code: ErrorBridgeAlreadyActive}
 	ErrProtocol                 = &BridgeError{Code: ErrorProtocol}
@@ -89,6 +91,22 @@ type ReadCookiesRequest struct {
 type ReadCookiesResponse struct {
 	RequestID string   `json:"request_id"`
 	Cookies   []Cookie `json:"cookies"`
+}
+
+// DiscourseSearchRequest 是当前唯一允许经 Browser Bridge 发出的网络请求。
+// URL 仍由后端生成，但 Host 与 Extension 都会重新锁定 linux.do/search.json，
+// 避免把已授权 origin 变成通用浏览器代理。
+type DiscourseSearchRequest struct {
+	RequestID               string `json:"request_id"`
+	ChannelID               string `json:"channel_id"`
+	PermissionOriginPattern string `json:"permission_origin_pattern"`
+	URL                     string `json:"url"`
+}
+
+type DiscourseSearchResponse struct {
+	RequestID  string `json:"request_id"`
+	HTTPStatus int    `json:"http_status"`
+	Body       string `json:"body"`
 }
 
 type RevokePermissionRequest struct {
@@ -204,6 +222,38 @@ func validateReadCookiesRequest(request ReadCookiesRequest) error {
 	}
 	if len(request.CookieScope.Partitions) != 1 || request.CookieScope.Partitions[0] != "unpartitioned" {
 		return bridgeError(ErrorScopeInvalid, "v1 only supports unpartitioned cookies")
+	}
+	return nil
+}
+
+func validateDiscourseSearchRequest(request DiscourseSearchRequest) error {
+	if err := validateRequestID(request.RequestID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(request.ChannelID) == "" || request.ChannelID != strings.TrimSpace(request.ChannelID) {
+		return bridgeError(ErrorScopeInvalid, "channel_id is required")
+	}
+	permissionHost, err := parsePermissionPattern(request.PermissionOriginPattern)
+	if err != nil {
+		return err
+	}
+	target, err := url.Parse(request.URL)
+	if err != nil || target.Scheme != "https" || target.Host != "linux.do" || target.Hostname() != permissionHost || target.Path != "/search.json" || target.User != nil || target.Fragment != "" || len(request.URL) > 8192 {
+		return bridgeError(ErrorScopeInvalid, "browser search is limited to https://linux.do/search.json")
+	}
+	query := target.Query()
+	if len(query) != 2 || len(query["q"]) != 1 || strings.TrimSpace(query.Get("q")) == "" || len(query.Get("q")) > 4096 || len(query["page"]) != 1 || query.Get("page") != "1" {
+		return bridgeError(ErrorScopeInvalid, "browser search query is outside the supported Discourse scope")
+	}
+	return nil
+}
+
+func validateDiscourseSearchResponse(response DiscourseSearchResponse) error {
+	if response.HTTPStatus < 100 || response.HTTPStatus > 599 {
+		return bridgeError(ErrorProtocol, "Chrome returned an invalid HTTP status")
+	}
+	if len(response.Body) > maxBrowserResponseBytes {
+		return bridgeError(ErrorProtocol, "Chrome returned an oversized response")
 	}
 	return nil
 }

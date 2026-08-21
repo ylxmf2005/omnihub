@@ -463,7 +463,7 @@ omnihub chrome-host uninstall
 
 Chrome 会按 manifest 直接启动同一个二进制；一般不需要手工运行 `chrome-host run`。`uninstall` 只注销精确的 Native Host 注册，不删除 OmniHub binary、SQLite、配置或 cache。
 
-本仓库不包含 Chrome Companion Extension。只有 Extension 已安装、用户对精确 HTTPS origin 授权、Bridge 在线，并且某个受信任 Cookie Channel 真实 Probe 成功后，该 Channel 才能显示 ready。Cookie 只进入当前执行内存，不写 SQLite、不经过 Dashboard HTTP，也不进入 Run、Error 或日志。
+本仓库的 `extension/` 包含可直接 Load unpacked 的 Chrome Companion Extension。当前产品路线只允许用户显式授权 `https://linux.do/*`，并只在 Chrome 会话内执行内建的 `/search.json` 第一页请求；Host 与 Extension 会分别拒绝其他 host、path 与 page。Cookie 不离开 Chrome，不写 SQLite、不经过 Dashboard HTTP，也不进入 Run、Error 或日志。安装与授权步骤见 `extension/README.md`。
 
 ## 出口、Probe 与诊断
 

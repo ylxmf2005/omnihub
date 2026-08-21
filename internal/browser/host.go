@@ -233,13 +233,13 @@ func runBroker(ctx context.Context, nativeWriter io.Writer, now func() time.Time
 func handleClientRequest(message wireMessage, status Status) (*wireMessage, *wireMessage, messageType, error) {
 	switch message.Type {
 	case messageStatus:
-		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.Error != nil {
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 			return nil, nil, "", bridgeError(ErrorProtocol, "status request contains unsupported fields")
 		}
 		response := wireMessage{ProtocolVersion: protocolVersion, Type: messageResult, RequestID: message.RequestID, Status: statusPointer(status)}
 		return nil, &response, "", nil
 	case messageReadCookies:
-		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || len(message.Cookies) != 0 || message.Error != nil {
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 			return nil, nil, "", bridgeError(ErrorProtocol, "read_cookies request contains unsupported fields")
 		}
 		if message.CookieScope == nil {
@@ -254,8 +254,21 @@ func handleClientRequest(message wireMessage, status Status) (*wireMessage, *wir
 		}
 		forwarded := message
 		return &forwarded, nil, messageReadCookies, nil
+	case messageDiscourseSearch:
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.CookieScope != nil || len(message.Cookies) != 0 || message.HTTPStatus != 0 || message.Body != "" || message.Error != nil {
+			return nil, nil, "", bridgeError(ErrorProtocol, "discourse_search request contains unsupported fields")
+		}
+		request := DiscourseSearchRequest{RequestID: message.RequestID, ChannelID: message.ChannelID, PermissionOriginPattern: message.PermissionOriginPattern, URL: message.URL}
+		if err := validateDiscourseSearchRequest(request); err != nil {
+			return nil, nil, "", err
+		}
+		if !contains(status.GrantedOrigins, message.PermissionOriginPattern) {
+			return nil, nil, "", bridgeError(ErrorBrowserPermissionMissing, "Chrome origin permission is not granted")
+		}
+		forwarded := message
+		return &forwarded, nil, messageDiscourseSearch, nil
 	case messageRevokePermission:
-		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.Error != nil {
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 			return nil, nil, "", bridgeError(ErrorProtocol, "revoke_permission request contains unsupported fields")
 		}
 		if _, err := parsePermissionPattern(message.PermissionOriginPattern); err != nil {
@@ -273,7 +286,7 @@ func handleClientRequest(message wireMessage, status Status) (*wireMessage, *wir
 
 func handleExtensionResponse(message wireMessage, expected messageType, request wireMessage, status Status, observedAt time.Time) (wireMessage, Status, error) {
 	if message.Type == messageError {
-		if message.Error == nil || !allowedExtensionError(message.Error.Code) || message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 {
+		if message.Error == nil || !allowedExtensionError(message.Error.Code) || message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) {
 			return wireMessage{}, status, bridgeError(ErrorProtocol, "Extension returned an invalid error")
 		}
 		status.LastSeenAt = observedAt
@@ -281,7 +294,7 @@ func handleExtensionResponse(message wireMessage, expected messageType, request 
 	}
 	switch expected {
 	case messageReadCookies:
-		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || message.Error != nil {
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || hasBrowserFetchFields(message) || message.Error != nil {
 			return wireMessage{}, status, bridgeError(ErrorProtocol, "Extension returned invalid read_cookies fields")
 		}
 		readRequest := ReadCookiesRequest{RequestID: request.RequestID, ChannelID: request.ChannelID, PermissionOriginPattern: request.PermissionOriginPattern, CookieScope: *request.CookieScope}
@@ -290,8 +303,18 @@ func handleExtensionResponse(message wireMessage, expected messageType, request 
 		}
 		status.LastSeenAt = observedAt
 		return wireMessage{ProtocolVersion: protocolVersion, Type: messageResult, RequestID: request.RequestID, Cookies: append([]Cookie(nil), message.Cookies...)}, status, nil
+	case messageDiscourseSearch:
+		if message.ProfileLabel != "" || len(message.GrantedOrigins) != 0 || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.URL != "" || message.Error != nil {
+			return wireMessage{}, status, bridgeError(ErrorProtocol, "Extension returned invalid discourse_search fields")
+		}
+		response := DiscourseSearchResponse{RequestID: request.RequestID, HTTPStatus: message.HTTPStatus, Body: message.Body}
+		if err := validateDiscourseSearchResponse(response); err != nil {
+			return wireMessage{}, status, err
+		}
+		status.LastSeenAt = observedAt
+		return wireMessage{ProtocolVersion: protocolVersion, Type: messageResult, RequestID: request.RequestID, HTTPStatus: message.HTTPStatus, Body: message.Body}, status, nil
 	case messageRevokePermission:
-		if message.ProfileLabel != "" || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.Error != nil {
+		if message.ProfileLabel != "" || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 			return wireMessage{}, status, bridgeError(ErrorProtocol, "Extension returned invalid revoke_permission fields")
 		}
 		if err := validateGrantedOrigins(message.GrantedOrigins); err != nil {
@@ -312,7 +335,7 @@ func validateHello(message wireMessage) error {
 	if message.Type != messageHello || strings.TrimSpace(message.ProfileLabel) == "" || message.ProfileLabel != strings.TrimSpace(message.ProfileLabel) || len(message.ProfileLabel) > 128 || strings.ContainsFunc(message.ProfileLabel, unicode.IsControl) {
 		return bridgeError(ErrorProtocol, "first native message must be a profile hello")
 	}
-	if message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.Error != nil {
+	if message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 		return bridgeError(ErrorProtocol, "profile hello contains unsupported fields")
 	}
 	return validateGrantedOrigins(message.GrantedOrigins)
@@ -322,7 +345,7 @@ func validatePermissionsChanged(message wireMessage) error {
 	if message.Type != messagePermissionsChanged {
 		return bridgeError(ErrorProtocol, "invalid permission event")
 	}
-	if message.ProfileLabel != "" || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || message.Error != nil {
+	if message.ProfileLabel != "" || message.Status != nil || message.ChannelID != "" || message.PermissionOriginPattern != "" || message.CookieScope != nil || len(message.Cookies) != 0 || hasBrowserFetchFields(message) || message.Error != nil {
 		return bridgeError(ErrorProtocol, "permission event contains unsupported fields")
 	}
 	return validateGrantedOrigins(message.GrantedOrigins)
@@ -344,7 +367,7 @@ func contains(values []string, wanted string) bool {
 
 func allowedExtensionError(code ErrorCode) bool {
 	switch code {
-	case ErrorBrowserPermissionMissing, ErrorCookieMissing, ErrorScopeInvalid:
+	case ErrorBrowserPermissionMissing, ErrorCookieMissing, ErrorScopeInvalid, ErrorBrowserRequestFailed:
 		return true
 	default:
 		return false
@@ -359,7 +382,13 @@ func safeExtensionError(code ErrorCode) *BridgeError {
 		return bridgeError(code, "required cookies are absent")
 	case ErrorScopeInvalid:
 		return bridgeError(code, "Chrome Extension rejected the authorized cookie scope")
+	case ErrorBrowserRequestFailed:
+		return bridgeError(code, "Chrome could not complete the authorized request")
 	default:
 		return bridgeError(ErrorProtocol, "Chrome Extension returned an unsupported error")
 	}
+}
+
+func hasBrowserFetchFields(message wireMessage) bool {
+	return message.URL != "" || message.HTTPStatus != 0 || message.Body != ""
 }

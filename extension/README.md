@@ -1,9 +1,9 @@
 # OmniHub Chrome Companion Extension
 
-A Manifest V3 extension that lets OmniHub read **only the cookies you explicitly
-authorize, for the sites you explicitly allow**, from the Chrome profile you are
-using. It talks to `omnihub chrome-host` over Chrome Native Messaging and does
-nothing else: no page scripts, no remote endpoints, no cookie storage.
+A Manifest V3 extension that lets OmniHub run its built-in linux.do Search in
+the Chrome profile you explicitly authorize. It talks to `omnihub chrome-host`
+over Chrome Native Messaging, sends only `GET https://linux.do/search.json`,
+and does not expose or store the browser's cookies.
 
 ## Install
 
@@ -33,10 +33,8 @@ no dependencies — load the directory as-is.
 
 ## Using it
 
-1. In the OmniHub Dashboard, open the channel's login link and sign in to the
-   site as usual.
-2. Open this extension's popup, type the site's exact host (for example
-   `x.com`), and click **允许此站点**. Chrome shows its own permission prompt;
+1. In the OmniHub Dashboard, open the linux.do Channel login link and sign in.
+2. Open this extension's popup and click **允许此站点**. Chrome shows its own permission prompt;
    accepting it is the authorization. OmniHub never grants this silently.
 3. The Dashboard learns the result from Bridge health — the extension does not
    call the Dashboard API.
@@ -53,27 +51,24 @@ the host reads the label from the `hello` message.
 
 ## What it can and cannot do
 
-Cookie values exist only in the local variables of one `read_cookies` handler
-call and go only to the native port. They are never written to
-`chrome.storage`, never logged, and never sent over the network. The extension
-has no `<all_urls>` permission, no `debugger` permission, and does not use the
-Chrome DevTools Protocol.
+The linux.do search handler uses `fetch(..., {credentials: "include"})` inside
+Chrome, so Chrome attaches the session itself. Cookie values are not returned
+to the Native Host. The extension never writes them to `chrome.storage` or logs
+them. It has no `<all_urls>`, `debugger`, content-script, or CDP access.
 
-For every request, the extension independently re-checks that the requested
-scope names one exact HTTPS host that this profile has actually granted, and
-returns only the exact cookie names asked for, only from domains inside the
-authorized origin, only from the current cookie store, and only unpartitioned
-cookies. Anything outside that is refused rather than widened.
+For every search, the Host and extension independently require the exact
+`https://linux.do/*` permission, `/search.json`, a non-empty `q`, and `page=1`.
+Another host, path, page, redirect, method, or oversized response is refused.
 
 Manifest permissions:
 
 | Permission | Why |
 | --- | --- |
-| `cookies` | read the authorized cookies |
+| `cookies` | retain the strict legacy `read_cookies` protocol boundary; linux.do Search itself does not export cookie values |
 | `nativeMessaging` | connect to `omnihub chrome-host` |
 | `storage` | the profile label (`local`) and bridge/backoff state (`session`) |
 | `alarms` | reconnect watchdog for the MV3 service worker |
-| `optional_host_permissions: ["https://*/*"]` | **grants nothing at install.** Optional host permissions must be declared in the manifest before they can be requested, and OmniHub cannot know your sites in advance. Chrome only ever grants the one exact `https://<host>/*` you approve in the popup, and that is what `chrome.permissions.getAll()` reports to the host. |
+| `optional_host_permissions: ["https://linux.do/*"]` | grants nothing at install; the popup requests only this exact origin after a user gesture |
 
 ## Protocol notes
 
@@ -86,7 +81,8 @@ decodes with `DisallowUnknownFields` and drops the connection on anything extra.
 The extension sends `hello` first, then only `permissions_changed` events and
 `result`/`error` replies. `status` requests are answered by the host itself, so
 there is no status handler here. Error replies use only
-`browser_permission_missing`, `cookie_missing`, and `scope_invalid`, with short
+`browser_permission_missing`, `cookie_missing`, `scope_invalid`, and
+`browser_request_failed`, with short
 fixed messages that never include cookie values or raw Chrome errors.
 
 If the port drops while Chrome is running, the service worker reconnects with
@@ -104,7 +100,6 @@ was captured from the real handlers under a stubbed `chrome` API and checked
 field-for-field against the `wireMessage` struct and the host's per-type
 field-emptiness rules.
 
-**Not verified:** the live round trip. Nothing here has been run against a
-registered native host, a real Chrome profile, or a real cookie channel, so
-`connectNative` startup, the host's hello acceptance, reconnect timing under
-real service worker termination, and real `chrome.cookies` results are untested.
+The Go protocol and adapter path are covered by round-trip tests with captured
+Native Messaging frames. A real Chrome/linux.do success still depends on the
+local installation, the user's login, permission grant, and upstream response.

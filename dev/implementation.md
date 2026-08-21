@@ -56,3 +56,11 @@
 - Channels 列表不再向不支持分层 Probe 的搜索路线提供“检查”按钮，改为提示由实际查询验证，避免生成必然失败的 `probe_unsupported` Run。
 - Dashboard 主内容区使用导航之外的完整宽度，移除 1280px 左对齐上限；项目 `AGENTS.md` 固定 Backend 与前端开发服务器使用 `screen` 常驻及重启后的最小回读要求。
 - `v2ex-direct-latest` 与新增 `nodeseek-direct-latest` 通过 RouteTemplate JSON Schema 的 `const` 保存固定官方 Feed；Backend 在 URL 省略时自动补入并拒绝覆盖，Dashboard 隐藏地址输入但保留 Egress 选择。默认 SQLite 已真实创建 `channel_nodeseek_latest`，保存 URL 为 `https://rss.nodeseek.com/`；当前 Direct Probe 因本机网络超时失败，状态如实保留。
+
+## linux.do Chrome 会话搜索增量
+
+- 根因：普通 Go HTTP 请求在 linux.do `/search.json` 前被 Cloudflare challenge 403 拦截；已有 Extension 只把指定 Cookie 交给 Go，仍没有让请求进入真实 Chrome 网络会话。
+- 实现：`linux-do-discourse-search` 保留原 RouteTemplate ID 和 Endpoint/Channel 配置，Adapter 改为 `discourse_browser`。Extension 使用用户显式授权的 Chrome 会话发出 GET，后端复用既有 Discourse query 映射与 Item/Coverage 归一化；Envelope 将实际出口标为 `chrome_default/browser`，不再冒充 Endpoint 绑定的 direct Egress。
+- 安全边界：manifest 的 optional host permission 收窄为 `https://linux.do/*`；Native Host 与 Extension 双重验证 host、`/search.json`、非空 `q` 和 `page=1`，拒绝其他路径、域名、页码、redirect 与大于 512 KiB 的响应。Cookie 不离开 Chrome，Channel 不再接受 User API Key Credential。
+- Dashboard：Chrome 授权面板按 RouteTemplate 的 `browser_cookie` auth 显示，不再依赖一条虚构的 `chrome_cookie` Credential；安装文档与内嵌静态资源已同步。
+- 聚焦反馈：扩展既有 `binding_test.go` 覆盖 Native Messaging 成功帧、越权 host/path/page 拒绝，以及浏览器响应到标准 Discourse Item 的归一化；`go test ./...`、Extension JavaScript syntax check 与 Dashboard production build 通过。真实 linux.do 成功查询仍需本机安装 Extension、登录并在 Chrome 权限弹窗中确认。

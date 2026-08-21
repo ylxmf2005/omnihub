@@ -47,6 +47,7 @@ type ApplyProviderChannelInput struct {
 type providerSpec struct {
 	provider           string
 	authKind           string
+	authRequired       bool
 	credentialRequired bool
 	endpointBaseURL    string
 }
@@ -335,11 +336,13 @@ func (service Service) managedProviderTemplate(id string) (core.RouteTemplate, p
 	case "github":
 		spec = providerSpec{provider: "github-api", authKind: "token", endpointBaseURL: "https://api.github.com"}
 	case "tavily":
-		spec = providerSpec{provider: "tavily", authKind: "api_key", credentialRequired: true, endpointBaseURL: "https://api.tavily.com"}
+		spec = providerSpec{provider: "tavily", authKind: "api_key", authRequired: true, credentialRequired: true, endpointBaseURL: "https://api.tavily.com"}
 	case "xurl":
-		spec = providerSpec{provider: "xurl", authKind: "app_only", credentialRequired: true}
+		spec = providerSpec{provider: "xurl", authKind: "app_only", authRequired: true, credentialRequired: true}
 	case "discourse":
 		spec = providerSpec{provider: "discourse", authKind: "user_api_key", endpointBaseURL: "https://linux.do"}
+	case "discourse_browser":
+		spec = providerSpec{provider: "discourse", authKind: "browser_cookie", authRequired: true, endpointBaseURL: "https://linux.do"}
 	case "arxiv":
 		spec = providerSpec{provider: "arxiv-api", authKind: "none", endpointBaseURL: "https://export.arxiv.org"}
 	case "hn_algolia":
@@ -347,7 +350,7 @@ func (service Service) managedProviderTemplate(id string) (core.RouteTemplate, p
 	default:
 		return core.RouteTemplate{}, providerSpec{}, fmt.Errorf("%w: adapter %s is not managed here", ErrUnsupportedTemplate, template.Adapter)
 	}
-	if template.Provider != spec.provider || template.Auth.Kind != spec.authKind || template.Auth.Required != spec.credentialRequired || template.EndpointRequired != (spec.endpointBaseURL != "") {
+	if template.Provider != spec.provider || template.Auth.Kind != spec.authKind || template.Auth.Required != spec.authRequired || template.EndpointRequired != (spec.endpointBaseURL != "") {
 		return core.RouteTemplate{}, providerSpec{}, fmt.Errorf("%w: builtin provider template contract is inconsistent", ErrUnsupportedTemplate)
 	}
 	return template, spec, nil
@@ -355,6 +358,9 @@ func (service Service) managedProviderTemplate(id string) (core.RouteTemplate, p
 
 func (service Service) validateProviderCredential(ctx context.Context, id string, spec providerSpec) error {
 	id = strings.TrimSpace(id)
+	if spec.authKind == "browser_cookie" && id != "" {
+		return fmt.Errorf("%w: browser-backed provider does not accept a stored credential", ErrInvalidProviderConfig)
+	}
 	if id == "" {
 		if spec.credentialRequired {
 			return fmt.Errorf("%w: provider credential is required", ErrInvalidProviderConfig)

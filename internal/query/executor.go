@@ -91,18 +91,19 @@ type SemanticGrouper interface {
 }
 
 type Service struct {
-	Feed          FeedExecutor
-	RSSHub        RSSHubExecutor
-	GitHub        GitHubExecutor
-	Tavily        TavilyExecutor
-	XURL          XURLExecutor
-	Discourse     DiscourseExecutor
-	Arxiv         ArxivExecutor
-	HNAlgolia     HNAlgoliaExecutor
-	CookieReader  CookieReader
-	BrowserCookie BrowserCookieExecutor
-	Semantic      SemanticGrouper
-	Now           func() time.Time
+	Feed             FeedExecutor
+	RSSHub           RSSHubExecutor
+	GitHub           GitHubExecutor
+	Tavily           TavilyExecutor
+	XURL             XURLExecutor
+	Discourse        DiscourseExecutor
+	DiscourseBrowser DiscourseExecutor
+	Arxiv            ArxivExecutor
+	HNAlgolia        HNAlgoliaExecutor
+	CookieReader     CookieReader
+	BrowserCookie    BrowserCookieExecutor
+	Semantic         SemanticGrouper
+	Now              func() time.Time
 }
 
 // Execute 从同一份 Catalog 和 Operation 构建路由计划，并把所有已选择路径的
@@ -257,14 +258,17 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 
 	execution := baseExecution(decision, run.operation)
 	execution.StartedAt = started.UTC()
-	egress, egressCredential, egressReason := router.ResolveEgress(run.catalog, decision.Channel)
-	if egressReason != "" {
-		return false, fmt.Errorf("%w: selected channel %s failed egress preflight: %s", ErrInvalidExecutor, decision.Channel.ID, egressReason)
-	}
-	execution.Egress = &core.ExecutionEgress{
-		ProfileID: egress.ID,
-		Mode:      egress.Mode,
-		Proxied:   false,
+	var egress core.EgressProfile
+	var egressCredential *core.Credential
+	if decision.RouteTemplate.Adapter == "discourse_browser" {
+		execution.Egress = &core.ExecutionEgress{ProfileID: browser.BridgeID, Mode: core.EgressModeBrowser}
+	} else {
+		var egressReason string
+		egress, egressCredential, egressReason = router.ResolveEgress(run.catalog, decision.Channel)
+		if egressReason != "" {
+			return false, fmt.Errorf("%w: selected channel %s failed egress preflight: %s", ErrInvalidExecutor, decision.Channel.ID, egressReason)
+		}
+		execution.Egress = &core.ExecutionEgress{ProfileID: egress.ID, Mode: egress.Mode}
 	}
 	var endpoint core.EndpointProfile
 	if decision.Channel.EndpointProfileID != "" {
@@ -338,6 +342,14 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			return false, fmt.Errorf("%w: Discourse executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
 		}
 		result = run.service.Discourse.Execute(childContext, adapter.DiscourseRequest{
+			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
+		})
+	case "discourse_browser":
+		if run.service.DiscourseBrowser == nil {
+			return false, fmt.Errorf("%w: browser Discourse executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
+		}
+		result = run.service.DiscourseBrowser.Execute(childContext, adapter.DiscourseRequest{
 			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
 		})

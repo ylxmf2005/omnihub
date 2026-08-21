@@ -57,6 +57,25 @@ func (client *Client) ReadCookies(ctx context.Context, request ReadCookiesReques
 	return ReadCookiesResponse{RequestID: response.RequestID, Cookies: append([]Cookie(nil), response.Cookies...)}, nil
 }
 
+func (client *Client) SearchDiscourse(ctx context.Context, request DiscourseSearchRequest) (DiscourseSearchResponse, error) {
+	if err := validateDiscourseSearchRequest(request); err != nil {
+		return DiscourseSearchResponse{}, err
+	}
+	response, err := client.exchange(ctx, wireMessage{
+		ProtocolVersion: protocolVersion, Type: messageDiscourseSearch,
+		RequestID: request.RequestID, ChannelID: request.ChannelID,
+		PermissionOriginPattern: request.PermissionOriginPattern, URL: request.URL,
+	})
+	if err != nil {
+		return DiscourseSearchResponse{}, err
+	}
+	result := DiscourseSearchResponse{RequestID: response.RequestID, HTTPStatus: response.HTTPStatus, Body: response.Body}
+	if err := validateDiscourseSearchResponse(result); err != nil {
+		return DiscourseSearchResponse{}, err
+	}
+	return result, nil
+}
+
 func (client *Client) RevokePermission(ctx context.Context, permissionOriginPattern string) (RevokePermissionResponse, error) {
 	if _, err := parsePermissionPattern(permissionOriginPattern); err != nil {
 		return RevokePermissionResponse{}, err

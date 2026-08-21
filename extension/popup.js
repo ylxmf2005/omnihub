@@ -112,8 +112,8 @@ async function revokeOrigin(origin) {
 grantForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const host = exactHost(hostInput.value);
-  if (host === "") {
-    showMessage("Enter one exact HTTPS host, for example x.com.", true);
+  if (host !== "linux.do") {
+    showMessage("This version only supports the exact linux.do origin.", true);
     return;
   }
   const pattern = patternForHost(host);
@@ -127,7 +127,7 @@ grantForm.addEventListener("submit", (event) => {
       showMessage(`${pattern} was not allowed.`, true);
       return;
     }
-    hostInput.value = "";
+    hostInput.value = "linux.do";
     showMessage(`Allowed ${pattern}.`, false);
     void refresh();
   });

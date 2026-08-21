@@ -1776,6 +1776,26 @@ func TestOfficialSearchAdaptersMapTypedConstraintsAndResults(t *testing.T) {
 		}
 	})
 
+	t.Run("discourse_browser", func(t *testing.T) {
+		client := &fakeDiscourseBrowserClient{response: browser.DiscourseSearchResponse{
+			HTTPStatus: 200,
+			Body:       `{"posts":[{"id":10,"topic_id":20,"post_number":1,"username":"alice","created_at":"2026-08-20T10:00:00Z","blurb":"result body"}],"topics":[{"id":20,"title":"Result","slug":"result","category_id":3}],"grouped_search_result":{"more_posts":false,"more_topics":false}}`,
+		}}
+		request := DiscourseRequest{
+			Operation: core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5, Sort: core.SearchSortNewest, Constraints: core.SearchConstraints{Time: core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: &from}}},
+			Channel:   core.Channel{ID: "linux", Source: "linux.do", RouteTemplateID: "linux-search", EndpointProfileID: "linux-endpoint", Enabled: true},
+			RouteTemplate: core.RouteTemplate{RouteTemplateID: "linux-search", Origin: "builtin", Provider: "discourse", Adapter: "discourse_browser", Auth: core.AuthDescriptor{
+				Kind: "browser_cookie", Required: true, LoginURL: "https://linux.do/login", Browser: "chrome", PermissionOrigins: []string{"https://linux.do/*"},
+				CookieScope: &core.CookieScope{URL: "https://linux.do/", AllowedDomains: []string{"linux.do"}, Names: []string{"_t"}, Store: "current", Partitions: []string{"unpartitioned"}},
+			}},
+			Endpoint: core.EndpointProfile{ID: "linux-endpoint", Provider: "discourse", BaseURL: "https://linux.do", EgressProfileID: "direct", Enabled: true}, Egress: egressProfile,
+		}
+		result := (DiscourseBrowserAdapter{Browser: client, Now: func() time.Time { return fixed }}).Execute(context.Background(), request)
+		if len(client.requests) != 1 || !strings.Contains(client.requests[0].URL, "/search.json?") || !strings.Contains(client.requests[0].URL, "page=1") || len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://linux.do/t/result/20/1" || result.ProviderState["auth_used"] != "true" {
+			t.Fatalf("browser Discourse result = %#v, requests=%#v", result, client.requests)
+		}
+	})
+
 	t.Run("arxiv", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			search := request.URL.Query().Get("search_query")
@@ -2641,6 +2661,44 @@ func TestBrowserHostRoundTripPermissionAndRevoke(t *testing.T) {
 	}
 }
 
+func TestBrowserHostDiscourseSearchIsPinnedToAuthorizedLinuxDoPath(t *testing.T) {
+	host := startBrowserHostFixture(t, browserRuntimeDir(t), "Profile", []string{"https://linux.do/*"}, time.Now().UTC())
+	defer host.stop(t)
+	client := browser.NewClient(host.runtimeDir)
+	request := browser.DiscourseSearchRequest{
+		RequestID: "browserreq_linux_search", ChannelID: "channel_linux_do_search",
+		PermissionOriginPattern: "https://linux.do/*",
+		URL:                     "https://linux.do/search.json?q=%22deepseek+harness%22&page=1",
+	}
+	resultChannel := make(chan browserSearchResult, 1)
+	go func() {
+		response, err := client.SearchDiscourse(context.Background(), request)
+		resultChannel <- browserSearchResult{response: response, err: err}
+	}()
+	forwarded := readBrowserWireFixture(t, host.output)
+	if forwarded.Type != "discourse_search" || forwarded.URL != request.URL || forwarded.PermissionOriginPattern != "https://linux.do/*" {
+		t.Fatalf("forwarded discourse_search = %#v", forwarded)
+	}
+	body := `{"posts":[],"topics":[],"grouped_search_result":{"more_posts":false,"more_topics":false}}`
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID, HTTPStatus: 200, Body: body})
+	result := <-resultChannel
+	if result.err != nil || result.response.HTTPStatus != 200 || result.response.Body != body {
+		t.Fatalf("SearchDiscourse() = %#v, %v", result.response, result.err)
+	}
+
+	for _, invalid := range []string{
+		"https://linux.do/admin/users.json?q=deepseek&page=1",
+		"https://example.com/search.json?q=deepseek&page=1",
+		"https://linux.do/search.json?q=deepseek&page=2",
+	} {
+		request.RequestID += "x"
+		request.URL = invalid
+		if _, err := client.SearchDiscourse(context.Background(), request); !errors.Is(err, browser.ErrScopeInvalid) {
+			t.Fatalf("SearchDiscourse(%q) error = %v", invalid, err)
+		}
+	}
+}
+
 func TestBrowserHostRejectsMissingCookiesAndExpandedScope(t *testing.T) {
 	host := startBrowserHostFixture(t, browserRuntimeDir(t), "Profile", []string{"https://x.com/*"}, time.Now().UTC())
 	defer host.stop(t)
@@ -3006,6 +3064,9 @@ type browserWireFixture struct {
 	PermissionOriginPattern string               `json:"permission_origin_pattern,omitempty"`
 	CookieScope             *browser.CookieScope `json:"cookie_scope,omitempty"`
 	Cookies                 []browser.Cookie     `json:"cookies,omitempty"`
+	URL                     string               `json:"url,omitempty"`
+	HTTPStatus              int                  `json:"http_status,omitempty"`
+	Body                    string               `json:"body,omitempty"`
 	Error                   *browser.BridgeError `json:"error,omitempty"`
 }
 
@@ -3020,6 +3081,23 @@ type browserHostFixture struct {
 type browserReadResult struct {
 	response browser.ReadCookiesResponse
 	err      error
+}
+
+type browserSearchResult struct {
+	response browser.DiscourseSearchResponse
+	err      error
+}
+
+type fakeDiscourseBrowserClient struct {
+	response browser.DiscourseSearchResponse
+	err      error
+	requests []browser.DiscourseSearchRequest
+}
+
+func (client *fakeDiscourseBrowserClient) SearchDiscourse(_ context.Context, request browser.DiscourseSearchRequest) (browser.DiscourseSearchResponse, error) {
+	client.requests = append(client.requests, request)
+	client.response.RequestID = request.RequestID
+	return client.response, client.err
 }
 
 type browserRevokeResult struct {

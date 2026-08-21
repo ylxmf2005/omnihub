@@ -264,10 +264,16 @@ func preflightReason(catalog *registry.Catalog, channel core.Channel, template c
 			return "preflight_endpoint_disabled"
 		}
 	}
-	if _, _, reason := ResolveEgress(catalog, channel); reason != "" {
-		return reason
+	if template.Adapter == "discourse_browser" {
+		if channel.CredentialID != "" {
+			return "preflight_browser_credential_unsupported"
+		}
+	} else {
+		if _, _, reason := ResolveEgress(catalog, channel); reason != "" {
+			return reason
+		}
 	}
-	if template.Auth.Required && channel.CredentialID == "" {
+	if template.Auth.Required && template.Auth.Kind != "browser_cookie" && channel.CredentialID == "" {
 		return "preflight_credential_missing"
 	}
 	// Optional auth means the Channel may omit a Credential. Once it explicitly

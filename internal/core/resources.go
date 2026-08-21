@@ -153,6 +153,8 @@ const (
 	EgressModeDirect      EgressMode = "direct"
 	EgressModeHTTPProxy   EgressMode = "http_proxy"
 	EgressModeSOCKS5      EgressMode = "socks5"
+	// EgressModeBrowser 只用于 Execution 事实，不能创建为 EgressProfile。
+	EgressModeBrowser EgressMode = "browser"
 )
 
 type Socks5DNSMode string

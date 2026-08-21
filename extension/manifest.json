@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "OmniHub Chrome Companion",
-  "version": "0.1.0",
-  "description": "Reads only the explicitly authorized cookies for OmniHub channels, per origin, after you grant permission here.",
+  "version": "0.2.0",
+  "description": "Runs the built-in linux.do search through your explicitly authorized Chrome session for OmniHub.",
   "minimum_chrome_version": "116",
   "permissions": [
     "cookies",
@@ -11,7 +11,7 @@
     "alarms"
   ],
   "optional_host_permissions": [
-    "https://*/*"
+    "https://linux.do/*"
   ],
   "background": {
     "service_worker": "background.js"

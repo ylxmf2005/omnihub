@@ -30,6 +30,8 @@ const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F]/;
 const ERROR_PERMISSION_MISSING = "browser_permission_missing";
 const ERROR_COOKIE_MISSING = "cookie_missing";
 const ERROR_SCOPE_INVALID = "scope_invalid";
+const ERROR_BROWSER_REQUEST_FAILED = "browser_request_failed";
+const MAX_BROWSER_RESPONSE_BYTES = 512 * 1024;
 
 /** @type {chrome.runtime.Port | null} */
 let port = null;
@@ -273,6 +275,9 @@ async function handleHostMessage(message) {
     case "read_cookies":
       await handleReadCookies(message);
       return;
+    case "discourse_search":
+      await handleDiscourseSearch(message);
+      return;
     case "revoke_permission":
       await handleRevokePermission(message);
       return;
@@ -288,6 +293,99 @@ async function handleHostMessage(message) {
       // protocol violation on the host side and would kill the bridge.
       console.warn("omnihub: ignoring unsupported native message type");
   }
+}
+
+// This is deliberately not a generic fetch bridge. Both the Native Host and
+// the extension independently pin the request to linux.do's official first
+// search page, so granting one origin cannot be reused to browse arbitrary
+// paths or exfiltrate arbitrary authenticated pages.
+function validateDiscourseSearch(message) {
+  if (message.permission_origin_pattern !== "https://linux.do/*") {
+    return { error: "only the linux.do origin is supported" };
+  }
+  if (typeof message.channel_id !== "string" || message.channel_id.trim() === "") {
+    return { error: "channel id is required" };
+  }
+  if (typeof message.url !== "string" || message.url.length > 8192) {
+    return { error: "search URL is invalid" };
+  }
+  let target;
+  try {
+    target = new URL(message.url);
+  } catch {
+    return { error: "search URL is invalid" };
+  }
+  const keys = Array.from(target.searchParams.keys());
+  if (
+    target.protocol !== "https:" ||
+    target.hostname !== "linux.do" ||
+    target.port !== "" ||
+    target.username !== "" ||
+    target.password !== "" ||
+    target.pathname !== "/search.json" ||
+    target.hash !== "" ||
+    keys.length !== 2 ||
+    target.searchParams.getAll("q").length !== 1 ||
+    target.searchParams.get("q").trim() === "" ||
+    target.searchParams.get("q").length > 4096 ||
+    target.searchParams.getAll("page").length !== 1 ||
+    target.searchParams.get("page") !== "1"
+  ) {
+    return { error: "search is outside the supported linux.do scope" };
+  }
+  return { target, pattern: "https://linux.do/*" };
+}
+
+async function handleDiscourseSearch(message) {
+  const requestId = message.request_id;
+  const scope = validateDiscourseSearch(message);
+  if (scope.error) {
+    replyError(requestId, ERROR_SCOPE_INVALID, scope.error);
+    return;
+  }
+  let permitted = false;
+  try {
+    permitted = await chrome.permissions.contains({ origins: [scope.pattern] });
+  } catch {
+    permitted = false;
+  }
+  if (!permitted) {
+    replyError(requestId, ERROR_PERMISSION_MISSING, "this Chrome profile has not granted linux.do");
+    return;
+  }
+
+  let response;
+  try {
+    response = await fetch(scope.target.href, {
+      method: "GET",
+      credentials: "include",
+      redirect: "error",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+  } catch {
+    replyError(requestId, ERROR_BROWSER_REQUEST_FAILED, "Chrome could not complete the authorized request");
+    return;
+  }
+
+  let body;
+  try {
+    body = await response.text();
+  } catch {
+    replyError(requestId, ERROR_BROWSER_REQUEST_FAILED, "Chrome could not read the authorized response");
+    return;
+  }
+  if (new TextEncoder().encode(body).length > MAX_BROWSER_RESPONSE_BYTES) {
+    replyError(requestId, ERROR_BROWSER_REQUEST_FAILED, "the authorized response is too large");
+    return;
+  }
+  post({
+    protocol_version: PROTOCOL_VERSION,
+    type: "result",
+    request_id: requestId,
+    http_status: response.status,
+    body,
+  });
 }
 
 // Re-checks locally that the requested scope is one exact HTTPS host, the
