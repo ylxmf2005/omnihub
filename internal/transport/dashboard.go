@@ -21,6 +21,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/registry"
 	"github.com/ylxmf2005/omnihub/internal/repository"
 	"github.com/ylxmf2005/omnihub/internal/subscription"
+	"github.com/ylxmf2005/omnihub/internal/transport/dashboardassets"
 )
 
 // ReadinessFunc 让 Dashboard 消费同一份持久健康读模型，而不是从 HTTP
@@ -104,6 +105,8 @@ type dashboardHTTPServer struct {
 	dependencies DashboardHTTPDependencies
 	query        http.Handler
 	devOrigin    string
+	// assets 为 nil 表示这个二进制没有嵌入界面构建产物。
+	assets http.Handler
 }
 
 // NewDashboardHTTPHandler 构造 Query、MCP、Dashboard 与 Feed 的 superset。
@@ -123,7 +126,11 @@ func NewDashboardHTTPHandler(dependencies DashboardHTTPDependencies) (http.Handl
 	if err != nil {
 		return nil, err
 	}
-	return &dashboardHTTPServer{dependencies: dependencies, query: query, devOrigin: devOrigin}, nil
+	server := &dashboardHTTPServer{dependencies: dependencies, query: query, devOrigin: devOrigin}
+	if dashboardassets.Available() {
+		server.assets = dashboardassets.Handler()
+	}
+	return server, nil
 }
 
 func validateDevOrigin(value string) (string, error) {
@@ -289,6 +296,13 @@ func (server *dashboardHTTPServer) serveDashboard(writer http.ResponseWriter, re
 	if len(segments) < 2 || segments[0] != "v1" {
 		if strings.HasPrefix(request.URL.Path, "/feeds/") {
 			server.serveFeed(writer, request)
+			return
+		}
+		// 静态界面只在这里接管：/v1/*、/feeds/*、/openapi.json 与 /mcp 都已在此之前
+		// 分流，因此 SPA fallback 不可能吞掉任何 API 路径。未构建界面时保持原有的
+		// endpoint_not_found，不用空白页面冒充存在的 Dashboard。
+		if server.assets != nil {
+			server.assets.ServeHTTP(writer, request)
 			return
 		}
 		writeProblemCode(writer, http.StatusNotFound, "Not Found", "endpoint_not_found", "the requested endpoint does not exist")

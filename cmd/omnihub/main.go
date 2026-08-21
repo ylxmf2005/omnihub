@@ -31,6 +31,7 @@ import (
 	"github.com/ylxmf2005/omnihub/internal/store/sqlite"
 	"github.com/ylxmf2005/omnihub/internal/subscription"
 	"github.com/ylxmf2005/omnihub/internal/transport"
+	"github.com/ylxmf2005/omnihub/internal/transport/dashboardassets"
 	omnihubskill "github.com/ylxmf2005/omnihub/skills/omnihub"
 )
 
@@ -1025,6 +1026,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		server := &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 		fmt.Fprintf(stderr, "omnihub: serving on http://%s\n", listen)
+		// go:embed 在编译期取快照，所以重新构建了 Dashboard 却没有重新 go build 时，
+		// serve 会安静地继续提供旧界面。这类问题只表现为「改动没生效」，很难自查，
+		// 因此在开发树里显式提示一次。
+		if stale, onDisk := dashboardassets.Stale("internal/transport/dashboardassets/dist"); stale {
+			fmt.Fprintf(stderr, "omnihub: warning: 磁盘上的 Dashboard 构建产物（%s）比二进制里嵌入的更新；重新运行 go build 才会生效\n", onDisk)
+		}
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(stderr, "omnihub: serve: %v\n", err)
 			return exitInternal
