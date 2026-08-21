@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "OmniHub Chrome Companion",
+  "version": "0.1.0",
+  "description": "Reads only the explicitly authorized cookies for OmniHub channels, per origin, after you grant permission here.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "cookies",
+    "nativeMessaging",
+    "storage",
+    "alarms"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "OmniHub Companion",
+    "default_popup": "popup.html"
+  }
+}

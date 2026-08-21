@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OmniHub Companion</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>OmniHub Companion</h1>
+      <p id="bridge-state" class="state state-unknown">Checking bridge…</p>
+    </header>
+
+    <section>
+      <h2>Allow a site</h2>
+      <p class="hint">
+        Log in to the site first, then enter its exact host. OmniHub can only read the cookies its
+        route template declares for hosts you allow here.
+      </p>
+      <form id="grant-form" autocomplete="off">
+        <label class="sr-only" for="host-input">Site host</label>
+        <div class="row">
+          <span class="prefix">https://</span>
+          <input id="host-input" type="text" placeholder="x.com" spellcheck="false" />
+          <button type="submit" id="grant-button">允许此站点</button>
+        </div>
+      </form>
+      <p id="grant-message" class="message" hidden></p>
+    </section>
+
+    <section>
+      <h2>Allowed sites</h2>
+      <ul id="origin-list" class="origins"></ul>
+      <p id="origin-empty" class="hint" hidden>No site is allowed yet.</p>
+    </section>
+
+    <section>
+      <h2>Profile label</h2>
+      <p class="hint">Shown in the OmniHub Dashboard so you can tell this Chrome profile apart.</p>
+      <form id="label-form" autocomplete="off">
+        <div class="row">
+          <label class="sr-only" for="label-input">Profile label</label>
+          <input id="label-input" type="text" maxlength="128" spellcheck="false" />
+          <button type="submit">Save</button>
+        </div>
+      </form>
+    </section>
+
+    <footer>
+      <button id="reconnect-button" type="button" class="link">Reconnect bridge</button>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
