@@ -1,0 +1,44 @@
+[
+  {
+    "view": {
+      "id": "view_v2ex_daily",
+      "display_name": "V2EX 每日跟读",
+      "operation": {
+        "schema_version": "1.0",
+        "operation": "latest",
+        "scope": {
+          "channels": [
+            "channel_v2ex_hot"
+          ]
+        },
+        "route_policy": {
+          "mode": "auto",
+          "aggregate": false,
+          "allow_fallback": false
+        },
+        "limit": 20,
+        "time_range": {},
+        "identity_dedupe": "exact",
+        "similarity_grouping": "off",
+        "deadline_ms": 30000
+      },
+      "enabled": true,
+      "revision": 1,
+      "created_at": "2026-08-21T02:16:50.798762Z",
+      "updated_at": "2026-08-21T02:16:50.798762Z"
+    },
+    "status": "fresh",
+    "snapshot": {
+      "id": "snp_bfc7bcf818f4fccfd5c3c1392e7aec43",
+      "view_id": "view_v2ex_daily",
+      "run_id": "run_2adea65fc803cb4800a4413fd3572796",
+      "created_at": "2026-08-21T02:17:00.957042Z",
+      "fresh_until": "2026-08-21T02:22:00.816889Z"
+    },
+    "feed_urls": {
+      "json": "/feeds/view_v2ex_daily.json",
+      "rss": "/feeds/view_v2ex_daily.rss",
+      "atom": "/feeds/view_v2ex_daily.atom"
+    }
+  }
+]

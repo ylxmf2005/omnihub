@@ -1,0 +1,11 @@
+[
+  {
+    "id": "egress_direct",
+    "display_name": "Direct",
+    "mode": "direct",
+    "proxied": false,
+    "has_endpoint": false,
+    "enabled": true,
+    "revision": 1
+  }
+]

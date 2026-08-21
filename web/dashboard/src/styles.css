@@ -1,0 +1,13 @@
+/* App-level overrides. Component styling lives in the Mantine theme; this file
+   only holds what must apply globally. */
+
+body {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Machine identity and metrics stay monospaced with aligned digits. */
+[style*='monospace'],
+code,
+kbd {
+  font-variant-numeric: tabular-nums;
+}

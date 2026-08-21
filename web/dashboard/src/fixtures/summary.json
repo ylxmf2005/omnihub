@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "version": "v0.0.0-20260814203443-a98188f87d98+dirty",
+  "instance_id": "req_0e9b00e9-c91d-41da-82c6-5526658d3d2d",
+  "generated_at": "2026-08-21T02:17:17.7522Z",
+  "readiness": {
+    "degraded": 1,
+    "ready": 2
+  },
+  "view_freshness": {
+    "fresh": 1
+  },
+  "active_runs": 0,
+  "recent_failures": 1
+}

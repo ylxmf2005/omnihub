@@ -1,0 +1,41 @@
+[
+  {
+    "id": "channel_linuxdo_latest",
+    "display_name": "linux.do 最新主题",
+    "source": "linux.do",
+    "route_template_id": "direct-feed-window",
+    "egress_profile_id": "egress_direct",
+    "parameters": {
+      "url": "https://linux.do/latest.rss"
+    },
+    "priority": 90,
+    "enabled": true,
+    "revision": 1
+  },
+  {
+    "id": "channel_nodeseek_latest",
+    "display_name": "NodeSeek 最新",
+    "source": "nodeseek",
+    "route_template_id": "direct-feed-window",
+    "egress_profile_id": "egress_direct",
+    "parameters": {
+      "url": "https://rss.nodeseek.com/"
+    },
+    "priority": 80,
+    "enabled": true,
+    "revision": 1
+  },
+  {
+    "id": "channel_v2ex_hot",
+    "display_name": "V2EX 最热主题",
+    "source": "v2ex",
+    "route_template_id": "direct-feed-window",
+    "egress_profile_id": "egress_direct",
+    "parameters": {
+      "url": "https://www.v2ex.com/index.xml"
+    },
+    "priority": 100,
+    "enabled": true,
+    "revision": 1
+  }
+]

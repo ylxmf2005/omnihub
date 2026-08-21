@@ -1,0 +1,151 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-08-21T02:17:17.755367Z",
+  "channels": [
+    {
+      "channel_id": "channel_linuxdo_latest",
+      "desired_state": "enabled",
+      "readiness": "ready",
+      "checks": [
+        {
+          "kind": "source_registered",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "template_declared",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "provider_enabled",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "egress_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "dependency_installed",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_probe",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:16:51.390184Z",
+          "expires_at": "2026-08-21T02:31:51.390184Z"
+        }
+      ],
+      "action_required": null,
+      "last_successful_probe_at": "2026-08-21T02:16:51.390184Z"
+    },
+    {
+      "channel_id": "channel_nodeseek_latest",
+      "desired_state": "enabled",
+      "readiness": "degraded",
+      "checks": [
+        {
+          "kind": "source_registered",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "template_declared",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "provider_enabled",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "egress_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "dependency_installed",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_probe",
+          "status": "failed",
+          "code": "probe_degraded",
+          "checked_at": "2026-08-21T02:17:00.824062Z",
+          "expires_at": "2026-08-21T02:22:00.824062Z",
+          "error": {
+            "code": "timeout",
+            "message": "upstream feed request timed out",
+            "source": "nodeseek",
+            "provider": "direct-feed",
+            "channel_id": "channel_nodeseek_latest",
+            "route_template_id": "direct-feed-window",
+            "retryable": true
+          }
+        }
+      ],
+      "action_required": null
+    },
+    {
+      "channel_id": "channel_v2ex_hot",
+      "desired_state": "enabled",
+      "readiness": "ready",
+      "checks": [
+        {
+          "kind": "source_registered",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "template_declared",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "provider_enabled",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "egress_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_configured",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "dependency_installed",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:17:17.755367Z"
+        },
+        {
+          "kind": "channel_probe",
+          "status": "passed",
+          "checked_at": "2026-08-21T02:16:51.113255Z",
+          "expires_at": "2026-08-21T02:31:51.113255Z"
+        }
+      ],
+      "action_required": null,
+      "last_successful_probe_at": "2026-08-21T02:16:51.113255Z"
+    }
+  ],
+  "route_groups": []
+}

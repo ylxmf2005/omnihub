@@ -1,0 +1,12 @@
+{
+  "id": "chrome_default",
+  "browser": "chrome",
+  "connected": false,
+  "profile_label": "",
+  "last_seen_at": "0001-01-01T00:00:00Z",
+  "last_error": {
+    "code": "browser_unavailable",
+    "message": "Chrome Browser Bridge is unavailable",
+    "retryable": true
+  }
+}

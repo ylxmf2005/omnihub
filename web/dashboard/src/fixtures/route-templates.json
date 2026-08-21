@@ -1,0 +1,266 @@
+[
+  {
+    "route_template_id": "direct-feed-window",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "any_registered"
+    },
+    "provider": "direct-feed",
+    "adapter": "feed",
+    "capabilities": [
+      "latest",
+      "search"
+    ],
+    "content_level": "body",
+    "pagination": {
+      "kind": "none",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "feed_window"
+    },
+    "auth": {
+      "kind": "none",
+      "required": false
+    },
+    "parameters_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "cost": "free",
+    "trust": "remote_public",
+    "limitations": [
+      "upstream_retention_unknown"
+    ]
+  },
+  {
+    "route_template_id": "github-native-search",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "exact",
+      "values": [
+        "github"
+      ]
+    },
+    "provider": "github-api",
+    "adapter": "github",
+    "capabilities": [
+      "search",
+      "fetch"
+    ],
+    "content_level": "metadata",
+    "pagination": {
+      "kind": "page",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "unsupported"
+    },
+    "auth": {
+      "kind": "token",
+      "required": false
+    },
+    "endpoint_required": true,
+    "cost": "rate_limited",
+    "trust": "official_api",
+    "limitations": [
+      "github_repository_metadata_only"
+    ]
+  },
+  {
+    "route_template_id": "tavily-search",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "exact",
+      "values": [
+        "tavily-discovery"
+      ]
+    },
+    "provider": "tavily",
+    "adapter": "tavily",
+    "capabilities": [
+      "search"
+    ],
+    "content_level": "snippet",
+    "pagination": {
+      "kind": "none",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "unsupported"
+    },
+    "auth": {
+      "kind": "api_key",
+      "required": true
+    },
+    "endpoint_required": true,
+    "parameters_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "exclude_domains": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "search_depth": {
+          "enum": [
+            "basic",
+            "advanced"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "cost": "metered",
+    "trust": "official_api",
+    "limitations": [
+      "web_index_coverage_unknown",
+      "candidate_results_only",
+      "tavily_max_20"
+    ]
+  },
+  {
+    "route_template_id": "v2ex-direct-latest",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "exact",
+      "values": [
+        "v2ex"
+      ]
+    },
+    "provider": "direct-feed",
+    "adapter": "feed",
+    "capabilities": [
+      "latest"
+    ],
+    "content_level": "body",
+    "pagination": {
+      "kind": "none",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "feed_window"
+    },
+    "auth": {
+      "kind": "none",
+      "required": false
+    },
+    "parameters_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "cost": "free",
+    "trust": "remote_public",
+    "limitations": [
+      "upstream_retention_unknown"
+    ]
+  },
+  {
+    "route_template_id": "v2ex-rsshub-latest",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "exact",
+      "values": [
+        "v2ex"
+      ]
+    },
+    "provider": "rsshub",
+    "adapter": "rsshub",
+    "capabilities": [
+      "latest"
+    ],
+    "content_level": "body",
+    "pagination": {
+      "kind": "none",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "feed_window"
+    },
+    "auth": {
+      "kind": "api_key",
+      "required": false
+    },
+    "endpoint_required": true,
+    "parameters_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "enum": [
+            "/v2ex/topics/latest"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "cost": "free",
+    "trust": "configured_endpoint",
+    "limitations": [
+      "upstream_retention_unknown",
+      "rsshub_route_metadata_version_dependent"
+    ]
+  },
+  {
+    "route_template_id": "x-xurl-search",
+    "origin": "builtin",
+    "source_constraint": {
+      "kind": "exact",
+      "values": [
+        "x"
+      ]
+    },
+    "provider": "xurl",
+    "adapter": "xurl",
+    "capabilities": [
+      "search"
+    ],
+    "content_level": "body",
+    "pagination": {
+      "kind": "none",
+      "globally_mergeable": false
+    },
+    "time_range": {
+      "kind": "recent_window"
+    },
+    "auth": {
+      "kind": "app_only",
+      "required": true
+    },
+    "cost": "metered",
+    "trust": "local_executable",
+    "limitations": [
+      "x_recent_search_window",
+      "xurl_shortcut_no_continuation"
+    ]
+  }
+]

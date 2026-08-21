@@ -1,0 +1,33 @@
+[
+  {
+    "id": "github",
+    "origin": "builtin",
+    "enabled": true
+  },
+  {
+    "id": "linux.do",
+    "origin": "builtin",
+    "enabled": true
+  },
+  {
+    "id": "nodeseek",
+    "origin": "builtin",
+    "enabled": true
+  },
+  {
+    "id": "tavily-discovery",
+    "display_name": "Tavily Web Discovery",
+    "origin": "builtin",
+    "enabled": true
+  },
+  {
+    "id": "v2ex",
+    "origin": "builtin",
+    "enabled": true
+  },
+  {
+    "id": "x",
+    "origin": "builtin",
+    "enabled": true
+  }
+]
