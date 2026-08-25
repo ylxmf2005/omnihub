@@ -2,7 +2,7 @@
 
 状态：`Stage E completed；0.1.0 release candidate verified`
 
-已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、Query Workbench、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Credential 列表只返回掩码，只有 detail 请求显式传入 `include_value=true` 时才完整回显并设置 `Cache-Control: no-store`。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
+已确认 Go + SQLite Repository、Query/Subscription 双平面、stale-while-revalidate、个性化 Channel/RSSHub 配置、Dashboard 后端责任、Run 轮询、扩展边界与首批纵切。个人本地 MVP 由 Dashboard 把 API Key/Token 直接写入 SQLite；Dashboard 只返回掩码与是否已配置，值只能轮换或撤销，不能通过 HTTP 读回。Chrome Cookie 使用 MV3 optional host permission + `connectNative()` 长连接，在每次执行时直接读取且不持久化。Stage 0—3 已交付；余下范围压缩为 Stage A—E 五个可独立验收纵切：可信出站、代表 Provider 与 Agent Query 发布面、Subscription 与 Dashboard Backend、Chrome Cookie Backend、本地 semantic grouping 与发布候选。
 
 ## Stage 0：冻结合同与创建独立仓库（已完成）
 
@@ -96,7 +96,7 @@
 - Probe 成功/瞬时失败默认 TTL 为 15/5 分钟；聚合键除 Egress 外必须拥有相同 Source、RouteTemplate、目标、参数与 Credential revision。
 - 一个 Snapshot renderer 投影 RSS/Atom/JSON Feed，并实现 ETag/Last-Modified 与 stale metadata。
 - `serve` 扩展为 loopback Dashboard Backend：summary、catalog/Channel/Endpoint/Egress/Credential/Collection/View/Run/readiness、Query Workbench；配置写入用 `POST`、完整 `PUT/DELETE + If-Match`，外部执行命令才使用 Idempotency-Key，预执行错误用 RFC9457。
-- Credential 列表只返回掩码，detail 仅 `include_value=true` 回显并设置 `Cache-Control: no-store`；Cookie 永不进入 HTTP。
+- Credential 的 Dashboard API 只返回掩码，值只能写入、轮换或撤销，不能通过 HTTP 读回；Cookie 永不进入 HTTP。
 - 生产 Dashboard 同源，开发态只接受一个显式 loopback Origin，CORS 只开放 Dashboard/Workbench 路由；删除不级联，普通被引用资源返回 409。每个 View 只暴露当前 Snapshot；Run/Probe 30 天、tombstone 180 天、孤立 embedding 30 天。Snapshot immutable append-only，非当前内容不提供历史 API且 v0.1 不清理。View Operation 创建后不可变，disabled View 只读既有 Snapshot。
 
 当前证据：SQLite v3 migration、故障注入、重复 idempotency、lease 过期重领、刷新失败保留旧 Snapshot、Observation/StateKey tombstone、三种 Feed 200→304、Dashboard 全资源 CRUD/409/202 polling/Host-Origin-CORS/credential no-store、Probe TTL/严格 route-group 与显式 prune 均通过。真实 CLI/loopback E2E、全量 test/race/vet/diff、三平台构建和独立 Review 已闭合；Dashboard 前端仍由独立工作流承担。

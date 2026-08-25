@@ -10,7 +10,7 @@ export function NotFound() {
         地址可能输错了，或这个页面已经改名。
       </Text>
       <Button component={Link} to="/" variant="default" w="fit-content">
-        回到概览
+        回到搜索
       </Button>
     </Stack>
   )

@@ -24,7 +24,6 @@ import { useState } from 'react'
 import {
   Anchor,
   Badge,
-  Box,
   Button,
   Group,
   Modal,
@@ -52,7 +51,7 @@ import {
 } from '../api/queries'
 import { get } from '../api/client'
 import type { OmniError, OperationKind, View, ViewListEntry } from '../api/types'
-import { IdChip, RunBadge, Timestamp, ViewBadge } from '../components/display'
+import { RunBadge, Timestamp, ViewBadge } from '../components/display'
 import {
   ConfirmDialog,
   DemoModeNotice,
@@ -68,14 +67,14 @@ import { describeError } from '../domain/vocabulary'
 
 /** What each Operation kind does, in the terms the create form needs. */
 export const KIND_COPY: Record<OperationKind, { label: string; hint: string }> = {
-  latest: { label: '取最新', hint: '每次刷新取所选 Channel 的最新内容。' },
-  search: { label: '按关键词搜索', hint: '每次刷新在所选 Channel 内搜索一个固定关键词。' },
+  latest: { label: '最新内容', hint: '每次更新取所选来源的最新内容。' },
+  search: { label: '固定搜索', hint: '每次更新在所选来源中搜索同一个关键词。' },
   fetch: { label: '抓取指定地址', hint: '每次刷新抓取一个固定的目标地址。' },
 }
 
 export const DEDUPE_COPY: Record<'exact' | 'none', { label: string; hint: string }> = {
-  exact: { label: '按身份去重', hint: '同一条内容从多个 Channel 取到时只保留一条。' },
-  none: { label: '不去重', hint: '保留每个 Channel 各自返回的条目。' },
+  exact: { label: '合并重复内容', hint: '同一条内容从多个来源取到时只保留一条。' },
+  none: { label: '保留重复内容', hint: '保留每个来源各自返回的条目。' },
 }
 
 /**
@@ -129,8 +128,8 @@ export function Views() {
   return (
     <Stack gap="lg">
       <PageHeader
-        title="Views"
-        description="每个 View 固定一条取数条件；刷新一次就生成一份 Snapshot，并对外提供可订阅的 Feed 地址。"
+        title="订阅"
+        description="保存一组来源和条件，生成可加入阅读器的 Feed。"
         actions={
           <>
             <Button
@@ -139,14 +138,14 @@ export function Views() {
               onClick={() => void views.refetch()}
               loading={views.isFetching}
             >
-              刷新列表
+              刷新
             </Button>
             <Button
               leftSection={<IconPlus size={14} />}
               onClick={() => setCreating(true)}
               disabled={READ_ONLY}
             >
-              新建 View
+              新建订阅
             </Button>
           </>
         }
@@ -160,15 +159,15 @@ export function Views() {
           <LoadingRow />
         ) : list.length === 0 ? (
           <EmptyState
-            title="还没有 View。"
-            hint="View 把一次取数固定下来：选好 Channel 和取数方式，之后每次刷新都按同样的条件执行，结果可以直接当 Feed 订阅。"
+            title="还没有订阅。"
+            hint="选好来源和更新方式后，就能得到可加入阅读器的 Feed 地址。"
             action={
               <Button
                 leftSection={<IconPlus size={14} />}
                 onClick={() => setCreating(true)}
                 disabled={READ_ONLY}
               >
-                新建 View
+                新建订阅
               </Button>
             }
           />
@@ -178,7 +177,7 @@ export function Views() {
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>名称</Table.Th>
-                  <Table.Th>取数方式</Table.Th>
+                  <Table.Th>更新方式</Table.Th>
                   <Table.Th>状态</Table.Th>
                   <Table.Th />
                 </Table.Tr>
@@ -217,18 +216,15 @@ function ViewRow({ entry }: { entry: ViewListEntry }) {
     <>
       <Table.Tr>
         <Table.Td>
-          <Anchor component={Link} to={`/views/${view.id}`} fz="sm" fw={500}>
+          <Anchor component={Link} to={`/subscriptions/${view.id}`} fz="sm" fw={500}>
             {view.display_name || view.id}
           </Anchor>
-          <Box mt={2}>
-            <IdChip value={view.id} width={220} />
-          </Box>
         </Table.Td>
         <Table.Td>
           <Text fz="sm">{KIND_COPY[view.operation.operation].label}</Text>
           <MetaLine gap="sm">
             <Fact label="范围">
-              {scope.length > 0 ? `${scope.length} 个 Channel` : '未按 Channel 限定'}
+              {scope.length > 0 ? `${scope.length} 个来源` : '所有来源'}
             </Fact>
             <Fact label="上限">{view.operation.limit}</Fact>
           </MetaLine>
@@ -259,7 +255,7 @@ function ViewRow({ entry }: { entry: ViewListEntry }) {
                 {describeError(failure.error.code, failure.error.retryable).text}
               </Fact>
               {failure.runId && (
-                <Anchor component={Link} to={`/runs/${failure.runId}`} fz="xs">
+                <Anchor component={Link} to={`/activity/${failure.runId}`} fz="xs">
                   查看失败详情
                 </Anchor>
               )}
@@ -353,9 +349,9 @@ export function DeleteViewDialog({
       opened={opened}
       onClose={onClose}
       onConfirm={() => void confirm()}
-      title="删除 View"
+      title="删除订阅"
       target={view.display_name || view.id}
-      consequence="删除后它的 Feed 地址立即失效。已经刷新过的 View 仍被 Run 与 Snapshot 引用，Backend 会拒绝删除并告知你，不会连带清除那些执行记录。"
+      consequence="删除后 Feed 地址立即失效。已有活动记录时不会删除。"
       loading={pending}
       error={etagError ?? remove.error}
     />
@@ -376,7 +372,6 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
   const channels = useChannels()
   const templates = useRouteTemplates()
 
-  const [id, setId] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [channelIds, setChannelIds] = useState<string[]>([])
   const [kind, setKind] = useState<OperationKind>('latest')
@@ -406,7 +401,6 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
   const effectiveKind = availableKinds.includes(kind) ? kind : (availableKinds[0] ?? null)
 
   const reset = () => {
-    setId('')
     setDisplayName('')
     setChannelIds([])
     setKind('latest')
@@ -422,7 +416,7 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
     if (!effectiveKind) return
     try {
       await create.mutateAsync({
-        id: id.trim(),
+        id: `view_${Date.now().toString(36)}`,
         display_name: displayName.trim(),
         enabled,
         operation: {
@@ -447,7 +441,6 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
   }
 
   const ready =
-    id.trim() !== '' &&
     displayName.trim() !== '' &&
     channelIds.length > 0 &&
     effectiveKind !== null &&
@@ -455,27 +448,19 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
     (effectiveKind !== 'fetch' || target.trim() !== '')
 
   return (
-    <Modal opened={opened} onClose={onClose} title="新建 View" size="lg" centered>
+    <Modal opened={opened} onClose={onClose} title="新建订阅" size="lg" centered>
       <Stack gap="sm">
         <TextInput
-          label="View ID"
-          description="创建后不可更改，也是 Feed 地址的一部分。"
-          placeholder="view_v2ex_daily"
-          value={id}
-          onChange={(event) => setId(event.currentTarget.value)}
-          required
-        />
-        <TextInput
-          label="显示名称"
+          label="名称"
           placeholder="V2EX 每日跟读"
           value={displayName}
           onChange={(event) => setDisplayName(event.currentTarget.value)}
           required
         />
         <MultiSelect
-          label="Channel 范围"
-          description="这个 View 只会从选中的线路取数。"
-          placeholder={channels.isLoading ? '正在读取…' : '选择 Channel'}
+          label="来源"
+          description="这个订阅只会从选中的来源更新。"
+          placeholder={channels.isLoading ? '正在读取…' : '选择来源'}
           data={(channels.data ?? []).map((channel) => ({
             value: channel.id,
             label: channel.display_name || channel.id,
@@ -486,11 +471,11 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
           required
         />
         <Select
-          label="取数方式"
+          label="更新方式"
           description={
             effectiveKind
               ? KIND_COPY[effectiveKind].hint
-              : '选中的 Channel 没有共同支持的取数方式，请调整范围。'
+              : '选中的来源没有共同支持的更新方式，请调整范围。'
           }
           data={availableKinds.map((candidate) => ({
             value: candidate,
@@ -503,7 +488,7 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
         />
         {selected.length > 0 && availableKinds.length < allKinds.length && (
           <Text fz="xs" c="dimmed">
-            只列出选中 Channel 的 RouteTemplate 都声明支持的方式。
+            只显示这些来源都支持的更新方式。
           </Text>
         )}
         {effectiveKind === 'search' && (
@@ -527,7 +512,7 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
         )}
         <Group grow align="flex-start">
           <NumberInput
-            label="条目上限"
+            label="每次最多"
             description="单次执行最多返回多少条，1 到 100。"
             value={limit}
             onChange={(value) => setLimit(typeof value === 'number' ? value : 1)}
@@ -555,7 +540,7 @@ function CreateViewModal({ opened, onClose }: { opened: boolean; onClose: () => 
         {create.error ? <ErrorAlert error={create.error} /> : null}
 
         <Text fz="xs" c="dimmed">
-          以上取数条件保存后不能再改，之后只能改名称和启用状态。要换条件请新建一个 View。
+          保存后可以改名称和启用状态；要更换来源或条件，请新建订阅。
         </Text>
 
         <Group justify="flex-end" gap="xs" mt="xs">

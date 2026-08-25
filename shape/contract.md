@@ -415,7 +415,7 @@ SQLite 的 `credentials` 记录直接保存 `value`；不创建 Keychain handle�
 }
 ```
 
-`GET /v1/credentials/{id}?include_value=true` 可在本地显式返回完整 `value`，响应带 `Cache-Control: no-store`。列表、日志、Run、Error、readiness 和默认 export 不得携带完整值。
+`GET /v1/credentials/{id}` 只返回掩码与是否已配置，不提供读取完整 `value` 的查询参数。完整值只能通过创建或轮换写入，日志、Run、Error、readiness 和默认 export 不得携带完整值。
 
 Chrome Cookie 使用 `auth_kind=chrome_cookie` 的 Credential，但 `value` 始终为 null；Cookie 在每次 Execute/Probe 时从当前 Chrome Bridge 读取，不落库。
 
@@ -696,7 +696,7 @@ Query Workbench Run 的 `request` 直接保存现有规范化 Operation；View r
 - `PUT/DELETE` 必须携带标准 strong `If-Match`，值为带引号的当前 revision，例如 `"3"`；冲突返回 RFC 9457 `409 Conflict`。v0.1 不接受 bare revision、body `expected_revision` 或 partial PATCH。
 - 只有 Query Run、View refresh 与 Channel Probe 这类外部执行命令支持 `Idempotency-Key`；同 key、同 payload 返回原 Run，不同 payload 返回冲突。普通配置创建依靠调用方提供的全局唯一 ID 与资源 CAS，不另建幂等状态。
 - `builtin` 资源不能直接修改/删除；disable/overlay 产生 user-owned 配置。
-- Credential create/update 可以接收完整 API Key/Token；列表只给 `has_value/value_masked`，detail 在 `include_value=true` 时可返回完整值并使用 `Cache-Control: no-store`。Cookie 永不通过 HTTP API 返回。日志、Run、Error、readiness 和默认 export 始终脱敏。
+- Credential create/update 可以接收完整 API Key/Token；所有读取只给 `has_value/value_masked`，不提供明文读取旁路。Cookie 永不通过 HTTP API 返回。日志、Run、Error、readiness 和默认 export 始终脱敏。
 
 ### 12.2 v1 Backend 资源
 

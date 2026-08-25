@@ -23,13 +23,13 @@ export interface StateCopy {
 }
 
 export const READINESS_COPY: Record<ReadinessState, StateCopy> = {
-  ready: { label: '可用', tone: 'ok', meaning: '最近一次 Probe 成功，且结果仍在有效期内。' },
+  ready: { label: '可用', tone: 'ok', meaning: '最近一次连接检查成功。' },
   ready_dependent: {
     label: '部分线路可用',
     tone: 'conditional',
-    meaning: '同一 route group 在某些 Egress 下成功、在另一些下失败。',
+    meaning: '部分网络连接可用，另一些不可用。',
   },
-  degraded: { label: '待确认', tone: 'warn', meaning: '配置完整，但最近一次 Probe 未通过或尚未执行。' },
+  degraded: { label: '待确认', tone: 'warn', meaning: '配置完整，但连接尚未验证成功。' },
   needs_login: { label: '待登录', tone: 'action', meaning: '需要你在浏览器中登录该来源。' },
   needs_permission: {
     label: '待授权',
@@ -37,16 +37,16 @@ export const READINESS_COPY: Record<ReadinessState, StateCopy> = {
     meaning: '需要你授予 Chrome 对该站点的读取权限。',
   },
   blocked: { label: '被拒绝', tone: 'bad', meaning: '上游明确拒绝了请求。' },
-  not_configured: { label: '未配置', tone: 'idle', meaning: '缺少必需的 Egress 或 Endpoint 绑定。' },
+  not_configured: { label: '未配置', tone: 'idle', meaning: '缺少必需的连接配置。' },
   unknown: { label: '未知', tone: 'idle', meaning: '暂时没有足以判断的依据。' },
 }
 
 export const VIEW_COPY: Record<ViewStatus, StateCopy> = {
-  fresh: { label: '最新', tone: 'ok', meaning: 'Snapshot 仍在有效期内。' },
+  fresh: { label: '最新', tone: 'ok', meaning: '当前内容仍在有效期内。' },
   stale: { label: '已过期', tone: 'warn', meaning: '内容仍可读取，但已超过新鲜期。' },
   refreshing: { label: '刷新中', tone: 'conditional', meaning: '正在后台刷新，旧内容仍可读。' },
-  empty: { label: '暂无内容', tone: 'idle', meaning: '尚未生成任何 Snapshot。' },
-  failed: { label: '刷新失败', tone: 'bad', meaning: '刷新失败，且没有可用的历史 Snapshot。' },
+  empty: { label: '暂无内容', tone: 'idle', meaning: '尚未成功更新内容。' },
+  failed: { label: '刷新失败', tone: 'bad', meaning: '刷新失败，且没有可用的历史内容。' },
 }
 
 export const RUN_COPY: Record<RunStatus, StateCopy> = {
@@ -68,17 +68,17 @@ export const ERROR_COPY: Record<string, { text: string; hint?: string }> = {
     hint: '可能是对方暂时不可达，或当前网络与 Egress 到不了它。可以稍后重试。',
   },
   timeout: { text: '来源响应超时', hint: '对方响应过慢。可以稍后重试。' },
-  auth_error: { text: '凭据被拒绝', hint: '请检查该 Channel 使用的 Credential 是否有效。' },
+  auth_error: { text: '访问密钥被拒绝', hint: '请检查这个来源使用的访问密钥是否有效。' },
   rate_limited: { text: '被对方限流', hint: '请求过于频繁，请稍后再试。' },
   upstream_error: { text: '来源返回了错误', hint: '对方服务出错，通常需要等待其恢复。' },
   parse_error: { text: '内容无法解析', hint: '返回内容不是有效的 Feed 格式。' },
   protocol_error: { text: '响应不符合预期格式' },
-  config_error: { text: '配置不完整', hint: '请补齐该 Channel 的 Egress 或 Endpoint 绑定。' },
+  config_error: { text: '配置不完整', hint: '请补齐这个来源需要的连接配置。' },
   parameter_error: { text: '请求参数无效' },
   internal_error: { text: 'OmniHub 内部错误' },
   browser_unavailable: {
-    text: 'Chrome Bridge 未连接',
-    hint: '依赖 Cookie 的 Channel 暂时无法执行，已保存的内容仍可读取。',
+    text: 'Chrome 未连接',
+    hint: '需要登录状态的来源暂时无法使用，已保存的内容仍可读取。',
   },
   browser_permission_missing: {
     text: '缺少 Chrome 站点授权',

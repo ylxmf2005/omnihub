@@ -373,7 +373,7 @@ curl --fail-with-body \
   http://127.0.0.1:8787/v1/views/my-view/refresh
 ```
 
-Dashboard 可管理 Channel、Endpoint、Egress、Credential、SemanticProfile、Collection 与 View，并读取 Run、readiness 和 catalog。创建使用 `POST`；完整更新与删除必须携带响应中的强 `ETag` 作为 `If-Match`。Credential 默认只返回掩码；只有 detail 显式使用 `include_value=true` 才回显原值，并设置 `Cache-Control: no-store`。
+Dashboard 围绕搜索、来源、订阅和活动四个任务组织。创建使用 `POST`；完整更新与删除必须携带响应中的强 `ETag` 作为 `If-Match`。Credential 只返回掩码与是否已配置，Dashboard 可创建、轮换和撤销，但没有读取原值的 HTTP 接口。
 
 ## 统一查询合同
 
@@ -493,7 +493,7 @@ Chrome 会按 manifest 直接启动同一个二进制；一般不需要手工运
 | `OMNIHUB_CACHE_DIR` | Direct Feed 条件响应缓存目录 |
 | `OMNIHUB_RUNTIME_DIR` | Chrome Bridge 当前用户 IPC 目录 |
 
-API Key/Token 按个人本地 MVP 方案原样保存在 SQLite；能读取该文件的本机账号也能读取 secret。列表、Envelope、Error、cache 与普通输出不回显原值；Credential detail 只有显式 `include_value=true` 才返回原值并设置 `Cache-Control: no-store`。Chrome Cookie 始终不落库，embedding cache 只保存向量和 cohort key，不保存原始输入文本。
+API Key/Token 按个人本地 MVP 方案原样保存在 SQLite；能读取该文件的本机账号也能读取 secret。Dashboard HTTP 响应、Envelope、Error、cache 与普通输出都不回显原值；值只能被覆盖或撤销。Chrome Cookie 始终不落库，embedding cache 只保存向量和 cohort key，不保存原始输入文本。
 
 普通升级、替换 binary 或 Native Host uninstall 都保留数据库、配置与 cache。v0.1 没有 backup/restore 或 destructive purge 命令；需要备份时先停止 `serve`，再离线复制 SQLite，或用 OPML/Source Bundle 导出不含密钥的可移植配置。
 

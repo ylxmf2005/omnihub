@@ -2998,8 +2998,8 @@ func TestStageCDashboardSubscriptionAndHealthContracts(t *testing.T) {
 		t.Fatalf("poll query Run = %d %#v calls=%v, %v", polled.Code, completedRun, feed.calls, err)
 	}
 
-	// Credential 默认和列表只回显掩码，include_value 才回显原值且禁止缓存；
-	// PUT 使用强 If-Match，PATCH、陈旧 CAS 与被引用 DELETE 都被拒绝。
+	// Credential 只回显掩码；GET 不提供明文旁路。PUT 使用强 If-Match，
+	// PATCH、陈旧 CAS 与被引用 DELETE 都被拒绝。
 	credentialValue := "user:fixture-password"
 	credential := map[string]any{
 		"id": "stage-c-proxy-credential", "provider": "egress", "auth_kind": "basic",
@@ -3016,8 +3016,8 @@ func TestStageCDashboardSubscriptionAndHealthContracts(t *testing.T) {
 		t.Fatalf("default Credential detail = %d %#v cache=%q, %v", defaultDetail.Code, credentialDetail, defaultDetail.Header().Get("Cache-Control"), err)
 	}
 	includeValue := do(http.MethodGet, "/v1/credentials/stage-c-proxy-credential?include_value=true", nil, nil)
-	if err := json.Unmarshal(includeValue.Body.Bytes(), &credentialDetail); err != nil || includeValue.Code != http.StatusOK || credentialDetail.Value == nil || *credentialDetail.Value != credentialValue || includeValue.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("Credential include_value = %d %#v cache=%q, %v", includeValue.Code, credentialDetail, includeValue.Header().Get("Cache-Control"), err)
+	if includeValue.Code != http.StatusBadRequest || bytes.Contains(includeValue.Body.Bytes(), []byte(credentialValue)) {
+		t.Fatalf("Credential include_value = %d: %s", includeValue.Code, includeValue.Body.String())
 	}
 	if response := do(http.MethodPatch, "/v1/credentials/stage-c-proxy-credential", map[string]any{"enabled": false}, nil); response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("Credential PATCH = %d: %s", response.Code, response.Body.String())

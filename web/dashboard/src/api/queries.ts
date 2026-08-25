@@ -11,10 +11,8 @@
  *   2. **Revision conflicts stay loud.** A 409 is surfaced to the caller as a
  *      `ProblemError` with `isRevisionConflict`; nothing here retries or
  *      re-reads-then-overwrites. The user decides.
- *   3. **Credential values never enter the cache.** Revealing a secret is an
- *      imperative call (`revealCredentialValue`), deliberately not a hook — a
- *      `useQuery` would persist the plaintext in the query cache, and from there
- *      into devtools and any future cache serializer.
+ *   3. **Credential values never return to the browser.** They can be replaced
+ *      or revoked, but Dashboard reads expose only masked metadata.
  *
  * Demo mode (`VITE_OMNIHUB_LIVE !== '1'`) serves the six endpoints that have
  * captured fixtures and returns empty collections for the rest, so the app
@@ -42,9 +40,7 @@ import type {
   AuthorizationDescriptor,
   BrowserBridge,
   Channel,
-  Collection,
   Credential,
-  DashboardSummary,
   EgressProfile,
   EndpointProfile,
   Envelope,
@@ -53,7 +49,6 @@ import type {
   ReadinessReport,
   Run,
   RunStatus,
-  SemanticProfile,
   Source,
   RouteTemplate,
   ViewDetailResponse,
@@ -62,7 +57,6 @@ import type {
 } from './types'
 import { isTerminalRun } from './types'
 
-import summaryFixture from '../fixtures/summary.json'
 import readinessFixture from '../fixtures/readiness.json'
 import viewsFixture from '../fixtures/views.json'
 import runsFixture from '../fixtures/runs.json'
@@ -96,7 +90,6 @@ function resolved<T>(value: unknown): Promise<T> {
 // ---------------------------------------------------------------------------
 
 export const keys = {
-  summary: ['summary'] as QueryKey,
   readiness: ['readiness'] as QueryKey,
   channels: ['channels'] as QueryKey,
   channel: (id: string) => ['channels', id] as QueryKey,
@@ -106,15 +99,8 @@ export const keys = {
   runs: (limit: number) => ['runs', limit] as QueryKey,
   run: (id: string) => ['runs', id] as QueryKey,
   credentials: ['credentials'] as QueryKey,
-  credential: (id: string) => ['credentials', id] as QueryKey,
   egress: ['egress-profiles'] as QueryKey,
-  egressOne: (id: string) => ['egress-profiles', id] as QueryKey,
   endpoints: ['endpoint-profiles'] as QueryKey,
-  endpointOne: (id: string) => ['endpoint-profiles', id] as QueryKey,
-  semantic: ['semantic-profiles'] as QueryKey,
-  semanticOne: (id: string) => ['semantic-profiles', id] as QueryKey,
-  collections: ['collections'] as QueryKey,
-  collection: (id: string) => ['collections', id] as QueryKey,
   sources: ['sources'] as QueryKey,
   routeTemplates: ['route-templates'] as QueryKey,
   bridge: ['browser-bridges'] as QueryKey,
@@ -122,7 +108,7 @@ export const keys = {
 }
 
 /** Lists that any write might invalidate: readiness and the summary are derived. */
-const DERIVED_KEYS: QueryKey[] = [keys.summary, keys.readiness]
+const DERIVED_KEYS: QueryKey[] = [keys.readiness]
 
 // ---------------------------------------------------------------------------
 // Read primitives
@@ -159,10 +145,6 @@ export function useDetail<T>(key: QueryKey, path: string, enabled = true) {
 // ---------------------------------------------------------------------------
 // Dashboard, readiness
 // ---------------------------------------------------------------------------
-
-export function useSummary() {
-  return useList<DashboardSummary>(keys.summary, '/v1/dashboard/summary', summaryFixture)
-}
 
 export function useReadiness() {
   return useList<ReadinessReport>(keys.readiness, '/v1/readiness', readinessFixture)
@@ -258,14 +240,6 @@ export function useEndpointProfiles() {
 
 export function useCredentials() {
   return useList<Credential[]>(keys.credentials, '/v1/credentials', [])
-}
-
-export function useSemanticProfiles() {
-  return useList<SemanticProfile[]>(keys.semantic, '/v1/semantic-profiles', [])
-}
-
-export function useCollections() {
-  return useList<Collection[]>(keys.collections, '/v1/collections', [])
 }
 
 export function useSources() {
@@ -367,18 +341,6 @@ export function useRevokeCredential() {
   })
 }
 
-/** POST /v1/browser-bridges/{id}/permissions/revoke. Bridge must be online. */
-export function useRevokeOrigin() {
-  const client = useQueryClient()
-  return useMutation<BrowserBridge, Error, { bridgeId: string; pattern: string }>({
-    mutationFn: ({ bridgeId, pattern }) =>
-      post<BrowserBridge>(`/v1/browser-bridges/${bridgeId}/permissions/revoke`, {
-        permission_origin_pattern: pattern,
-      }).then((response) => response.data),
-    onSuccess: () => invalidate(client, [keys.bridge]),
-  })
-}
-
 // ---------------------------------------------------------------------------
 // Query plane
 // ---------------------------------------------------------------------------
@@ -402,21 +364,4 @@ export function useRunQuery<K extends OperationKind>(kind: K) {
   return useMutation<Envelope, Error, QueryInputFor<K>>({
     mutationFn: (body) => post<Envelope>(`/v1/${kind}`, body).then((response) => response.data),
   })
-}
-
-// ---------------------------------------------------------------------------
-// Credential reveal — deliberately not a hook
-// ---------------------------------------------------------------------------
-
-/**
- * Fetches a credential's plaintext for one explicit user action.
- *
- * This is a bare function, not a `useQuery`, so the value never lands in the
- * query cache. Callers must hold it in component state, show it, and drop it —
- * no storage, no URL, no logging, no clipboard without an explicit gesture. The
- * Backend sends `Cache-Control: no-store`; this respects it by never caching.
- */
-export async function revealCredentialValue(id: string): Promise<string | undefined> {
-  const response = await get<Credential>(`/v1/credentials/${id}?include_value=true`)
-  return response.data.value
 }

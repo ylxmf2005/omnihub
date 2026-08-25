@@ -870,19 +870,11 @@ func (server *dashboardHTTPServer) serveCredentials(writer http.ResponseWriter, 
 	id := segments[2]
 	switch request.Method {
 	case http.MethodGet:
-		if err := validateQueryKeys(request.URL.Query(), "include_value"); err != nil {
+		if err := validateQueryKeys(request.URL.Query()); err != nil {
 			writeDashboardError(writer, err)
 			return
 		}
-		includeValue, err := parseOptionalBool(request.URL.Query(), "include_value")
-		if err != nil {
-			writeDashboardError(writer, err)
-			return
-		}
-		if includeValue {
-			writer.Header().Set("Cache-Control", "no-store")
-		}
-		value, err := server.dependencies.Management.GetCredentialDetail(request.Context(), id, includeValue)
+		value, err := server.dependencies.Management.GetCredentialDetail(request.Context(), id, false)
 		writeRevisionResult(writer, http.StatusOK, value, value.Revision, err)
 	case http.MethodPut:
 		revision, ok := requireRevision(writer, request)

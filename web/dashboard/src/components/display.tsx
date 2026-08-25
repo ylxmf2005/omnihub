@@ -42,14 +42,12 @@ const TONE_ICON: Record<Tone, ReactNode> = {
 }
 
 /**
- * State chip. Icon plus words, never colour alone. The raw enum value lives in
- * the tooltip so the UI stays traceable to the API without shouting codes at
- * the reader.
+ * State chip. Icon plus words, never colour alone.
  */
 export function StateBadge({
   label,
   tone,
-  code,
+  code: _code,
   meaning,
   icon,
 }: {
@@ -62,12 +60,7 @@ export function StateBadge({
   return (
     <Tooltip
       label={
-        <>
-          {meaning}
-          <Text span fz={10} ff="monospace" c="dimmed" ml={6}>
-            {code}
-          </Text>
-        </>
+        meaning
       }
       multiline
       w={260}

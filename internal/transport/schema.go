@@ -254,7 +254,7 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 		{"EndpointProfile", "/v1/endpoint-profiles", "/v1/endpoint-profiles/{id}", schemas["endpoint_input"], schemas["endpoints"], schemas["endpoint"], schemas["endpoint"]},
 		{"SemanticProfile", "/v1/semantic-profiles", "/v1/semantic-profiles/{id}", schemas["semantic_profile_input"], schemas["semantic_profiles"], schemas["semantic_profile"], schemas["semantic_profile"]},
 		{"EgressProfile", "/v1/egress-profiles", "/v1/egress-profiles/{id}", schemas["egress_input"], schemas["egress_profiles"], schemas["egress_profile"], schemas["egress_profile"]},
-		{"Credential", "/v1/credentials", "/v1/credentials/{id}", schemas["credential_input"], schemas["credentials"], schemas["credential_detail"], schemas["credential_summary"]},
+		{"Credential", "/v1/credentials", "/v1/credentials/{id}", schemas["credential_input"], schemas["credentials"], schemas["credential_summary"], schemas["credential_summary"]},
 		{"Collection", "/v1/collections", "/v1/collections/{id}", schemas["collection_input"], schemas["collections"], schemas["collection"], schemas["collection"]},
 		{"View", "/v1/views", "/v1/views/{id}", schemas["view_input"], schemas["views"], schemas["view_detail"], schemas["view"]},
 	} {
@@ -263,7 +263,7 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 			"post": createEndpoint("create"+resource.name, "创建 "+resource.name+"。", resource.input, resource.written, problem),
 		}
 		paths[resource.itemPath] = map[string]any{
-			"get":    resourceReadEndpoint("get"+resource.name, "读取 "+resource.name+"。", resource.detail, problem, resource.name == "Credential"),
+			"get":    resourceReadEndpoint("get"+resource.name, "读取 "+resource.name+"。", resource.detail, problem),
 			"put":    replaceEndpoint("replace"+resource.name, "完整替换 "+resource.name+"。", resource.input, resource.written, problem),
 			"delete": deleteEndpoint("delete"+resource.name, "删除 "+resource.name+"。", problem),
 		}
@@ -287,7 +287,7 @@ func addDashboardOpenAPI(paths map[string]map[string]any, problem json.RawMessag
 		"get":  listRunsEndpoint(schemas["runs"], problem),
 		"post": createRunEndpoint(schemas["run_input"], schemas["run"], problem),
 	}
-	paths["/v1/runs/{id}"] = map[string]any{"get": resourceReadEndpoint("getRun", "读取持久 Run。", schemas["run"], problem, false)}
+	paths["/v1/runs/{id}"] = map[string]any{"get": resourceReadEndpoint("getRun", "读取持久 Run。", schemas["run"], problem)}
 	for _, feed := range []struct{ path, media, operationID string }{
 		{"/feeds/{view}.json", "application/feed+json", "getJSONFeed"},
 		{"/feeds/{view}.rss", "application/rss+xml", "getRSSFeed"},
@@ -327,18 +327,11 @@ func readEndpoint(operationID, summary string, output, problem json.RawMessage, 
 	return operation
 }
 
-func resourceReadEndpoint(operationID, summary string, output, problem json.RawMessage, credential bool) map[string]any {
+func resourceReadEndpoint(operationID, summary string, output, problem json.RawMessage) map[string]any {
 	operation := readEndpoint(operationID, summary, output, problem, true)
 	responses := operation["responses"].(map[string]any)
 	responses["200"].(map[string]any)["headers"] = map[string]any{
 		"ETag": map[string]any{"schema": map[string]any{"type": "string"}},
-	}
-	if credential {
-		operation["parameters"] = append(operation["parameters"].([]any), map[string]any{
-			"name": "include_value", "in": "query", "required": false, "schema": map[string]any{"type": "boolean"},
-			"description": "显式返回持久 API Key/Token；响应使用 Cache-Control: no-store。",
-		})
-		responses["200"].(map[string]any)["headers"].(map[string]any)["Cache-Control"] = map[string]any{"schema": map[string]any{"type": "string"}}
 	}
 	return operation
 }

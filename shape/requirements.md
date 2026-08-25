@@ -277,7 +277,7 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 10. **首批验证与 X**：Direct Feed、RSSHub/V2EX、GitHub、Tavily、X/xurl；twscrape 只 opt-in。NodeSeek 使用官方推荐 Feed 的内建预设，但在当前网络仍作为 unavailable/readiness 样本。
 11. **测试边界**：每个宣称来源与功能都要有可重放测试；本 Task 只扩展已有 `*_test.go` 与合同 fixture，不新增 test 文件。
 12. **渠道与 Chrome 授权方向**：Channel 是 Dashboard 一级管理对象；需要 Cookie 的 Channel 在用户授予 Chrome origin permission 后按每次执行直接读取，Cookie 不持久化。Dashboard 可打开登录链接并显示分层健康；Chrome Extension 客户端由独立 Agent/工作流实现，本 Task 负责后端 Bridge/合同。
-13. **本地 MVP Credential**：Dashboard 直接录入 API Key/Token，SQLite 保存真实值，不使用 Keychain、受保护 secret store 或 opaque handle。Credential 列表只返回掩码；只有 detail 请求显式传入 `include_value=true` 时才返回完整值，并设置 `Cache-Control: no-store`。日志、Run 与诊断不回显原值。
+13. **本地 MVP Credential**：Dashboard 直接录入 API Key/Token，SQLite 保存真实值，不使用 Keychain、受保护 secret store 或 opaque handle。所有 Dashboard 读取只返回掩码与是否已配置，完整值只能创建、轮换或撤销，不能通过 HTTP 读回。日志、Run 与诊断不回显原值。
 14. **轻量本机信任模型**：只监听 loopback，保留 Host/Origin/CORS、SQLite 文件权限和日志脱敏；v1 不实现 Dashboard 登录、bootstrap session 或复杂 CSRF token。
 15. **显式出站方向**：EgressProfile 支持 environment/direct/http_proxy/socks5 与 SOCKS5 local/proxy DNS；有 Endpoint 时绑定在 EndpointProfile，无 Endpoint 时绑定在 Channel；Operation/Probe 不覆盖，代理认证引用 Credential 且不在 URL 中携带。
 16. **出站 fail-closed**：不隐式 fallback、直连、公共 DoH、公共代理或关闭 TLS；真正 System Proxy/PAC、VPN/TUN 与最快线路不在 Stage A。Probe/readiness/Execution 绑定 Endpoint×Egress，输出脱敏的 profile 事实。
@@ -291,4 +291,4 @@ Source Bundle 再把 arXiv、YouTube、Hacker News、播客/Newsletter、NodeSee
 
 ## 7. 决策收口
 
-Credential 列表只返回掩码；只有 detail 请求带 `include_value=true` 时返回完整 API Key/Token，并设置 `Cache-Control: no-store`。Egress、迁移、readiness、Provider 能力、Dashboard 默认值、保留、Chrome 与 semantic grouping 已按上述合同收敛，不再保留承重未决项。
+Credential 的 Dashboard 读取只返回掩码，完整 API Key/Token 不能通过 HTTP 读回。Egress、迁移、readiness、Provider 能力、Dashboard 默认值、保留、Chrome 与 semantic grouping 已按上述合同收敛，不再保留承重未决项。

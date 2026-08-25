@@ -382,7 +382,7 @@ omnihub doctor --channel channel_x_official --format json
 
 ## 15. Credential、Chrome Browser Bridge 与本机信任
 
-- Dashboard 直接 CRUD API Key/Token Credential，值原样保存在本机 SQLite。列表返回掩码；detail 可在 `include_value=true` 时回显并使用 `Cache-Control: no-store`。日志、Run、Error、readiness 与默认 export 始终脱敏。
+- Dashboard 可创建、轮换和撤销 API Key/Token Credential，值原样保存在本机 SQLite。所有读取只返回掩码，不提供明文读取旁路。日志、Run、Error、readiness 与默认 export 始终脱敏。
 - `chrome_cookie` Credential 不保存 Cookie。Chrome Extension 在用户手势下请求目标 origin 的 optional host permission，以 `chrome.cookies` 按 Channel Execute/Probe 读取 RouteTemplate allowlist；禁止 `<all_urls>` 常驻权限、`debugger`、默认 Profile CDP、Cookie SQLite 扫描或自行 OS 解密。
 - Extension 通过 `connectNative()` 与 `omnihub chrome-host` 维持可重连 Port。Host 暴露当前 OS 用户专属的 Unix socket/Windows named pipe，CLI 与 `serve` 的 Browser Bridge Client 都可请求当前 execution；Chrome 依据 Host manifest 的 `allowed_origins` 限制固定 Extension ID，Host 不信任 payload 自报身份。
 - Login URL、origin 与 cookie name 必须来自受信任 RouteTemplate。Chrome origin permission 可以被同一当前 Profile 中、allowlist 为其子集的多个 Channel 复用；Cookie 只进入当前 Adapter 内存，结束即释放。
@@ -422,7 +422,7 @@ YouTube、Newsletter、Podcast 等继续通过 Source Bundle 扩充；arXiv 与 
 | 个性化来源 | Direct Feed 与 RSSHub Channel/参数均可管理 | 管理 API 与配置校验面扩大 | 已确认 |
 | Dashboard | loopback 单实例；Credential/Channel/配置管理 + Query Workbench；Run 轮询；前端独立 | 信任本机账号与 SQLite 权限 | 已确认 |
 | Channel | RouteTemplate 静态只读，Channel 才可配置、授权、探测和执行 | 新增配置与健康读模型 | 已确认 |
-| API Key | Dashboard 录入，SQLite 原样保存；列表掩码，detail 仅在 `include_value=true` 时完整回显 | 数据库备份可读到 Key | 已确认 |
+| API Key | Dashboard 录入，SQLite 原样保存；所有读取只返回掩码，值只能轮换或撤销 | 数据库备份可读到 Key | 已确认 |
 | Chrome 授权 | MV3 optional host permission + cookies API + connectNative 长连接；每次执行直接读 | Chrome/Bridge 离线时 Channel blocked | 已确认 |
 | RSSHub | 只连接显式 Endpoint | 用户自行准备实例 | 已确认 |
 | EgressProfile | Endpoint 固定绑定；无 Endpoint Channel 固定绑定；Operation 无覆盖；缺绑定 fail-closed | 同一 BaseURL 多出口需多个 EndpointProfile；同一 Direct Feed URL 多出口需多个 Channel | 已确认 |

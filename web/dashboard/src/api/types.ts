@@ -334,21 +334,8 @@ export interface Envelope {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard summary and readiness
+// Readiness
 // ---------------------------------------------------------------------------
-
-/** GET /v1/dashboard/summary */
-export interface DashboardSummary {
-  schema_version: string
-  version: string
-  instance_id: string
-  generated_at: string
-  /** Sparse: a state with no channels is absent, not zero. */
-  readiness: Partial<Record<ReadinessState, number>>
-  view_freshness: Partial<Record<ViewStatus, number>>
-  active_runs: number
-  recent_failures: number
-}
 
 export interface ReadinessCheck {
   kind: string
@@ -454,16 +441,6 @@ export interface EgressProfile {
 }
 
 /** POST/PUT /v1/egress-profiles. Requires `id`, `mode`, `enabled`. */
-export interface EgressProfileInput {
-  id: string
-  mode: string
-  enabled: boolean
-  display_name?: string
-  proxy_endpoint?: string
-  socks5_dns?: string
-  credential_id?: string
-}
-
 export interface EndpointProfile {
   id: string
   provider: string
@@ -476,22 +453,7 @@ export interface EndpointProfile {
 }
 
 /** POST/PUT /v1/endpoint-profiles. Requires `id`, `provider`, `base_url`, `egress_profile_id`. */
-export interface EndpointProfileInput {
-  id: string
-  provider: string
-  base_url: string
-  egress_profile_id: string
-  trust?: string
-}
-
-/**
- * GET /v1/credentials
- *
- * The list never carries the secret. It reports `has_value` and a `value_masked`
- * preview; the plaintext exists only on the detail route with
- * `?include_value=true`, is sent with `Cache-Control: no-store`, and must never
- * be cached, stored or logged.
- */
+/** GET /v1/credentials. Dashboard responses never carry the secret value. */
 export interface Credential {
   id: string
   provider: string
@@ -501,8 +463,6 @@ export interface Credential {
   value_masked?: string
   enabled: boolean
   revision: number
-  /** Only present on an explicit reveal. Treat as radioactive. */
-  value?: string
 }
 
 /** POST /v1/credentials. Requires `id`, `provider`, `auth_kind`, `value`, `enabled`. */
@@ -521,50 +481,6 @@ export interface CredentialInput {
  * so changing the model or dimension invalidates previously grouped results
  * rather than silently mixing incompatible vectors.
  */
-export interface SemanticProfile {
-  id: string
-  endpoint_profile_id: string
-  model: string
-  dimension: number
-  threshold: number
-  index_revision: number
-  credential_id?: string
-  enabled: boolean
-  revision: number
-}
-
-export interface SemanticProfileInput {
-  id: string
-  endpoint_profile_id: string
-  model: string
-  dimension: number
-  threshold: number
-  index_revision: number
-  enabled: boolean
-  credential_id?: string
-}
-
-/** A Collection groups Channels; `title`, not `display_name`. */
-export interface Collection {
-  id: string
-  title?: string
-  parent_id?: string
-  position: number
-  channel_ids: string[]
-  enabled: boolean
-  revision: number
-}
-
-/** POST /v1/collections. Requires `id`, `position`, `channel_ids`, `enabled`. */
-export interface CollectionInput {
-  id: string
-  position: number
-  channel_ids: string[]
-  enabled: boolean
-  title?: string
-  parent_id?: string
-}
-
 /**
  * GET /v1/sources. Deliberately thin — the catalog is reference material.
  *

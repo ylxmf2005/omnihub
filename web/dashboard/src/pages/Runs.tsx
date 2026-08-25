@@ -19,8 +19,7 @@ import { Link } from 'react-router'
 import { useChannels, useRuns, useViews } from '../api/queries'
 import type { Run } from '../api/types'
 import { RUN_STATUSES, isTerminalRun } from '../api/types'
-import { summarizeEnvelope } from '../components/EnvelopeView'
-import { IdChip, RunBadge, Timestamp } from '../components/display'
+import { RunBadge, Timestamp } from '../components/display'
 import {
   EmptyState,
   ErrorAlert,
@@ -36,16 +35,16 @@ import { RUN_COPY } from '../domain/vocabulary'
 /** Run kinds as a person reads them. Shared with RunDetail. */
 export const RUN_KIND_COPY: Record<Run['kind'], { label: string; description: string }> = {
   query: {
-    label: '直接查询',
-    description: '通过 Query 平面同步执行的一次取数。',
+    label: '搜索',
+    description: '一次内容搜索。',
   },
   view_refresh: {
-    label: 'View 刷新',
-    description: '为一个 View 重新生成 Snapshot。',
+    label: '订阅更新',
+    description: '为一个订阅更新内容。',
   },
   channel_probe: {
-    label: 'Channel Probe',
-    description: '对一条线路做连通性检查，不取内容。',
+    label: '来源检查',
+    description: '检查一个来源能否连接。',
   },
 }
 
@@ -81,8 +80,8 @@ export function Runs() {
   return (
     <Stack gap="lg">
       <PageHeader
-        title="Runs"
-        description="每条 Run 记录一次由 Backend 排队执行的操作：它取了什么、覆盖了多少范围、哪条线路出了问题。Workbench 里的同步查询直接返回结果，不留 Run。"
+        title="活动"
+        description="查看订阅更新和来源检查的结果。"
         actions={
           <Button
             variant="default"
@@ -98,7 +97,7 @@ export function Runs() {
       {runs.error ? <ErrorAlert error={runs.error} onRetry={() => void runs.refetch()} /> : null}
 
       <SectionCard
-        title="执行记录"
+        title="最近活动"
         count={
           all.length > 0
             ? filtered
@@ -147,9 +146,9 @@ export function Runs() {
           <LoadingRow />
         ) : all.length === 0 ? (
           <EmptyState
-            title="还没有任何执行记录。"
-            hint="刷新一个 View，或对一条 Channel 做一次 Probe，就会留下第一条 Run。"
-            action={<PageLink to="/views">去刷新一个 View</PageLink>}
+            title="还没有活动记录。"
+            hint="更新一个订阅或检查一个来源后，记录会出现在这里。"
+            action={<PageLink to="/subscriptions">去更新订阅</PageLink>}
           />
         ) : list.length === 0 ? (
           <EmptyState
@@ -184,15 +183,9 @@ function RunRow({ run, name }: { run: Run; name?: string }) {
   return (
     <Table.Tr>
       <Table.Td>
-        <Anchor component={Link} to={`/runs/${run.id}`} fz="sm" fw={500}>
+        <Anchor component={Link} to={`/activity/${run.id}`} fz="sm" fw={500}>
           {name ?? run.resource.id}
         </Anchor>
-        <Group gap="sm" mt={2} wrap="nowrap">
-          <Text fz="xs" c="dimmed">
-            {run.resource.type}
-          </Text>
-          <IdChip value={run.id} width={170} />
-        </Group>
       </Table.Td>
       <Table.Td>
         <Text fz="sm">{RUN_KIND_COPY[run.kind]?.label ?? run.kind}</Text>
@@ -248,7 +241,10 @@ function RunOutcomeLine({ run }: { run: Run }) {
     return null
   }
 
-  const { returned, examined, gaps, failures } = summarizeEnvelope(run.result)
+  const returned = run.result.coverage.reduce((total, entry) => total + entry.returned, 0)
+  const examined = run.result.coverage.reduce((total, entry) => total + entry.examined, 0)
+  const gaps = run.result.coverage.filter((entry) => entry.truncated || !entry.exhaustive)
+  const failures = run.result.executions.filter((entry) => entry.status === 'failed').length
   return (
     <MetaLine gap="sm">
       <Fact label="结果">{run.result.items.length} 条</Fact>

@@ -94,7 +94,7 @@
 ### Credential
 
 - 列表和普通详情只展示掩码与 `has_value`。
-- 只有用户明确点击“显示”时才请求 `GET /v1/credentials/{id}?include_value=true`。
+- Dashboard 不读取密钥原文；只允许创建、轮换和撤销，并显示掩码与是否已配置。
 - 该响应是 `Cache-Control: no-store`。Secret 只能进入当前组件的短生命周期内存；不能进入 localStorage、sessionStorage、URL、日志、错误追踪、持久 Query cache 或剪贴板自动操作。
 - `chrome_cookie` 永不通过该接口回显 value。
 - Revoke 会清值并禁用 Credential，不等于删除记录。

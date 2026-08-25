@@ -6,6 +6,8 @@
 
 继续执行请求：用户离开后不再回答问题，授权 Agent 自主完成技术与产品取舍；优先简单可发布的本地 MVP、复用现有能力并完成必要的新技术调研，使用 Ponytail full 控制复杂度。最终目标是实现全部当前范围、为每个宣称支持的来源与功能提供测试、完成独立审核和发布准备，并以可验收纵切阶段性交付和 push。
 
+2026-08-25 前端收缩请求：用户确认 Dashboard 不再逐一暴露后端资源模型，要求删除无价值页面和冗长解释，而不是只隐藏入口；保留并重写为搜索、来源、订阅、活动四个用户任务。前端不得读取或显示已保存凭据的明文，旧页面与旧路由不保留兼容。
+
 来源：当前对话中用户显式调用 `$shape` 并要求先充分调查、产出 Shape 草稿、再进入 Grill；项目名与目标仓库已确定为 `OmniHub` / `ylxmf2005/omnihub`。
 
 ## Reality Coordinates
@@ -18,6 +20,7 @@
 - RSSHub 现实：它能输出 RSS、Atom、JSON Feed 并暴露 Route 元数据，但 Endpoint 可达不等于具体 Route 已具备 credential、浏览器或反爬条件；X Route 本身也需要 X 鉴权配置。
 - 已确认持久层方向：v1 真实实现使用 SQLite，但领域层通过 Repository/Unit of Work 隔离持久化；Schema、ID、乐观并发、幂等与 Run lease 边界为未来 MySQL 多实例执行留出迁移空间。v1 不同时维护 MySQL Driver，也不宣称已经分布式。
 - 已确认 Dashboard 责任：OmniHub 产品包含综合 Web Dashboard；本 Task 负责管理 API、运行事件与前后端合同，前端实现由另一 Agent/工作流承担。
+- 2026-08-25 前端审查确认：当前 Dashboard 有 12 个一级导航、16 条路由和 7,718 行页面代码。Collection 与 Semantic Profile 各自拥有完整 CRUD 页面，但当前 View/Workbench 分别只接受 Channel 范围、固定 `similarity_grouping=off`，两个配置面未进入用户可完成的主流程；Credential 页面还能通过 `include_value=true` 把明文密钥带进浏览器。用户据此确认重写信息架构并删除旧表面。
 - 已确认刷新方向：Query Plane 保持无状态；Subscription Plane 使用 SQLite，并采用 View stale-while-revalidate、首次有界阻塞刷新、显式 refresh 与外部 cron；v1 不内置 scheduler。
 - 已确认个性化来源：RSSHub Endpoint 与其启用的 Channel/参数均由用户配置；Direct Feed 同样以用户 Channel 注册并通过 OPML 组织，不把内建 RouteTemplate 清单当成每个人的订阅集合。
 - 已确认上一轮全部 Grill 项：Dashboard v1 管理当前 loopback 单实例；可管理 user-owned 配置与 Query Workbench；Run 使用 `202 + run_id` 轮询而非 SSE/WebSocket；RSSHub 只连接不托管；扩展采用内建 Adapter + Manifest + command/MCP binding；首批验证矩阵保持不变；允许新增必要测试、Repository contract tests 与 fixture。
@@ -45,7 +48,7 @@
 
 ## Goal
 
-把 OmniHub 实现并验收到可发布的本地 v1：既支持无状态的一次性 Agent 检索，也能保存 View、分发 Feed、通过 Web Dashboard Backend 管理配置与运行；CLI、HTTP、MCP、Feed 与 Skill 共享同一执行语义，并对每次执行如实返回实际 Provider、Channel、RouteTemplate、Egress、覆盖范围、失败和来源链路。
+把 OmniHub 实现并验收到可发布的本地 v1：既支持无状态的一次性 Agent 检索，也能保存 View、分发 Feed；CLI、HTTP、MCP、Feed 与 Skill 共享同一执行语义，并对每次执行如实保留实际 Provider、Channel、RouteTemplate、Egress、覆盖范围、失败和来源链路。Web Dashboard 只围绕搜索、来源、订阅和活动四个用户任务组织这些能力，正常流程不要求用户理解内部执行模型。
 
 本轮修订还要让 Search 与 Latest 的公共语义重新可信：Feed/RSSHub 只承担 Latest，Search 必须进入平台官方 Search、平台官方采用的搜索服务或用户显式选择的 Web/第三方索引，并能结构化表达时间、作者、分类、标签、内容范围和排序限定。
 
@@ -55,9 +58,12 @@
 - 定义 Direct Feed、RSSHub、原生 API、固定 CLI、MCP 与通用 Web Search 的选择和扩展机制。
 - 定义统一 Item、Observation/Origin、Coverage、Error、时间、分页、去重与增量状态合同。
 - 规划 CLI、HTTP API、MCP、RSS/Atom/JSON Feed、JSONL、OPML 与 Skill 共享同一核心能力。
-- 规划 Web Dashboard 所需的管理资源、运行状态与事件合同；本 Task 不实现前端。
+- 实现 Web Dashboard 的四个用户任务，并让它们复用现有管理、查询、订阅与运行合同。
 - 通过领域 Repository 与事务边界隔离 SQLite，为后续 MySQL Store 和多实例 Run coordination 保留真实迁移路径。
 - 允许用户管理 Direct Feed、RSSHub Channel/参数、Endpoint、Credential、Collection 与 View，而不是只能使用内建来源。
+- Dashboard 一级信息架构只保留搜索、来源、订阅、活动。来源负责接入、认证、浏览器连接和可用性；订阅负责 View、内容与 Feed；活动负责最近执行与失败排查。资源 ID、RouteTemplate、Provider、Adapter、Egress、Endpoint、Revision、ETag、原始 Operation/Envelope 和实例身份只在完成任务或故障定位确有必要时出现。
+- 删除独立的 Collections、Semantic Profiles、Connections、Credentials、Browser Bridge、Catalog、Diagnostics 页面与旧路由；仍有用户价值的来源认证、Chrome 连接和失败证据重写进对应主流程。Channel、View 与 Run 的详情可以作为主流程的对象详情存在，不作为独立产品概念宣传。
+- 删除 Dashboard 的明文凭据读取和显示能力，并删除 HTTP 管理面 `include_value=true` 的明文返回；凭据只允许创建、轮换、撤销和查看是否已配置。
 - 定义 Channel、RouteTemplate、Credential 与 Browser Bridge；支持 Dashboard 录入 API Key、用户授权 Chrome 域权限、打开登录页、按执行读取 Cookie、撤销授权并查看分层健康。
 - 实现 Chrome Companion Extension、Native Messaging Host 与 linux.do 专用浏览器搜索合同；只允许用户显式授权 `https://linux.do/*`，只执行 `/search.json` 第一页 GET。
 - 实现显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage A，不反向进入 Stage 3 验收。
@@ -74,7 +80,8 @@
 - OmniHub 不负责原文长期归档、OCR/ASR/Vision、证据编排或综合写作；这些属于 Knowledge Studio。
 - v1 不自动安装、升级或监控 RSSHub，不默认使用未知公共实例。
 - v1 不建设通用网页爬虫平台、内置长期任务调度系统或强制内容分类本体。
-- 本 Task 不实现 Dashboard 前端；前端不得另造查询、路由、状态或错误语义。
+- Dashboard 不另造查询、路由、状态或错误语义；它只把现有后端合同改写成用户任务。
+- 不为被删除的 Dashboard 路由、页面、术语或明文凭据读取保留重定向、功能开关、兼容组件或“高级模式”。后端仍可保留 Query/Subscription 执行需要的 Collection、Semantic Profile、Endpoint、Egress 等领域能力，除非本轮明确删除其 HTTP 明文凭据出口。
 - 不实现任意 origin/path 的通用浏览器代理、页面脚本注入、CDP/remote debugging、后台扫描 Cookie 或其他站点的浏览器搜索。
 - v1 不实现 MySQL Store、多实例部署、分布式锁、租户/RBAC 或伪分布式兼容层；这里只冻结未来替换 Store 所需的领域边界和数据不变量。
 - v1 只支持 Google Chrome 常规 Profile；不直接解密浏览器 Cookie 数据库，不用 remote debugging/CDP 绕过 Chrome 保护，不默认扫描全部 Profile、域名或 Cookie，不支持 Firefox/Safari/Edge 与 Incognito。
@@ -88,7 +95,9 @@
 
 ## Acceptance Evidence
 
-- Dashboard 可创建并更新 API Key/Token Credential，SQLite readback 能验证原值与 revision；Credential 列表仅返回掩码，只有 detail 请求显式传入 `include_value=true` 才返回完整值，且响应设置 `Cache-Control: no-store`。
+- Dashboard 可创建、轮换和撤销 API Key/Token，但任何 Dashboard API 响应与浏览器状态都不返回凭据明文；SQLite 层的聚焦测试继续验证写入值与 revision。`include_value=true` 不再是公共 HTTP 管理合同。
+- Dashboard 主导航恰好呈现搜索、来源、订阅、活动四个入口；不存在旧页面兼容路由。搜索能按来源和时间等已支持限定返回结果，来源能完成内建来源接入并显示认证/Chrome 状态，订阅能创建和刷新 View 并取得 Feed，活动能从失败进入必要证据。
+- 桌面和移动端真实浏览器检查证明四个主入口无横向溢出、主动作清楚；删除页面、路由和凭据明文路径后，前端 lint/build、Go 全量测试、race 与 vet 通过。
 - linux.do Search 只能经用户授权的当前 Chrome Profile 与在线 Browser Bridge 执行；Cookie 不离开 Chrome，也不进入 SQLite、HTTP、Run、Error、日志或 fixture，CLI 与 `serve` 复用同一本机 IPC。
 - Channel health 分开呈现 Bridge、权限、Credential、Endpoint 与真实 Probe；依赖 Chrome 的 Channel 在 Bridge 离线或 permission 缺失时如实返回 `blocked` 与对应错误，不影响无关 Channel；已有 View Snapshot 仍以 `stale` 分发并保留最近刷新失败事实。
 - 公共合同示例可通过 JSON/YAML 校验，实施计划能从合同冻结、Repository/SQLite spike、五条纵切一路推进到 Dashboard Backend 与公共出口。
@@ -116,8 +125,8 @@
 - `shape/design.md`：`ready`，Registry/Router、官方搜索 Adapter 与 V2EX Web Search 路线已更新。
 - `plan.md`：`completed`，Stage 0—F 的本地实现与聚焦运行验证完成。
 - `dev/implementation.md`：`completed`，Stage E/F 与 linux.do Chrome 会话搜索实现、公共出口、Dashboard 和本机真实配置已通过聚焦反馈。
-- Dashboard 创建流程增量：`completed`，官方 Endpoint 在 Channel 创建事务中复用/创建，默认前端流程不再暴露 Endpoint，搜索路线不再提供必失败 Probe；宽屏 1920px 与移动 375px 浏览器验证已通过。
+- Dashboard 四任务重构：`completed`，一级导航只保留搜索、来源、订阅、活动；八个旧页面与旧路由已删除，来源认证和 Chrome 状态并入来源流程。
 - 官方 Feed 预设增量：`completed`，V2EX/NodeSeek 固定 Feed 由 RouteTemplate 提供，Dashboard 不要求填写；默认 SQLite 已创建 NodeSeek Channel，当前 Direct Probe 为 `failed/timeout`，仍未标记 ready。
-- `test/test-plan.md`：`completed`，TC-E01—E10 已执行并闭合。
-- `test/test-report.md`：`passed`，来源/功能、发布物、三平台 CI 与历史红色均已裁决。
+- `test/test-plan.md`：`completed`，TC-IA01—05 已执行并闭合。
+- `test/test-report.md`：`passed`，真实搜索、旧路由删除、明文密钥拒绝、四任务浏览器流程、桌面/移动布局与全量门禁均已裁决。
 - `review/review.md`：`approve`，Stage E 合同、安全、迁移、公共出口与发布候选独立复审通过。

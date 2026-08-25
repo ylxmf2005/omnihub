@@ -9,19 +9,11 @@ import './styles.css'
 
 import { Shell } from './components/Shell'
 import { theme } from './theme'
-import { BrowserBridgePage } from './pages/BrowserBridge'
-import { Catalog } from './pages/Catalog'
 import { ChannelDetail } from './pages/ChannelDetail'
 import { Channels } from './pages/Channels'
-import { Collections } from './pages/Collections'
-import { Connections } from './pages/Connections'
-import { Credentials } from './pages/Credentials'
-import { Diagnostics } from './pages/Diagnostics'
 import { NotFound } from './pages/NotFound'
-import { Overview } from './pages/Overview'
 import { RunDetail } from './pages/RunDetail'
 import { Runs } from './pages/Runs'
-import { SemanticProfiles } from './pages/SemanticProfiles'
 import { ViewDetail } from './pages/ViewDetail'
 import { Views } from './pages/Views'
 import { Workbench } from './pages/Workbench'
@@ -46,21 +38,13 @@ createRoot(document.getElementById('root')!).render(
         <BrowserRouter>
           <Shell>
             <Routes>
-              <Route path="/" element={<Overview />} />
-              <Route path="/workbench" element={<Workbench />} />
-              <Route path="/channels" element={<Channels />} />
-              <Route path="/channels/:id" element={<ChannelDetail />} />
-              <Route path="/connections" element={<Connections />} />
-              <Route path="/credentials" element={<Credentials />} />
-              <Route path="/semantic-profiles" element={<SemanticProfiles />} />
-              <Route path="/collections" element={<Collections />} />
-              <Route path="/views" element={<Views />} />
-              <Route path="/views/:id" element={<ViewDetail />} />
-              <Route path="/runs" element={<Runs />} />
-              <Route path="/runs/:id" element={<RunDetail />} />
-              <Route path="/diagnostics" element={<Diagnostics />} />
-              <Route path="/bridge" element={<BrowserBridgePage />} />
-              <Route path="/catalog" element={<Catalog />} />
+              <Route path="/" element={<Workbench />} />
+              <Route path="/sources" element={<Channels />} />
+              <Route path="/sources/:id" element={<ChannelDetail />} />
+              <Route path="/subscriptions" element={<Views />} />
+              <Route path="/subscriptions/:id" element={<ViewDetail />} />
+              <Route path="/activity" element={<Runs />} />
+              <Route path="/activity/:id" element={<RunDetail />} />
               <Route path="*" element={<NotFound />} />
             </Routes>
           </Shell>

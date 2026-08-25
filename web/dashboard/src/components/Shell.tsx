@@ -1,11 +1,4 @@
-/**
- * App shell: sidebar navigation, content column, and the instance identity that
- * answers "which process am I actually talking to".
- *
- * Navigation is driven by the router, so the active item is derived from the URL
- * rather than tracked separately — a second source of truth for "where am I"
- * goes stale the first time someone navigates by link or back button.
- */
+/** 主导航由 URL 派生激活状态，避免为当前位置维护第二份状态。 */
 
 import {
   AppShell,
@@ -16,27 +9,17 @@ import {
   ScrollArea,
   Stack,
   Text,
-  Tooltip,
 } from '@mantine/core'
 import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
-  IconBook2,
-  IconFolders,
-  IconKey,
-  IconLayersSubtract,
   IconRss,
   IconSearch,
   IconShare3,
-  IconSitemap,
-  IconSparkles,
-  IconStethoscope,
-  IconWorld,
+  IconLayersSubtract,
 } from '@tabler/icons-react'
 import type { ReactNode } from 'react'
 import { Link, useLocation } from 'react-router'
-import { IdChip } from './display'
-import { useSummary } from '../api/queries'
 
 interface NavItem {
   label: string
@@ -44,46 +27,14 @@ interface NavItem {
   icon: ReactNode
 }
 
-const NAV_GROUPS: { label?: string; items: NavItem[] }[] = [
-  {
-    items: [
-      { label: '概览', to: '/', icon: <IconLayersSubtract size={16} /> },
-      { label: 'Query Workbench', to: '/workbench', icon: <IconSearch size={16} /> },
-    ],
-  },
-  {
-    label: '接入',
-    items: [
-      { label: 'Channels', to: '/channels', icon: <IconRss size={16} /> },
-      { label: 'Connections', to: '/connections', icon: <IconSitemap size={16} /> },
-      { label: 'Credentials', to: '/credentials', icon: <IconKey size={16} /> },
-      { label: 'Semantic Profiles', to: '/semantic-profiles', icon: <IconSparkles size={16} /> },
-    ],
-  },
-  {
-    label: '分发',
-    items: [
-      { label: 'Collections', to: '/collections', icon: <IconFolders size={16} /> },
-      { label: 'Views', to: '/views', icon: <IconLayersSubtract size={16} /> },
-    ],
-  },
-  {
-    label: '运行',
-    items: [
-      { label: 'Runs', to: '/runs', icon: <IconActivity size={16} /> },
-      { label: 'Diagnostics', to: '/diagnostics', icon: <IconStethoscope size={16} /> },
-    ],
-  },
-  {
-    label: '系统',
-    items: [
-      { label: 'Browser Bridge', to: '/bridge', icon: <IconWorld size={16} /> },
-      { label: 'Catalog', to: '/catalog', icon: <IconBook2 size={16} /> },
-    ],
-  },
+const NAV_ITEMS: NavItem[] = [
+  { label: '搜索', to: '/', icon: <IconSearch size={16} /> },
+  { label: '来源', to: '/sources', icon: <IconRss size={16} /> },
+  { label: '订阅', to: '/subscriptions', icon: <IconLayersSubtract size={16} /> },
+  { label: '活动', to: '/activity', icon: <IconActivity size={16} /> },
 ]
 
-/** `/channels/abc` keeps Channels lit; only `/` must match exactly. */
+/** 根路径只匹配搜索页，其他入口同时覆盖自己的对象详情。 */
 function isActive(pathname: string, to: string): boolean {
   return to === '/' ? pathname === '/' : pathname === to || pathname.startsWith(`${to}/`)
 }
@@ -91,7 +42,6 @@ function isActive(pathname: string, to: string): boolean {
 export function Shell({ children }: { children: ReactNode }) {
   const [navOpen, { toggle: toggleNav, close: closeNav }] = useDisclosure(false)
   const { pathname } = useLocation()
-  const summary = useSummary()
 
   return (
     <AppShell
@@ -126,82 +76,30 @@ export function Shell({ children }: { children: ReactNode }) {
         </AppShell.Section>
 
         <AppShell.Section grow component={ScrollArea} px="xs" pt={{ base: 'sm', sm: 0 }}>
-          <Stack gap="md" pb="sm">
-            {NAV_GROUPS.map((group, index) => (
-              <Box key={group.label ?? index}>
-                {group.label && (
-                  <Text fz={10} fw={600} c="dimmed" px="xs" pb={4} tt="uppercase" lts="0.04em">
-                    {group.label}
-                  </Text>
-                )}
-                {group.items.map((item) => (
-                  <NavLink
-                    key={item.to}
-                    component={Link}
-                    to={item.to}
-                    label={item.label}
-                    leftSection={item.icon}
-                    active={isActive(pathname, item.to)}
-                    fz="md"
-                    py={6}
-                    onClick={closeNav}
-                  />
-                ))}
-              </Box>
+          <Stack gap={4} pb="sm">
+            {NAV_ITEMS.map((item) => (
+              <NavLink
+                key={item.to}
+                component={Link}
+                to={item.to}
+                label={item.label}
+                leftSection={item.icon}
+                active={isActive(pathname, item.to)}
+                fz="md"
+                py={8}
+                onClick={closeNav}
+              />
             ))}
           </Stack>
         </AppShell.Section>
-
-        {/* Instance identity is "which process am I talking to", so it stays
-            visible on every page instead of being a homepage banner. */}
-        {summary.data && (
-          <AppShell.Section p="sm" style={{ borderTop: '1px solid var(--app-shell-border-color)' }}>
-            <Stack gap={2}>
-              <IdentityRow label="监听">
-                <Text fz={10} ff="monospace" c="dimmed">
-                  127.0.0.1:8787
-                </Text>
-              </IdentityRow>
-              <IdentityRow label="版本">
-                <Tooltip label={summary.data.version} fz="xs">
-                  <Text
-                    fz={10}
-                    ff="monospace"
-                    c="dimmed"
-                    truncate
-                    style={{ maxWidth: 118, cursor: 'help' }}
-                  >
-                    {summary.data.version}
-                  </Text>
-                </Tooltip>
-              </IdentityRow>
-              <IdentityRow label="Instance">
-                <IdChip value={summary.data.instance_id} width={118} />
-              </IdentityRow>
-            </Stack>
-          </AppShell.Section>
-        )}
       </AppShell.Navbar>
 
       <AppShell.Main>
-        {/* Dashboard 的表格、Workbench 与详情面板需要使用导航之外的完整
-            可用宽度；阅读型文案在各组件内部自行限制行宽。 */}
         <Box p={{ base: 'md', sm: 'lg' }} style={{ width: '100%' }}>
           {children}
         </Box>
       </AppShell.Main>
     </AppShell>
-  )
-}
-
-function IdentityRow({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <Group justify="space-between" gap="xs" wrap="nowrap">
-      <Text fz={10} c="dimmed">
-        {label}
-      </Text>
-      {children}
-    </Group>
   )
 }
 

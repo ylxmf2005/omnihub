@@ -363,7 +363,7 @@ func TestAllContractSchemasAreJSON(t *testing.T) {
 	}
 }
 
-func TestCredentialSchemasSeparateMaskedAndExplicitValue(t *testing.T) {
+func TestCredentialSchemasNeverExposeValue(t *testing.T) {
 	artifacts, err := Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +377,12 @@ func TestCredentialSchemasSeparateMaskedAndExplicitValue(t *testing.T) {
 	}
 	detail := schemaObject(t, artifacts.Schemas.CredentialDetail)["properties"].(map[string]any)
 	if _, ok := detail["value"]; !ok {
-		t.Fatal("credential detail misses explicit value")
+		t.Fatal("internal credential detail schema unexpectedly lost value")
+	}
+	credentialGET := artifacts.OpenAPI.Paths["/v1/credentials/{id}"]["get"].(map[string]any)
+	parameters := credentialGET["parameters"].([]any)
+	if len(parameters) != 1 {
+		t.Fatalf("credential GET parameters = %#v, want path id only", parameters)
 	}
 }
 

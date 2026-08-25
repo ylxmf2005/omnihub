@@ -7,7 +7,6 @@
 
 | 文件 | 来源端点 |
 | --- | --- |
-| `summary.json` | `GET /v1/dashboard/summary` |
 | `readiness.json` | `GET /v1/readiness` |
 | `channels.json` | `GET /v1/channels` |
 | `views.json` | `GET /v1/views` |
@@ -17,9 +16,9 @@
 | `egress-profiles.json` | `GET /v1/egress-profiles` |
 | `browser-bridges.json` | `GET /v1/browser-bridges` |
 
-演示模式（`VITE_OMNIHUB_LIVE` 未设为 `1`）从这里读数据；真实模式走同一套 hooks 与类型，只把数据源换成 `fetch`。因此演示界面不会和真实结果脱节。
+显式设置 `VITE_OMNIHUB_DEMO=1` 时从这里读数据；默认模式访问真实后端。
 
-Credentials、Collections、Endpoint Profiles、Semantic Profiles 没有 fixture：它们在真实实例上本来就是空列表，演示模式返回空集合即可，页面渲染的是真实的空状态。
+访问密钥和 Endpoint Profiles 没有 fixture；演示模式返回空集合。
 
 ## 唯一的加工：删字段，不改值
 
@@ -31,7 +30,7 @@ snapshot.state_keys      内部记账
 run.result / run.request 完整 Envelope 与请求
 ```
 
-保留下来的每个字段都是后端原值。需要这些字段的页面（Run 详情、Snapshot、Query Workbench）在真实模式下自己取，不要把它们塞回这里。
+保留下来的每个字段都是后端原值。活动详情和订阅内容在真实模式下单独读取，不要把大字段塞回列表 fixture。
 
 重抓脚本见本文件末尾。
 
@@ -131,7 +130,6 @@ def strip_run(run):
     return run
 
 targets = {
-    "summary.json":         ("/v1/dashboard/summary", None),
     "readiness.json":       ("/v1/readiness", None),
     "channels.json":        ("/v1/channels", None),
     "egress-profiles.json": ("/v1/egress-profiles", None),
