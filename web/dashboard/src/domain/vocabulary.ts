@@ -190,7 +190,7 @@ export const LIMITATION_COPY: Record<string, string> = {
 	algolia_derived_index: '这是官网采用的 Algolia 派生索引，不是 HN 原始数据库',
 	hn_algolia_time_precision_second: 'HN Algolia 上游时间只有秒级精度',
 	hn_algolia_first_page: '只读取了 HN Algolia 搜索首屏',
-	discourse_search_first_page: '只读取了 Discourse 搜索首屏',
+	discourse_search_page: '当前结果来自 Discourse 搜索分页',
 	v2ex_not_native_search: 'V2EX 没有官方全文 Search，这条路线使用限定域名的 Web 索引',
   rsshub_route_metadata_version_dependent: '字段随 RSSHub 路由版本变化',
 }

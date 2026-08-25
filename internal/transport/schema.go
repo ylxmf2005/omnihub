@@ -567,8 +567,16 @@ func applyContractConstraints(schema *jsonschema.Schema, typ reflect.Type) {
 		applyRoutePolicyConstraints(routePolicy)
 	}
 	if continuation := schema.Properties["continuation"]; continuation != nil && continuation.Type != "object" {
-		continuation.Types = []string{"null"}
-		continuation.Type = ""
+		if typ == reflect.TypeFor[core.SearchInput]() || typ == reflect.TypeFor[core.Operation]() {
+			continuation.Types = []string{"string", "null"}
+			continuation.Type = ""
+			minimum, maximum := 68, 68
+			continuation.MinLength, continuation.MaxLength = &minimum, &maximum
+			continuation.Pattern = `^ctn_[0-9a-f]{64}$`
+		} else {
+			continuation.Types = []string{"null"}
+			continuation.Type = ""
+		}
 	}
 	if request := schema.Properties["request"]; request != nil {
 		applyContractConstraints(request, reflect.TypeFor[core.Operation]())
@@ -782,13 +790,27 @@ func applyEnvelopeConstraints(schema *jsonschema.Schema) {
 	}
 	if continuation := schema.Properties["continuation"]; continuation != nil {
 		if mode := continuation.Properties["mode"]; mode != nil {
-			value := any("none")
-			mode.Const = &value
+			mode.Enum = []any{"none", "opaque"}
 		}
 		if token := continuation.Properties["token"]; token != nil {
 			token.Type = ""
-			token.Types = []string{"null"}
+			token.Types = []string{"string", "null"}
+			minimum, maximum := 68, 68
+			token.MinLength, token.MaxLength = &minimum, &maximum
+			token.Pattern = `^ctn_[0-9a-f]{64}$`
 		}
+		none, opaque := any("none"), any("opaque")
+		minimum, maximum := 68, 68
+		continuation.AllOf = append(continuation.AllOf,
+			&jsonschema.Schema{
+				If:   &jsonschema.Schema{Required: []string{"mode"}, Properties: map[string]*jsonschema.Schema{"mode": {Const: &none}}},
+				Then: &jsonschema.Schema{Properties: map[string]*jsonschema.Schema{"token": {Types: []string{"null"}}}},
+			},
+			&jsonschema.Schema{
+				If:   &jsonschema.Schema{Required: []string{"mode"}, Properties: map[string]*jsonschema.Schema{"mode": {Const: &opaque}}},
+				Then: &jsonschema.Schema{Required: []string{"token"}, Properties: map[string]*jsonschema.Schema{"token": {Type: "string", MinLength: &minimum, MaxLength: &maximum, Pattern: `^ctn_[0-9a-f]{64}$`}}},
+			},
+		)
 		requireArray(continuation.Properties["limitations"], false)
 	}
 	if items := schema.Properties["items"]; items != nil && items.Items != nil {

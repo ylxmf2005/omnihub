@@ -54,7 +54,7 @@
 - `route_policy` 是选择 Channel 的策略；`mode` 为 `auto | prefer | only | exclude`。`prefer/only/exclude` 数组可以组合；`prefer | only | exclude` mode 要求对应数组非空，`auto` 可不带 selector，也可带组合 hint。`aggregate=false` 时每个 Source 默认只执行一个首选 Channel；`allow_fallback` 控制失败后能否改走已披露的备选 Channel。selector 必须显式标注 `channel | provider`，不能靠 ID 字符串猜类型。
 - `identity_dedupe` v1 为 `none | exact`；`similarity_grouping` 为 `off | semantic`，默认 `off`。semantic 只分组，不删除、折叠或 rerank 不同 Item。
 - `semantic_profile_id` 在 grouping=`semantic` 时必填，其他模式省略；它只选择 embedding 配置，不改变 Channel 路由或网络出口。Fetch 不支持 semantic grouping。
-- `continuation` 只能使用 OmniHub 签发的不透明 token；调用方不能传 Adapter cursor。Stage 2 尚未签发 token，因此任何非 null continuation 都在上游调用前拒绝。
+- `continuation` 只能使用 OmniHub Backend Query Session 签发的不透明 token；调用方不能传 Adapter cursor。token 绑定除页大小和 deadline 外的查询条件，单次消费且仅在当前进程的 15 分钟 TTL 内有效。
 
 ## 2. Result Envelope
 
@@ -667,7 +667,7 @@ Feed 支持 ETag/Last-Modified，并暴露 snapshot 时间与 stale 状态。
 
 Run claim/renew/finish 使用 compare-and-swap revision 与 lease。SQLite v1 仍走同一状态转换；未来 MySQL 多实例不得重新定义 Run 语义。进程内 singleflight 只减少本机重复执行，不能代替持久 Run 幂等和 lease。
 
-Query Workbench Run 的 `request` 直接保存现有规范化 Operation；View refresh Run 从当前 View 读取同一 Operation。v1 不增加 Query Session、可恢复 merge buffer 或新的 cursor 合同。Channel Probe Run 的终态事实保存在持久 Probe health，因而允许 `result=null`；查询与刷新 Run 仍以内嵌同一 Envelope 为终态结果。Probe 目标不健康时 Run 为 `failed`，并同时保存可用的脱敏 health 事实；这让 CLI 失败码与 Run 状态一致，不增加第二套 partial 规则。只有 Probe 引擎、lease 或持久化失败且没有可信报告时才不写 health。
+Query Workbench 的同步搜索可使用 Backend 进程内 Query Session；它保存 Provider cursor、merge buffer 与消费位置，不创建 Run，也不持久化为用户资源。View refresh Run 仍从当前 View 读取规范化 Operation，不能保存临时 continuation。Channel Probe Run 的终态事实保存在持久 Probe health，因而允许 `result=null`；查询与刷新 Run 仍以内嵌同一 Envelope 为终态结果。Probe 目标不健康时 Run 为 `failed`，并同时保存可用的脱敏 health 事实；只有 Probe 引擎、lease 或持久化失败且没有可信报告时才不写 health。
 
 ## 11. OPML 与 Source Bundle
 
@@ -853,7 +853,7 @@ Chrome 或 Bridge 离线时，依赖 Cookie 的 Channel 立即以 check/error co
 
 - Query Plane 多 Channel 一次性请求只承诺 bounded first window；无法稳定续页时不签发 token。
 - 单 Channel 的 Provider cursor 留在 Adapter Result 内部，不直接暴露给调用方。
-- 服务端 Query Session 或 View 可以保存每 Channel cursor、已消费位置与 merge buffer，并签发有 TTL 的 opaque continuation token。
+- Dashboard Backend Query Session 保存每 Channel cursor、已消费位置与 merge buffer，并签发 15 分钟 TTL、单次消费的 opaque continuation token；View 不保存临时 token。
 - token 与原请求 scope/policy 绑定；参数变化后必须拒绝继续。
 
 ## 16. 版本策略

@@ -152,6 +152,12 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	if err := searchSchema.Validate(&validDomainSearch); err != nil {
 		t.Fatalf("valid domain search schema input failed: %v", err)
 	}
+	continuationToken := "ctn_" + strings.Repeat("0", 64)
+	validContinuationSearch := cloneJSONMap(t, validSearch)
+	validContinuationSearch["continuation"] = continuationToken
+	if err := searchSchema.Validate(&validContinuationSearch); err != nil {
+		t.Fatalf("valid continuation search schema input failed: %v", err)
+	}
 	fetchSchema := resolvedSchema(t, artifacts.CLI.Commands[2].InputSchema)
 	validFetch := map[string]any{
 		"schema_version": core.SchemaVersion, "target": "octo/repository", "scope": map[string]any{"channels": []any{"github"}},
@@ -186,8 +192,8 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 		"trailing dot domain": func(value map[string]any) {
 			value["scope"] = map[string]any{"domains": []any{"example.com."}}
 		},
-		"blank domain": func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{" "}} },
-		"continuation": func(value map[string]any) { value["continuation"] = "provider-cursor" },
+		"blank domain":          func(value map[string]any) { value["scope"] = map[string]any{"domains": []any{" "}} },
+		"provider continuation": func(value map[string]any) { value["continuation"] = "provider-cursor" },
 		"semantic without profile": func(value map[string]any) {
 			value["similarity_grouping"] = "semantic"
 		},
@@ -254,6 +260,12 @@ func TestGeneratedOperationAndEnvelopeSchemasEnforceRuntimeBoundaries(t *testing
 	validEnvelope := contractExample(t, "../../shape/contract.md", 1)
 	if err := envelopeSchema.Validate(&validEnvelope); err != nil {
 		t.Fatalf("contract envelope failed generated schema: %v", err)
+	}
+	validContinuationEnvelope := cloneJSONMap(t, validEnvelope)
+	validContinuationEnvelope["request"].(map[string]any)["continuation"] = continuationToken
+	validContinuationEnvelope["continuation"] = map[string]any{"mode": "opaque", "token": continuationToken, "limitations": []any{"process_local"}}
+	if err := envelopeSchema.Validate(&validContinuationEnvelope); err != nil {
+		t.Fatalf("valid continuation envelope failed generated schema: %v", err)
 	}
 	withSkipped := cloneJSONMap(t, validEnvelope)
 	skipped := cloneJSONMap(t, withSkipped["executions"].([]any)[0].(map[string]any))

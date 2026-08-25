@@ -13,7 +13,7 @@ import {
 import { IconSearch } from '@tabler/icons-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useChannels, useRouteTemplates, useRunQuery } from '../api/queries'
-import type { Item, SearchInput, SearchSort } from '../api/types'
+import type { Envelope, Item, SearchInput, SearchSort } from '../api/types'
 import { CardRow, EmptyState, ErrorAlert, PageHeader, SectionCard } from '../components/layout'
 
 export function Workbench() {
@@ -29,6 +29,9 @@ export function Workbench() {
   const [authors, setAuthors] = useState('')
   const [categories, setCategories] = useState('')
   const [tags, setTags] = useState('')
+  const [pageSize, setPageSize] = useState(20)
+  const [pages, setPages] = useState<Envelope[]>([])
+  const [pageIndex, setPageIndex] = useState(0)
 
   const eligible = useMemo(() => {
     const capabilities = new Map(
@@ -46,13 +49,19 @@ export function Workbench() {
     }
   }, [eligible, initialized])
 
+  useEffect(() => {
+    setPages([])
+    setPageIndex(0)
+    search.reset()
+  }, [query, selected, from, to, sort, authors, categories, tags, pageSize])
+
   const split = (value: string) => value.split(',').map((part) => part.trim()).filter(Boolean)
-  const run = () => {
+  const request = (continuation?: string): SearchInput => {
     const time = {
       ...(from ? { from: new Date(from).toISOString() } : {}),
       ...(to ? { to: new Date(to).toISOString() } : {}),
     }
-    const body: SearchInput = {
+    return {
       schema_version: '1.0',
       query: query.trim(),
       scope: { channels: selected },
@@ -62,7 +71,7 @@ export function Workbench() {
         aggregate: true,
         allow_fallback: false,
       },
-      limit: 20,
+      limit: pageSize,
       constraints: {
         ...(Object.keys(time).length > 0 ? { time: { field: 'published_at' as const, ...time } } : {}),
         ...(split(authors).length > 0 ? { authors: split(authors) } : {}),
@@ -73,11 +82,37 @@ export function Workbench() {
       identity_dedupe: 'exact',
       similarity_grouping: 'off',
       deadline_ms: 30_000,
+      ...(continuation ? { continuation } : {}),
     }
-    search.mutate(body)
+  }
+
+  const run = () => {
+    search.mutate(request(), {
+      onSuccess: (result) => {
+        setPages([result])
+        setPageIndex(0)
+      },
+    })
+  }
+
+  const next = () => {
+    if (pageIndex + 1 < pages.length) {
+      setPageIndex(pageIndex + 1)
+      return
+    }
+    const token = pages[pageIndex]?.continuation.token
+    if (!token) return
+    search.mutate(request(token), {
+      onSuccess: (result) => {
+        setPages((current) => [...current, result])
+        setPageIndex((current) => current + 1)
+      },
+    })
   }
 
   const missing = query.trim() === '' || selected.length === 0
+  const current = pages[pageIndex]
+  const hasNext = pageIndex + 1 < pages.length || Boolean(current?.continuation.token)
 
   return (
     <Stack gap="lg">
@@ -127,7 +162,15 @@ export function Workbench() {
                 <TextInput label="标签" description="多个标签用逗号分隔" value={tags} onChange={(event) => setTags(event.currentTarget.value)} />
               </Stack>
             </details>
-            <Group justify="flex-end">
+            <Group justify="space-between" align="flex-end">
+              <Select
+                label="每页"
+                data={['10', '20', '50']}
+                value={String(pageSize)}
+                onChange={(value) => setPageSize(Number(value ?? 20))}
+                allowDeselect={false}
+                w={110}
+              />
               <Button leftSection={<IconSearch size={15} />} onClick={run} loading={search.isPending} disabled={missing}>
                 搜索
               </Button>
@@ -136,8 +179,19 @@ export function Workbench() {
         </CardRow>
       </SectionCard>
 
-      {search.error ? <ErrorAlert error={search.error} onRetry={run} /> : null}
-      <SearchResults items={search.data?.items} failed={search.data?.errors.length ?? 0} />
+      {search.error ? <ErrorAlert error={search.error} onRetry={pages.length > 0 ? next : run} /> : null}
+      <SearchResults items={current?.items} failed={current?.errors.length ?? 0} />
+      {current ? (
+        <Group justify="center">
+          <Button variant="default" disabled={pageIndex === 0 || search.isPending} onClick={() => setPageIndex(pageIndex - 1)}>
+            上一页
+          </Button>
+          <Text fz="sm" c="dimmed">第 {pageIndex + 1} 页</Text>
+          <Button variant="default" disabled={!hasNext || search.isPending} loading={search.isPending} onClick={next}>
+            下一页
+          </Button>
+        </Group>
+      ) : null}
     </Stack>
   )
 }

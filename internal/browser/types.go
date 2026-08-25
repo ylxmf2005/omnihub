@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -242,7 +243,8 @@ func validateDiscourseSearchRequest(request DiscourseSearchRequest) error {
 		return bridgeError(ErrorScopeInvalid, "browser search is limited to https://linux.do/search.json")
 	}
 	query := target.Query()
-	if len(query) != 2 || len(query["q"]) != 1 || strings.TrimSpace(query.Get("q")) == "" || len(query.Get("q")) > 4096 || len(query["page"]) != 1 || query.Get("page") != "1" {
+	page, pageErr := strconv.Atoi(query.Get("page"))
+	if len(query) != 2 || len(query["q"]) != 1 || strings.TrimSpace(query.Get("q")) == "" || len(query.Get("q")) > 4096 || len(query["page"]) != 1 || pageErr != nil || page < 1 || page > 10 || strconv.Itoa(page) != query.Get("page") {
 		return bridgeError(ErrorScopeInvalid, "browser search query is outside the supported Discourse scope")
 	}
 	return nil

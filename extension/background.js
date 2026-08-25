@@ -296,8 +296,8 @@ async function handleHostMessage(message) {
 }
 
 // This is deliberately not a generic fetch bridge. Both the Native Host and
-// the extension independently pin the request to linux.do's official first
-// search page, so granting one origin cannot be reused to browse arbitrary
+// the extension independently pin every request to linux.do's official search
+// endpoint and bounded page range, so granting one origin cannot browse arbitrary
 // paths or exfiltrate arbitrary authenticated pages.
 function validateDiscourseSearch(message) {
   if (message.permission_origin_pattern !== "https://linux.do/*") {
@@ -329,7 +329,7 @@ function validateDiscourseSearch(message) {
     target.searchParams.get("q").trim() === "" ||
     target.searchParams.get("q").length > 4096 ||
     target.searchParams.getAll("page").length !== 1 ||
-    target.searchParams.get("page") !== "1"
+    !/^(?:[1-9]|10)$/.test(target.searchParams.get("page"))
   ) {
     return { error: "search is outside the supported linux.do scope" };
   }

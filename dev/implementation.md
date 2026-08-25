@@ -61,6 +61,6 @@
 
 - 根因：普通 Go HTTP 请求在 linux.do `/search.json` 前被 Cloudflare challenge 403 拦截；已有 Extension 只把指定 Cookie 交给 Go，仍没有让请求进入真实 Chrome 网络会话。
 - 实现：`linux-do-discourse-search` 保留原 RouteTemplate ID 和 Endpoint/Channel 配置，Adapter 改为 `discourse_browser`。Extension 使用用户显式授权的 Chrome 会话发出 GET，后端复用既有 Discourse query 映射与 Item/Coverage 归一化；Envelope 将实际出口标为 `chrome_default/browser`，不再冒充 Endpoint 绑定的 direct Egress。
-- 安全边界：manifest 的 optional host permission 收窄为 `https://linux.do/*`；Native Host 与 Extension 双重验证 host、`/search.json`、非空 `q` 和 `page=1`，拒绝其他路径、域名、页码、redirect 与大于 512 KiB 的响应。Cookie 不离开 Chrome，Channel 不再接受 User API Key Credential。
+- 安全边界：manifest 的 optional host permission 收窄为 `https://linux.do/*`；Native Host 与 Extension 双重验证 host、`/search.json`、非空 `q` 和规范的 `page=1..10`，拒绝其他路径、域名、参数、redirect 与大于 512 KiB 的响应。Query Session 只向前端签发短 TTL opaque continuation，Discourse 页码留在后端；Cookie 不离开 Chrome，Channel 不再接受 User API Key Credential。
 - Dashboard：Chrome 授权面板按 RouteTemplate 的 `browser_cookie` auth 显示，不再依赖一条虚构的 `chrome_cookie` Credential；安装文档与内嵌静态资源已同步。
 - 聚焦反馈：扩展既有 `binding_test.go` 覆盖 Native Messaging 成功帧、越权 host/path/page 拒绝，以及浏览器响应到标准 Discourse Item 的归一化；`go test ./...`、Extension JavaScript syntax check 与 Dashboard production build 通过。真实 linux.do 成功查询仍需本机安装 Extension、登录并在 Chrome 权限弹窗中确认。

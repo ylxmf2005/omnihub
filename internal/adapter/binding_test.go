@@ -1779,7 +1779,7 @@ func TestOfficialSearchAdaptersMapTypedConstraintsAndResults(t *testing.T) {
 	t.Run("discourse_browser", func(t *testing.T) {
 		client := &fakeDiscourseBrowserClient{response: browser.DiscourseSearchResponse{
 			HTTPStatus: 200,
-			Body:       `{"posts":[{"id":10,"topic_id":20,"post_number":1,"username":"alice","created_at":"2026-08-20T10:00:00Z","blurb":"result body"}],"topics":[{"id":20,"title":"Result","slug":"result","category_id":3}],"grouped_search_result":{"more_posts":false,"more_topics":false}}`,
+			Body:       `{"posts":[{"id":10,"topic_id":20,"post_number":1,"username":"alice","created_at":"2026-08-20T10:00:00Z","blurb":"result body"}],"topics":[{"id":20,"title":"Result","slug":"result","category_id":3}],"grouped_search_result":{"more_posts":false,"more_topics":false,"more_full_page_results":true}}`,
 		}}
 		request := DiscourseRequest{
 			Operation: core.Operation{Operation: core.OperationSearch, Query: &query, Limit: 5, Sort: core.SearchSortNewest, Constraints: core.SearchConstraints{Time: core.SearchTimeConstraint{Field: core.SearchTimePublishedAt, From: &from}}},
@@ -1791,7 +1791,7 @@ func TestOfficialSearchAdaptersMapTypedConstraintsAndResults(t *testing.T) {
 			Endpoint: core.EndpointProfile{ID: "linux-endpoint", Provider: "discourse", BaseURL: "https://linux.do", EgressProfileID: "direct", Enabled: true}, Egress: egressProfile,
 		}
 		result := (DiscourseBrowserAdapter{Browser: client, Now: func() time.Time { return fixed }}).Execute(context.Background(), request)
-		if len(client.requests) != 1 || !strings.Contains(client.requests[0].URL, "/search.json?") || !strings.Contains(client.requests[0].URL, "page=1") || len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://linux.do/t/result/20/1" || result.ProviderState["auth_used"] != "true" {
+		if len(client.requests) != 1 || !strings.Contains(client.requests[0].URL, "/search.json?") || !strings.Contains(client.requests[0].URL, "page=1") || len(result.Errors) != 0 || len(result.Items) != 1 || result.Items[0].URL != "https://linux.do/t/result/20/1" || result.ProviderState["auth_used"] != "true" || result.NextCursor == nil || *result.NextCursor != "2" {
 			t.Fatalf("browser Discourse result = %#v, requests=%#v", result, client.requests)
 		}
 	})
@@ -2685,11 +2685,27 @@ func TestBrowserHostDiscourseSearchIsPinnedToAuthorizedLinuxDoPath(t *testing.T)
 	if result.err != nil || result.response.HTTPStatus != 200 || result.response.Body != body {
 		t.Fatalf("SearchDiscourse() = %#v, %v", result.response, result.err)
 	}
+	request.RequestID += "p2"
+	request.URL = "https://linux.do/search.json?q=deepseek&page=2"
+	go func() {
+		response, err := client.SearchDiscourse(context.Background(), request)
+		resultChannel <- browserSearchResult{response: response, err: err}
+	}()
+	forwarded = readBrowserWireFixture(t, host.output)
+	if forwarded.URL != request.URL {
+		t.Fatalf("forwarded page 2 = %#v", forwarded)
+	}
+	writeBrowserWireFixture(t, host.input, browserWireFixture{ProtocolVersion: "1.0", Type: "result", RequestID: request.RequestID, HTTPStatus: 200, Body: body})
+	if result = <-resultChannel; result.err != nil {
+		t.Fatalf("SearchDiscourse(page 2) error = %v", result.err)
+	}
 
 	for _, invalid := range []string{
 		"https://linux.do/admin/users.json?q=deepseek&page=1",
 		"https://example.com/search.json?q=deepseek&page=1",
-		"https://linux.do/search.json?q=deepseek&page=2",
+		"https://linux.do/search.json?q=deepseek&page=0",
+		"https://linux.do/search.json?q=deepseek&page=01",
+		"https://linux.do/search.json?q=deepseek&page=11",
 	} {
 		request.RequestID += "x"
 		request.URL = invalid

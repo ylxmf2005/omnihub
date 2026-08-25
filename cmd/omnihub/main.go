@@ -954,7 +954,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return exitInternal
 		}
 		browserClient := browser.NewClient(paths.RuntimeDir)
+		querySessions := query.NewSessionStore()
 		executeCatalog := func(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
+			return executeCatalogOperationWithStoreAndSessions(ctx, catalog, store, querySessions, operation)
+		}
+		executeSubscription := func(ctx context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
 			return executeCatalogOperationWithStore(ctx, catalog, store, operation)
 		}
 		execute := func(ctx context.Context, operation core.Operation) (core.Envelope, error) {
@@ -966,7 +970,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		managementService := &management.Service{Store: store, Catalog: catalog}
 		subscriptionService := &subscription.Service{
-			Store: store, LoadCatalog: load, Execute: executeCatalog, InstanceID: instanceID,
+			Store: store, LoadCatalog: load, Execute: executeSubscription, InstanceID: instanceID,
 		}
 		readinessReport := func(ctx context.Context) (readiness.Report, error) {
 			current, loadErr := load(ctx)
@@ -1167,6 +1171,10 @@ func executeCatalogOperation(ctx context.Context, catalog *registry.Catalog, ope
 }
 
 func executeCatalogOperationWithStore(ctx context.Context, catalog *registry.Catalog, store repository.Store, operation core.Operation) (core.Envelope, error) {
+	return executeCatalogOperationWithStoreAndSessions(ctx, catalog, store, nil, operation)
+}
+
+func executeCatalogOperationWithStoreAndSessions(ctx context.Context, catalog *registry.Catalog, store repository.Store, sessions *query.SessionStore, operation core.Operation) (core.Envelope, error) {
 	paths, err := resolveCLIPaths()
 	if err != nil {
 		return core.Envelope{}, fmt.Errorf("%w: %v", transport.ErrExecutionConfiguration, err)
@@ -1178,6 +1186,7 @@ func executeCatalogOperationWithStore(ctx context.Context, catalog *registry.Cat
 		Tavily: adapter.TavilyAdapter{}, XURL: adapter.XURLAdapter{}, Discourse: adapter.DiscourseAdapter{},
 		DiscourseBrowser: adapter.DiscourseBrowserAdapter{Browser: browserClient},
 		Arxiv:            adapter.ArxivAdapter{}, HNAlgolia: adapter.HNAlgoliaAdapter{}, CookieReader: browserClient,
+		Sessions: sessions,
 	}
 	if operation.SimilarityGrouping == core.SimilaritySemantic {
 		if store == nil {

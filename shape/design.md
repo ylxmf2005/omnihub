@@ -105,7 +105,7 @@ skills/omnihub          Agent Skill
 - Feed 只投影 Snapshot；它不是新的搜索实现。
 - Dashboard 管理同一份 RouteTemplate、Channel、Endpoint、Credential、Collection、View、Run 与 readiness；前端由另一 Agent 实现。
 
-把两者分开可以避免“为了输出 RSS，所有 CLI 用户都必须跑长期服务”，也避免让无状态 CLI 假装能提供稳定的跨 Provider continuation。
+把两者分开可以避免“为了输出 RSS，所有 CLI 用户都必须跑长期服务”。Dashboard Backend 的短生命周期 Query Session 提供跨 Provider continuation；无状态 CLI 与 View 不假装能恢复这个进程内状态。
 
 ## 4. Registry 与 Router
 
@@ -344,7 +344,7 @@ Adapter 应尊重 ETag/Last-Modified、RSS TTL、Cache-Control、Expires 和 Ret
 
 - Channel 内的 Provider cursor 是 Adapter 私有实现细节。
 - Query Plane 多 Channel 只承诺 first window；coverage 标记 truncated，不伪造全局 `next_cursor`。
-- Subscription Plane/Query Session 只有在持久化每 Channel cursor、buffer 和消费位置后才签发 opaque token。
+- Query Session 只有在当前 Backend 进程保存每 Channel cursor、buffer 和消费位置后才签发 opaque token；token 单次消费、15 分钟过期，重启后失效。Subscription View 不持久化临时 token。
 - 搜索 merge 可以参考各 Channel position 与 Provider weight，但必须保留 observation positions；跨 Provider score 不视为可直接比较的“真分数”。
 - 排序用 canonical URL/稳定 ID 打破平局，保证同输入同响应可重复。
 

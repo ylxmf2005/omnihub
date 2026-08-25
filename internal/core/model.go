@@ -396,5 +396,7 @@ type AdapterResult struct {
 	Errors        []Error           `json:"errors"`
 	Limitations   []string          `json:"limitations,omitempty"`
 	ProviderState map[string]string `json:"provider_state,omitempty"`
-	FreshUntil    *time.Time        `json:"fresh_until,omitempty"`
+	// NextCursor 只在 Query Service 内流转，不能进入 Envelope 或公共 token。
+	NextCursor *string    `json:"-"`
+	FreshUntil *time.Time `json:"fresh_until,omitempty"`
 }

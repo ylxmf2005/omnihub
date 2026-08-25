@@ -21,6 +21,7 @@ const maxDiscourseResponseBytes int64 = 4 << 20
 
 type DiscourseRequest struct {
 	Operation        core.Operation
+	Cursor           *string
 	Channel          core.Channel
 	RouteTemplate    core.RouteTemplate
 	Endpoint         core.EndpointProfile
@@ -38,8 +39,9 @@ type discourseSearchResponse struct {
 	Posts               []discoursePost  `json:"posts"`
 	Topics              []discourseTopic `json:"topics"`
 	GroupedSearchResult struct {
-		MorePosts  *bool `json:"more_posts"`
-		MoreTopics *bool `json:"more_topics"`
+		MorePosts           *bool `json:"more_posts"`
+		MoreTopics          *bool `json:"more_topics"`
+		MoreFullPageResults *bool `json:"more_full_page_results"`
 	} `json:"grouped_search_result"`
 }
 
@@ -157,7 +159,15 @@ func discourseRequestURL(request DiscourseRequest, adapterName, testBaseURL stri
 	base.Path = "/search.json"
 	parameters := base.Query()
 	parameters.Set("q", query)
-	parameters.Set("page", "1")
+	page := 1
+	if request.Cursor != nil {
+		parsed, parseErr := strconv.Atoi(*request.Cursor)
+		if parseErr != nil || parsed < 1 || parsed > 10 || strconv.Itoa(parsed) != *request.Cursor {
+			return nil, &core.Error{Code: core.ErrorParameter, Message: "Discourse cursor is invalid"}
+		}
+		page = parsed
+	}
+	parameters.Set("page", strconv.Itoa(page))
 	base.RawQuery = parameters.Encode()
 	return base, nil
 }
@@ -204,8 +214,9 @@ func normalizeDiscourse(request DiscourseRequest, result core.AdapterResult, doc
 		topics[topic.ID] = topic
 	}
 	posts := document.Posts
-	if len(posts) > request.Operation.Limit {
-		posts = posts[:request.Operation.Limit]
+	page := 1
+	if request.Cursor != nil {
+		page, _ = strconv.Atoi(*request.Cursor)
 	}
 	items := make([]core.Item, 0, len(posts))
 	for index, post := range posts {
@@ -215,17 +226,22 @@ func normalizeDiscourse(request DiscourseRequest, result core.AdapterResult, doc
 			return officialSearchFailure(request.Channel, request.RouteTemplate, result, core.ErrorProtocol, "Discourse response contains invalid post metadata", false, map[string]any{"result_index": index})
 		}
 		canonicalURL := fmt.Sprintf("https://linux.do/t/%s/%d/%d", url.PathEscape(topic.Slug), topic.ID, post.PostNumber)
-		upstreamID, rank := strconv.FormatInt(post.ID, 10), index+1
+		upstreamID, rank := strconv.FormatInt(post.ID, 10), (page-1)*50+index+1
 		summary := optionalTrimmed(html.UnescapeString(post.Blurb))
 		publishedAt = publishedAt.UTC()
-		items = append(items, core.Item{URL: canonicalURL, Title: strings.TrimSpace(topic.Title), Summary: summary, Content: core.Content{Role: core.ContentSnippet, Text: summary, SourceSupplied: summary != nil}, PublishedAt: &publishedAt, Authors: []core.Author{{Name: post.Username}}, Tags: []string{strconv.FormatInt(topic.Category, 10)}, Observations: []core.Observation{{Source: request.Channel.Source, Provider: request.RouteTemplate.Provider, ChannelID: request.Channel.ID, RouteTemplateID: request.RouteTemplate.RouteTemplateID, Endpoint: request.Endpoint.ID, UpstreamID: &upstreamID, OriginalURL: canonicalURL, CanonicalURL: canonicalURL, RetrievedAt: retrievedAt, Rank: &rank, Verification: core.VerificationBody, Limitations: []string{"discourse_search_first_page"}}}})
+		items = append(items, core.Item{URL: canonicalURL, Title: strings.TrimSpace(topic.Title), Summary: summary, Content: core.Content{Role: core.ContentSnippet, Text: summary, SourceSupplied: summary != nil}, PublishedAt: &publishedAt, Authors: []core.Author{{Name: post.Username}}, Tags: []string{strconv.FormatInt(topic.Category, 10)}, Observations: []core.Observation{{Source: request.Channel.Source, Provider: request.RouteTemplate.Provider, ChannelID: request.Channel.ID, RouteTemplateID: request.RouteTemplate.RouteTemplateID, Endpoint: request.Endpoint.ID, UpstreamID: &upstreamID, OriginalURL: canonicalURL, CanonicalURL: canonicalURL, RetrievedAt: retrievedAt, Rank: &rank, Verification: core.VerificationBody, Limitations: []string{"discourse_search_page"}}}})
 	}
 	examined, returned := len(document.Posts), len(items)
-	exhaustive := !(document.GroupedSearchResult.MorePosts != nil && *document.GroupedSearchResult.MorePosts || document.GroupedSearchResult.MoreTopics != nil && *document.GroupedSearchResult.MoreTopics)
-	limitations := []string{"discourse_search_first_page"}
+	hasMore := document.GroupedSearchResult.MorePosts != nil && *document.GroupedSearchResult.MorePosts || document.GroupedSearchResult.MoreTopics != nil && *document.GroupedSearchResult.MoreTopics || document.GroupedSearchResult.MoreFullPageResults != nil && *document.GroupedSearchResult.MoreFullPageResults
+	exhaustive := !hasMore
+	limitations := []string{"discourse_search_page"}
 	result.Items = items
-	result.Coverage = []core.Coverage{{Source: request.Channel.Source, ChannelID: request.Channel.ID, RouteTemplateID: request.RouteTemplate.RouteTemplateID, Scope: "discourse_search_first_page", Examined: &examined, Returned: &returned, Exhaustive: &exhaustive, Truncated: !exhaustive, Limitations: limitations}}
+	result.Coverage = []core.Coverage{{Source: request.Channel.Source, ChannelID: request.Channel.ID, RouteTemplateID: request.RouteTemplate.RouteTemplateID, Scope: fmt.Sprintf("discourse_search_page_%d", page), Examined: &examined, Returned: &returned, Exhaustive: &exhaustive, Truncated: !exhaustive, Limitations: limitations}}
 	result.Limitations = limitations
+	if hasMore {
+		next := strconv.Itoa(page + 1)
+		result.NextCursor = &next
+	}
 	return result
 }
 

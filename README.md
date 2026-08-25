@@ -8,7 +8,7 @@
 
 OmniHub 是本地优先的 Go CLI/MCP Server。CLI、REST、MCP、持久 View 与配套 Skill 共用同一份 `Operation → Envelope` 合同；每条结果都保留实际 Source、Provider、Channel、RouteTemplate、URL、覆盖范围和错误终态。
 
-> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl、可选 semantic grouping，以及 JSON、JSONL、REST、MCP、Dashboard Backend、持久 Run/View、RSS/Atom/JSON Feed、Chrome Native Host/Bridge Backend 和 Agent Skill。Dashboard 前端与 Chrome Companion Extension 不在本仓库中，因此不能据此宣称某个 Cookie 来源已经 ready。
+> 当前为 `0.1.x` preview。已实现 Direct Feed、RSSHub、GitHub Repository Search/metadata fetch、Tavily Search、X/xurl、可选 semantic grouping，以及 JSON、JSONL、REST、MCP、Dashboard、持久 Run/View、RSS/Atom/JSON Feed、Chrome Companion/Native Host 和 Agent Skill。来源是否 ready 仍以当前配置、权限与运行检查为准，不能只根据代码中存在对应 Adapter 判断。
 
 ```text
 Agent / App ── CLI / REST / MCP ── Operation Service ── Router ── Providers
@@ -463,7 +463,7 @@ omnihub chrome-host uninstall
 
 Chrome 会按 manifest 直接启动同一个二进制；一般不需要手工运行 `chrome-host run`。`uninstall` 只注销精确的 Native Host 注册，不删除 OmniHub binary、SQLite、配置或 cache。
 
-本仓库的 `extension/` 包含可直接 Load unpacked 的 Chrome Companion Extension。当前产品路线只允许用户显式授权 `https://linux.do/*`，并只在 Chrome 会话内执行内建的 `/search.json` 第一页请求；Host 与 Extension 会分别拒绝其他 host、path 与 page。Cookie 不离开 Chrome，不写 SQLite、不经过 Dashboard HTTP，也不进入 Run、Error 或日志。安装与授权步骤见 `extension/README.md`。
+本仓库的 `extension/` 包含可直接 Load unpacked 的 Chrome Companion Extension。当前产品路线只允许用户显式授权 `https://linux.do/*`，并只在 Chrome 会话内执行内建的 `/search.json` 分页请求；Host 与 Extension 会分别拒绝其他 host、path、额外 query key 与 1—10 之外的 page。前端只接触 OmniHub 的 opaque continuation，不接触 Discourse 页码。Cookie 不离开 Chrome，不写 SQLite、不经过 Dashboard HTTP，也不进入 Run、Error 或日志。安装与授权步骤见 `extension/README.md`。
 
 ## 出口、Probe 与诊断
 

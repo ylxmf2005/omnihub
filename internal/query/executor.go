@@ -103,7 +103,13 @@ type Service struct {
 	CookieReader     CookieReader
 	BrowserCookie    BrowserCookieExecutor
 	Semantic         SemanticGrouper
+	Sessions         *SessionStore
 	Now              func() time.Time
+
+	// resumeCursors/capturedCursors 只供 Query Session 在同一 Service 内重放
+	// Provider 后续窗；它们不会进入公共 Operation 或 Envelope。
+	resumeCursors   map[string]string
+	capturedCursors *map[string]string
 }
 
 // Execute 从同一份 Catalog 和 Operation 构建路由计划，并把所有已选择路径的
@@ -112,6 +118,9 @@ type Service struct {
 func (service Service) Execute(parent context.Context, catalog *registry.Catalog, operation core.Operation) (core.Envelope, error) {
 	if catalog == nil {
 		return core.Envelope{}, fmt.Errorf("%w: catalog is required", ErrInvalidExecutor)
+	}
+	if operation.Continuation != nil {
+		return service.resume(parent, catalog, operation)
 	}
 	now := service.Now
 	if now == nil {
@@ -175,7 +184,8 @@ func (service Service) Execute(parent context.Context, catalog *registry.Catalog
 		}
 	}
 
-	items, returnedByChannel, globallyTruncated := finalizeItems(run.items, operation)
+	baseCoverage := slices.Clone(run.coverage)
+	items, buffer, returnedByChannel, globallyTruncated := finalizeItemsWithBuffer(run.items, operation)
 	run.applyReturnedCounts(returnedByChannel, globallyTruncated)
 	if operation.SimilarityGrouping == core.SimilaritySemantic {
 		var problem *core.Error
@@ -198,6 +208,15 @@ func (service Service) Execute(parent context.Context, catalog *registry.Catalog
 	if finishedAt.Before(startedAt) {
 		finishedAt = startedAt
 	}
+	continuation := core.Continuation{Mode: "none", Limitations: []string{}}
+	if service.Sessions != nil && operation.Operation == core.OperationSearch && operation.SimilarityGrouping == core.SimilarityOff && (len(buffer) > 0 || len(run.cursors) > 0) {
+		session := newQuerySession(operation, requiredChannelIDs, run, baseCoverage, buffer, items)
+		token, tokenErr := service.Sessions.create(operation, session)
+		if tokenErr != nil {
+			return core.Envelope{}, tokenErr
+		}
+		continuation = core.Continuation{Token: token, Mode: "opaque", Limitations: []string{"query_session_process_ttl"}}
+	}
 	return core.BuildEnvelope(core.EnvelopeInput{
 		RequestID:          requestID,
 		Request:            operation,
@@ -206,9 +225,190 @@ func (service Service) Execute(parent context.Context, catalog *registry.Catalog
 		Items:              items,
 		Coverage:           run.coverage,
 		Errors:             run.problems,
-		Continuation:       core.Continuation{Mode: "none", Limitations: []string{}},
+		Continuation:       continuation,
 		StartedAt:          startedAt,
 		FinishedAt:         finishedAt,
+	})
+}
+
+func newQuerySession(operation core.Operation, selectedIDs []string, run executionRun, baseCoverage []core.Coverage, buffer []routedItem, delivered []core.Item) *querySession {
+	session := &querySession{
+		operation: operation, selectedIDs: slices.Clone(selectedIDs),
+		executions: make(map[string]core.Execution), coverage: make(map[string]core.Coverage),
+		errors: slices.Clone(run.problems), buffer: buffer,
+		cursors: make(map[string]string), seen: make(map[string]struct{}),
+	}
+	session.operation.Continuation = nil
+	for _, execution := range run.executions {
+		if execution.Status != core.ExecutionSkipped {
+			session.executions[execution.ChannelID] = execution
+		}
+	}
+	for _, observed := range baseCoverage {
+		session.coverage[observed.ChannelID] = observed
+	}
+	for channelID, cursor := range run.cursors {
+		session.cursors[channelID] = cursor
+	}
+	for _, item := range delivered {
+		session.seen[item.Identity.ClusterID] = struct{}{}
+	}
+	return session
+}
+
+func (service Service) resume(parent context.Context, catalog *registry.Catalog, operation core.Operation) (envelope core.Envelope, finalErr error) {
+	if service.Sessions == nil || operation.Continuation == nil {
+		return core.Envelope{}, fmt.Errorf("%w: %v", core.ErrInvalidOperation, ErrContinuation)
+	}
+	if err := operation.Validate(); err != nil {
+		return core.Envelope{}, err
+	}
+	token := *operation.Continuation
+	session, err := service.Sessions.acquire(token, operation)
+	if err != nil {
+		return core.Envelope{}, fmt.Errorf("%w: %v", core.ErrInvalidOperation, err)
+	}
+	defer func() {
+		if finalErr != nil {
+			service.Sessions.release(token, session)
+		}
+	}()
+
+	for len(session.buffer) < operation.Limit && len(session.cursors) > 0 {
+		before := len(session.buffer)
+		if err := service.fetchContinuationWindow(parent, catalog, operation, session); err != nil {
+			return core.Envelope{}, err
+		}
+		if len(session.buffer) == before && len(session.cursors) > 0 {
+			return core.Envelope{}, fmt.Errorf("%w: continuation made no progress", ErrInvalidExecutor)
+		}
+	}
+
+	count := min(operation.Limit, len(session.buffer))
+	page := append([]routedItem(nil), session.buffer[:count]...)
+	session.buffer = append([]routedItem(nil), session.buffer[count:]...)
+	items := make([]core.Item, 0, len(page))
+	returned := make(map[string]int)
+	for _, routed := range page {
+		items = append(items, routed.item)
+		for channelID := range routed.channelIDs {
+			returned[channelID]++
+		}
+		session.seen[routed.item.Identity.ClusterID] = struct{}{}
+	}
+
+	keep := len(session.buffer) > 0 || len(session.cursors) > 0
+	nextToken, err := service.Sessions.rotate(token, session, keep)
+	if err != nil {
+		return core.Envelope{}, err
+	}
+	continuation := core.Continuation{Mode: "none", Limitations: []string{}}
+	if nextToken != nil {
+		continuation = core.Continuation{Token: nextToken, Mode: "opaque", Limitations: []string{"query_session_process_ttl"}}
+	}
+	return buildSessionEnvelope(service, operation, session, items, returned, continuation)
+}
+
+func (service Service) fetchContinuationWindow(parent context.Context, catalog *registry.Catalog, request core.Operation, session *querySession) error {
+	channelIDs := make([]string, 0, len(session.cursors))
+	for channelID := range session.cursors {
+		channelIDs = append(channelIDs, channelID)
+	}
+	slices.Sort(channelIDs)
+	selectors := make([]core.RouteSelector, 0, len(channelIDs))
+	for _, channelID := range channelIDs {
+		selectors = append(selectors, core.RouteSelector{Kind: core.SelectorChannel, ID: channelID})
+	}
+	fetch := session.operation
+	fetch.Scope = core.Scope{Channels: channelIDs}
+	fetch.RoutePolicy = core.RoutePolicy{Mode: core.RouteOnly, Only: selectors, Aggregate: true}
+	fetch.Limit = 100
+	fetch.DeadlineMS = request.DeadlineMS
+	fetch.Continuation = nil
+
+	captured := make(map[string]string)
+	nextService := service
+	nextService.Sessions = nil
+	nextService.resumeCursors = session.cursors
+	nextService.capturedCursors = &captured
+	window, err := nextService.Execute(parent, catalog, fetch)
+	if err != nil {
+		return err
+	}
+	session.cursors = captured
+	for _, execution := range window.Executions {
+		if execution.Status != core.ExecutionSkipped {
+			session.executions[execution.ChannelID] = execution
+		}
+	}
+	for _, observed := range window.Coverage {
+		session.coverage[observed.ChannelID] = observed
+	}
+	session.errors = append(session.errors, window.Errors...)
+	for _, item := range window.Items {
+		if _, exists := session.seen[item.Identity.ClusterID]; exists {
+			continue
+		}
+		channels := make(map[string]struct{})
+		for _, observation := range item.Observations {
+			channels[observation.ChannelID] = struct{}{}
+		}
+		session.buffer = append(session.buffer, routedItem{item: item, channelIDs: channels})
+	}
+	if session.operation.IdentityDedupe == core.IdentityExact {
+		session.buffer = dedupeExact(session.buffer)
+	}
+	sortItems(session.buffer, session.operation)
+	return nil
+}
+
+func buildSessionEnvelope(service Service, operation core.Operation, session *querySession, items []core.Item, returned map[string]int, continuation core.Continuation) (core.Envelope, error) {
+	now := service.Now
+	if now == nil {
+		now = time.Now
+	}
+	started := now().UTC()
+	pending := make(map[string]bool)
+	for channelID := range session.cursors {
+		pending[channelID] = true
+	}
+	for _, routed := range session.buffer {
+		for channelID := range routed.channelIDs {
+			pending[channelID] = true
+		}
+	}
+	executions := make([]core.Execution, 0, len(session.selectedIDs))
+	coverage := make([]core.Coverage, 0, len(session.coverage))
+	for _, channelID := range session.selectedIDs {
+		if execution, ok := session.executions[channelID]; ok {
+			execution.Returned = returned[channelID]
+			execution.Limitations = appendUnique(execution.Limitations, "query_session_page")
+			executions = append(executions, execution)
+		}
+		if observed, ok := session.coverage[channelID]; ok {
+			value := returned[channelID]
+			observed.Returned = &value
+			if pending[channelID] {
+				exhaustive := false
+				observed.Exhaustive = &exhaustive
+				observed.Truncated = true
+			}
+			observed.Limitations = appendUnique(observed.Limitations, "query_session_page")
+			coverage = append(coverage, observed)
+		}
+	}
+	requestID, err := core.NewRequestID()
+	if err != nil {
+		return core.Envelope{}, err
+	}
+	finished := now().UTC()
+	if finished.Before(started) {
+		finished = started
+	}
+	return core.BuildEnvelope(core.EnvelopeInput{
+		RequestID: requestID, Request: operation, RequiredChannelIDs: session.selectedIDs,
+		Executions: executions, Items: items, Coverage: coverage, Errors: session.errors,
+		Continuation: continuation, StartedAt: started, FinishedAt: finished,
 	})
 }
 
@@ -224,6 +424,7 @@ type executionRun struct {
 	items      []routedItem
 	coverage   []core.Coverage
 	problems   []core.Error
+	cursors    map[string]string
 }
 
 // executeFallbacks 深度优先遍历当前失败 Channel 披露的 fallback。嵌套路线
@@ -342,7 +543,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			return false, fmt.Errorf("%w: Discourse executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
 		}
 		result = run.service.Discourse.Execute(childContext, adapter.DiscourseRequest{
-			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Operation: run.operation, Cursor: cursorFor(run.service.resumeCursors, decision.Channel.ID), Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
 		})
 	case "discourse_browser":
@@ -350,7 +551,7 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 			return false, fmt.Errorf("%w: browser Discourse executor is required for channel %s", ErrInvalidExecutor, decision.Channel.ID)
 		}
 		result = run.service.DiscourseBrowser.Execute(childContext, adapter.DiscourseRequest{
-			Operation: run.operation, Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
+			Operation: run.operation, Cursor: cursorFor(run.service.resumeCursors, decision.Channel.ID), Channel: decision.Channel, RouteTemplate: decision.RouteTemplate,
 			Endpoint: endpoint, Credential: credential, Egress: egress, EgressCredential: egressCredential,
 		})
 	case "arxiv":
@@ -428,6 +629,15 @@ func (run *executionRun) executeDecision(decision router.Decision) (bool, error)
 	result, normalizeErr := normalizeAdapterResult(result, decision, execution.StartedAt, provider.AllowsGlobalDiscovery)
 	if normalizeErr != nil {
 		return false, normalizeErr
+	}
+	if result.NextCursor != nil {
+		if run.cursors == nil {
+			run.cursors = make(map[string]string)
+		}
+		run.cursors[decision.Channel.ID] = *result.NextCursor
+		if run.service.capturedCursors != nil {
+			(*run.service.capturedCursors)[decision.Channel.ID] = *result.NextCursor
+		}
 	}
 	examinedFallback := len(result.Items)
 	var unknownTimeExcluded bool
@@ -780,18 +990,25 @@ type routedItem struct {
 }
 
 func finalizeItems(items []routedItem, operation core.Operation) ([]core.Item, map[string]int, map[string]bool) {
+	result, _, returned, truncated := finalizeItemsWithBuffer(items, operation)
+	return result, returned, truncated
+}
+
+func finalizeItemsWithBuffer(items []routedItem, operation core.Operation) ([]core.Item, []routedItem, map[string]int, map[string]bool) {
 	if operation.IdentityDedupe == core.IdentityExact {
 		items = dedupeExact(items)
 	}
 	sortItems(items, operation)
 
 	globallyTruncated := make(map[string]bool)
+	var buffer []routedItem
 	if len(items) > operation.Limit {
 		for _, discarded := range items[operation.Limit:] {
 			for channelID := range discarded.channelIDs {
 				globallyTruncated[channelID] = true
 			}
 		}
+		buffer = append([]routedItem(nil), items[operation.Limit:]...)
 		items = items[:operation.Limit]
 	}
 
@@ -803,7 +1020,15 @@ func finalizeItems(items []routedItem, operation core.Operation) ([]core.Item, m
 		}
 		result = append(result, routed.item)
 	}
-	return result, returnedByChannel, globallyTruncated
+	return result, buffer, returnedByChannel, globallyTruncated
+}
+
+func cursorFor(cursors map[string]string, channelID string) *string {
+	if value, ok := cursors[channelID]; ok {
+		copy := value
+		return &copy
+	}
+	return nil
 }
 
 func dedupeExact(items []routedItem) []routedItem {

@@ -35,7 +35,7 @@
 - 发布路线采用五个纵切，而不是继续维护十个互相重叠的阶段：可信出站；代表 Provider 与 Agent Query 公共出口；Subscription 与 Dashboard Backend；Chrome Bridge Backend；本地 semantic grouping 与发布候选。
 - Stage B 的代表 Provider 已冻结为窄能力：GitHub 只检索 Repository metadata 并按仓库读取 metadata，Token 可选；Tavily 默认 basic、最多 20 条且不取 answer/raw content/images，结果 Source 取规范化目标 hostname、Provider 固定为 tavily；xurl 只接受 direct/environment/http_proxy，SOCKS5 fail-closed，命令执行不伪造分层网络观测。
 - Stage C 的管理边界已冻结：生产 Dashboard 与 Backend 同源，开发态只允许一个显式 loopback Origin；删除不级联或静默解绑，Credential 撤销会清值并阻断依赖 Channel；`ready_dependent` 只在 readiness 的 route-group 聚合读模型中出现，并且只聚合除 Egress 外完全相同的执行路线；成功 Probe TTL 为 15 分钟、瞬时失败为 5 分钟。每个 View 只暴露当前成功 Snapshot，Run/Probe 30 天、identity tombstone 180 天、孤立 embedding 30 天；v1 只提供默认 dry-run 的显式 `maintenance prune`，由用户或外部 cron 加 `--apply` 执行，不在 `serve` 启动或普通读取时隐式删除。
-- Stage C 的剩余执行语义已由 Agent 按本地 MVP 收口：无 Snapshot 的首次有界刷新失败返回 `503 Service Unavailable`、`Retry-After: 60` 与 RFC 9457；Query Workbench Run 直接保存现有规范化 Operation，不引入 Query Session/cursor 模型。可写资源使用 `POST` 创建、`PUT + If-Match` 完整替换，不实现 partial PATCH 或 preview 兼容；Credential 通过显式 revoke action 清值并 disable，仍被引用的普通资源删除返回 409。View 的 Operation 创建后不可变，更新只允许名称与启用状态变化；disabled View 可分发既有 Snapshot，但不会产生任何刷新。
+- Stage C 原先按无状态首窗收口 Query Workbench；2026-08-25 用户以真实 linux.do 搜索确认 Dashboard 的固定 `limit=20` 同时混淆了“每页显示条数”和“来源检索窗口”，并明确要求前端控制 10/20/50 条每页且支持真实分页。当前修订引入 Backend 进程内、短 TTL 的 Query Session：只向调用方签发不透明 continuation，保存各 Channel 私有 cursor、待消费 merge buffer 与去重位置；进程重启或过期后 token 明确失效，不把 Provider 页码暴露给前端。View refresh 仍直接保存规范化 Operation，不持久化临时 Query Session。
 - Stage C 的 Snapshot/Probe 取舍按 Ponytail full 冻结：Snapshot 内容保持 immutable append-only，`current_view_snapshots` 每个 View 只保存一个当前指针；新 Snapshot、指针、checkpoint、tombstone 与 Run 终态同事务提交，避免为“只留一份”隐式覆盖用户数据。旧 schema Snapshot 不参与读取；v0.1 不隐式覆盖或删除非当前 Snapshot，也不暴露历史读取 API，磁盘增长达到真实阈值后再以用户明确授权的 compaction 处理。Snapshot 保存实际执行 StateKey，identity tombstone 只过滤命中的 Observation，仍有其他 provenance 时保留 Item。持久 Probe 只保存脱敏 health 投影；v0.1 的分层 Probe 只覆盖 Feed/RSSHub，GitHub、Tavily 与 xurl 明确返回 unsupported，不拿普通查询冒充诊断。
 - Stage D 原先只交付 Chrome Bridge/Native Host 与 mock consumer；2026-08-21 用户新增确认后，仓库已纳入可 Load unpacked 的 Extension 和 linux.do 专用浏览器搜索 consumer。它不是通用 Cookie Adapter 或通用浏览器代理；Host 安装仍必须接收一个精确 Extension ID。
 - Chrome Bridge 离线或 permission 缺失时，依赖它的 Channel 当前不可执行，readiness 始终为 `blocked`；已有成功 Snapshot 的 View 仍可作为 `stale` 分发。历史 Probe 不能把当前缺失的运行依赖降格成仅 `degraded`。
@@ -65,7 +65,8 @@
 - 删除独立的 Collections、Semantic Profiles、Connections、Credentials、Browser Bridge、Catalog、Diagnostics 页面与旧路由；仍有用户价值的来源认证、Chrome 连接和失败证据重写进对应主流程。Channel、View 与 Run 的详情可以作为主流程的对象详情存在，不作为独立产品概念宣传。
 - 删除 Dashboard 的明文凭据读取和显示能力，并删除 HTTP 管理面 `include_value=true` 的明文返回；凭据只允许创建、轮换、撤销和查看是否已配置。
 - 定义 Channel、RouteTemplate、Credential 与 Browser Bridge；支持 Dashboard 录入 API Key、用户授权 Chrome 域权限、打开登录页、按执行读取 Cookie、撤销授权并查看分层健康。
-- 实现 Chrome Companion Extension、Native Messaging Host 与 linux.do 专用浏览器搜索合同；只允许用户显式授权 `https://linux.do/*`，只执行 `/search.json` 第一页 GET。
+- 实现 Chrome Companion Extension、Native Messaging Host 与 linux.do 专用浏览器搜索合同；只允许用户显式授权 `https://linux.do/*`，并允许后端签发的 Query Session 在同一受限 `/search.json` GET 上请求正整数 `page`。页码仍由 Host 与 Extension 双重校验，前端只接触 OmniHub continuation。
+- Dashboard 搜索页由用户选择 10/20/50 条每页，显示上一页、下一页和当前页；查询条件或页大小变化后从第一页重新建立 Query Session。后端 `limit` 表示本次响应页大小，不再由 Dashboard 固定为 20。
 - 实现显式 EgressProfile、Endpoint×Egress 绑定与主动分层网络 Probe；该能力属于 Stage A，不反向进入 Stage 3 验收。
 - 用代表性路线验证抽象：Direct Feed、RSSHub、GitHub、Tavily、X、Discourse、arXiv Query API 与 HN Algolia，而不是把 Feed window 冒充所有平台的 Search。
 - 为 V2EX、linux.do 与 NodeSeek conditional 保留基于 Feed 的 latest 来源；arXiv 与 Hacker News 增加真实 Search Route，YouTube、Newsletter/Podcast 继续通过已证明的 Feed/Bundle 类型扩充。
@@ -92,6 +93,7 @@
 - v1 不引入 sqlite-vec、Chromem、Qdrant、LanceDB 或独立 ANN 服务；当单模型 cohort 达到约一万条，或语义比较 p95 超过 150ms，再依据真实数据重新选择索引。
 - 不因某个 Source 有 Manifest、某个 Provider 可达或某个 Tool 已安装，就宣称该 Source 的所有 Capability 可用。
 - 不把 Feed window 内关键词过滤保留为 Search 兼容层；不解析调用者塞进 query 的 Provider 私有控制语法；不在首版接入 SoV2EX。
+- 不承诺 continuation 跨 `serve` 重启或 TTL 后恢复，不把 Query Session 持久化为用户资源；未实现私有 cursor 的 Route 在其首窗结束后如实到达末页，不伪造下一页。
 
 ## Acceptance Evidence
 
@@ -108,7 +110,8 @@
 - 四种 Egress mode 都有成功与 fail-closed fixture；Probe 按真实连接拓扑输出 DNS/TCP/proxy connect/TLS/HTTP/Feed parse，未执行层为 `not_run`，普通 Query 不产生额外诊断请求。
 - Direct Feed、RSSHub、GitHub、Tavily 与 X/xurl 各有成功、缺配置/凭据和上游失败证据；V2EX、linux.do、NodeSeek conditional 及发布的 Feed Bundle 样例逐项有 fixture 或真实 smoke，未授权/不可达来源不报告 ready。
 - 同一 fixture Operation 经 CLI、REST、MCP 得到语义等价 Envelope；View refresh、Run 轮询、RSS/Atom/JSON Feed、JSONL、Skill 与 Dashboard API 均从同一 Operation/Subscription Service 投影。
-- Chrome Bridge 证明 permission/scope/断线/成功路径；Host 与 Extension 分别拒绝非 linux.do、非 `/search.json`、非第一页请求，浏览器响应经 Discourse 归一化后进入统一 Envelope，Cookie 不离开 Chrome。
+- Chrome Bridge 证明 permission/scope/断线/成功路径；Host 与 Extension 分别拒绝非 linux.do、非 `/search.json`、非法或越界页码，允许当前 Query Session 的 linux.do 后续页；浏览器响应经 Discourse 归一化后进入统一 Envelope，Cookie 不离开 Chrome。
+- 真实 Dashboard 搜索以 `krill` 证明页大小 10/20/50 均由界面控制，第一页超过所选条数时返回 opaque continuation；下一页产生不同结果且不重复，上一页使用已取得页面，不重放一次性 token；条件或页大小变化重置为第一页。
 - semantic grouping 在固定语料上证明同模型 cohort、阈值边界、Endpoint/Credential/model/index revision 隔离、provider unavailable、dimension/finite/zero-norm 与坏 BLOB fail-closed；所有 Item 保留，功能默认关闭，JSON/RSS/Atom 从 Snapshot 保留同一 similarity metadata。
 - macOS/Linux/Windows 产物、checksum、全新目录安装/doctor、配置示例和扩展文档可重放；最终 Test 与独立 Review 均通过。
 - Direct Feed/RSSHub RouteTemplate 不再声明 Search；旧 Feed Search View 执行时在发网前明确失败，不能静默改成 Latest。
@@ -129,4 +132,5 @@
 - 官方 Feed 预设增量：`completed`，V2EX/NodeSeek 固定 Feed 由 RouteTemplate 提供，Dashboard 不要求填写；默认 SQLite 已创建 NodeSeek Channel，当前 Direct Probe 为 `failed/timeout`，仍未标记 ready。
 - `test/test-plan.md`：`completed`，TC-IA01—05 已执行并闭合。
 - `test/test-report.md`：`passed`，真实搜索、旧路由删除、明文密钥拒绝、四任务浏览器流程、桌面/移动布局与全量门禁均已裁决。
+- 搜索真实分页修订：`completed`，Dashboard 10/20/50 条每页、Backend opaque continuation、linux.do 多页和不支持 Route 如实结束均已实现；TC-PG01—05、真实 page 1/2、全量门禁与 live UI 已通过。
 - `review/review.md`：`approve`，Stage E 合同、安全、迁移、公共出口与发布候选独立复审通过。

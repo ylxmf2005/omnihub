@@ -74,10 +74,13 @@ func (operation Operation) Validate() error {
 		}
 		seenDomains[normalized] = true
 	}
-	// Stage 1 尚未签发或验证 continuation token。接受任意非空字符串会把
-	// Adapter cursor 误当成 OmniHub token，因此在签发器落地前显式拒绝。
 	if operation.Continuation != nil {
-		return fmt.Errorf("%w: continuation is not supported", ErrInvalidOperation)
+		if operation.Operation != OperationSearch || operation.SimilarityGrouping == SimilaritySemantic {
+			return fmt.Errorf("%w: continuation is only supported for non-semantic search", ErrInvalidOperation)
+		}
+		if !validContinuationToken(*operation.Continuation) {
+			return fmt.Errorf("%w: continuation token is invalid", ErrInvalidOperation)
+		}
 	}
 	if !operation.Scope.hasSelection() {
 		return fmt.Errorf("%w: scope requires a channel, source, provider, domain or collection", ErrInvalidOperation)
@@ -114,6 +117,18 @@ func (operation Operation) Validate() error {
 		return fmt.Errorf("%w: unsupported similarity_grouping %q", ErrInvalidOperation, operation.SimilarityGrouping)
 	}
 	return nil
+}
+
+func validContinuationToken(token string) bool {
+	if len(token) != 68 || !strings.HasPrefix(token, "ctn_") {
+		return false
+	}
+	for _, character := range token[4:] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (constraints SearchConstraints) empty() bool {

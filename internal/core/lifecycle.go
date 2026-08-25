@@ -116,8 +116,17 @@ func (envelope Envelope) Validate() error {
 	if envelope.Meta.DurationMS != envelope.Meta.FinishedAt.Sub(envelope.Meta.StartedAt).Milliseconds() || envelope.Meta.ResultCount != len(envelope.Items) {
 		return fmt.Errorf("%w: envelope metadata is inconsistent", ErrInvalidEnvelope)
 	}
-	if envelope.Continuation.Mode != "none" || envelope.Continuation.Token != nil {
-		return fmt.Errorf("%w: Stage 1 continuation must be empty", ErrInvalidEnvelope)
+	switch envelope.Continuation.Mode {
+	case "none":
+		if envelope.Continuation.Token != nil {
+			return fmt.Errorf("%w: continuation mode none cannot carry a token", ErrInvalidEnvelope)
+		}
+	case "opaque":
+		if envelope.Request.Operation != OperationSearch || envelope.Continuation.Token == nil || !validContinuationToken(*envelope.Continuation.Token) {
+			return fmt.Errorf("%w: opaque continuation is invalid", ErrInvalidEnvelope)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported continuation mode %q", ErrInvalidEnvelope, envelope.Continuation.Mode)
 	}
 	if len(envelope.SelectedChannelIDs) == 0 {
 		return fmt.Errorf("%w: selected channel ids are required", ErrInvalidEnvelope)

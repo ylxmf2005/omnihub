@@ -57,7 +57,8 @@ to the Native Host. The extension never writes them to `chrome.storage` or logs
 them. It has no `<all_urls>`, `debugger`, content-script, or CDP access.
 
 For every search, the Host and extension independently require the exact
-`https://linux.do/*` permission, `/search.json`, a non-empty `q`, and `page=1`.
+`https://linux.do/*` permission, `/search.json`, a non-empty `q`, and a canonical
+positive `page` between 1 and 10, matching Discourse's documented controller bound.
 Another host, path, page, redirect, method, or oversized response is refused.
 
 Manifest permissions:

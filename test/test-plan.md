@@ -1,4 +1,4 @@
-# TestPlan：Dashboard 四任务重构与密钥明文收口
+# TestPlan：Dashboard 四任务重构、密钥明文收口与搜索真实分页
 
 ## 计划状态
 
@@ -24,6 +24,11 @@
 | 密钥明文仍进入浏览器或 OpenAPI | comment-review 安全边界、context | 本机密钥暴露给前端状态和插件 | TC-IA03 |
 | 订阅与活动仍展示 Channel/Run/Snapshot 等实现模型 | 用户审查 | 页面存在但普通用户无法理解 | TC-IA04 |
 | 大幅删改后桌面/移动布局或后端回归 | 本轮 diff | 产品不可启动或主要动作不可用 | TC-IA05 |
+| 页大小仍由前端硬编码或只改成另一个常数 | 用户对固定 20 条的反馈 | 用户无法控制单页密度，结果继续无故截断 | TC-PG01 |
+| “下一页”只切前端数组，没有继续来源检索 | 用户确认真实分页 | 首窗之后的历史仍不可检索 | TC-PG02 |
+| 多来源 cursor 或 merge buffer 暴露、丢失或重复 | 公共 continuation 合同 | 翻页重复、漏项或前端绑定 Provider 私有页码 | TC-PG03 |
+| Chrome 扩大为任意浏览器代理 | 既有 Cookie 安全边界 | 登录态可被滥用于其他域名或路径 | TC-PG04 |
+| continuation 过期、条件变化或进程重启后静默错页 | Query Session 生命周期 | 用户看到与当前查询不相干的数据 | TC-PG05 |
 
 ## 用例
 
@@ -97,13 +102,83 @@
 - 清理：保留项目约定的两个 `screen` 长驻服务，不保留临时测试资源。
 - 证据边界：本机移动视口模拟不等于所有真实移动浏览器。
 
+### TC-PG01 — 页大小由 Dashboard 控制
+
+- 背景与风险：页面显示密度不能继续被 `limit: 20` 写死。
+- 优先级：P0
+- 环境与身份：真实 Vite Dashboard、默认 SQLite、已连接 Chrome Bridge。
+- 前置数据：linux.do 搜索 `krill` 首窗至少 50 条。
+- 实际动作：依次选择 10、20、50 条每页并重新搜索 `krill`。
+- 预期：当前页分别显示 10、20、50 条；请求 `limit` 与选择一致；10/20 条页面显示下一页，50 条是否有下一页由上游 continuation 决定。
+- 观察面与窗口：浏览器 DOM、`POST /v1/search` 请求/响应，最长 30 秒。
+- 证据：页面结果计数、请求体和 Envelope continuation。
+- 失败处理：阻断交付。
+- 清理：只读搜索，无外部写入。
+- 证据边界：不证明上游索引完整性。
+
+### TC-PG02 — linux.do 后续页进入真实来源
+
+- 背景与风险：前端切数组不能冒充来源翻页。
+- 优先级：P0
+- 环境与身份：同 TC-PG01。
+- 前置数据：使用第一页返回的 opaque continuation。
+- 实际动作：以 20 条每页连续点击下一页，直到消费首窗 buffer 后再触发 linux.do `page=2`；随后返回上一页。
+- 预期：每页最多 20 条；页间 Item identity 不重复；消费首窗后 Extension 实际请求 `/search.json?...&page=2`；上一页读取已取得页面，不重用已消费 token。
+- 观察面与窗口：浏览器页面、Backend Envelope、Bridge 请求校验测试。
+- 证据：页面标题/URL 集合、Adapter/Bridge 自动化与真实响应。
+- 失败处理：阻断交付。
+- 清理：none。
+- 证据边界：只证明本次 linux.do 会话和 Discourse 当前数据。
+
+### TC-PG03 — 多来源 merge buffer 与 opaque token
+
+- 背景与风险：不同 Provider 的私有 cursor 不能泄漏或导致重复、漏掉已取得结果。
+- 优先级：P0
+- 环境与身份：确定性 Adapter fixtures 与 HTTP 公共入口。
+- 前置数据：至少两个来源，各自产生超过单页大小的交错结果，其中一个支持后续 cursor。
+- 实际动作：通过 `/v1/search` 取第一页和后续页，改变后续页 `limit`，检查所有响应。
+- 预期：token 为 OmniHub 不透明随机值，不含 Provider/page/query；改变页大小仍从同一消费位置继续；已取得 buffer 先消费，跨页 exact identity 不重复；不支持 cursor 的 Route 在首窗后自然结束。
+- 观察面与窗口：HTTP 响应、query 单元/集成测试。
+- 证据：新增自动化测试与响应断言。
+- 失败处理：阻断交付。
+- 清理：Session TTL 内存状态由测试实例释放。
+- 证据边界：不证明跨进程恢复。
+
+### TC-PG04 — Chrome 页码扩展不扩大授权面
+
+- 背景与风险：支持 page=N 不能把 Extension 变成通用认证浏览器代理。
+- 优先级：P0
+- 环境与身份：Browser Host/Extension 校验测试。
+- 前置数据：合法 linux.do Search 消息和非法域名、路径、query key、页码样本。
+- 实际动作：验证 page=1、page=2 与边界值；重放 page=0、负数、小数、前导零、超上限、其他域名/路径/参数。
+- 预期：只接受精确 linux.do `/search.json`、单一非空 q 和规范正整数页码；Cookie/响应仍不进入 OmniHub 可观察面。
+- 观察面与窗口：Go/Extension 自动化与真实 Bridge 状态。
+- 证据：`internal/browser`、`extension` 聚焦测试。
+- 失败处理：阻断交付。
+- 清理：不变更权限。
+- 证据边界：不审计 Chrome 自身实现。
+
+### TC-PG05 — Query Session 失效与重置
+
+- 背景与风险：一次性 token、过期或查询变化必须 fail closed。
+- 优先级：P1
+- 环境与身份：可控时钟的 Session 自动化和真实 Dashboard。
+- 前置数据：已取得一枚 continuation。
+- 实际动作：重复消费同一 token；使用不同 query/scope/sort/constraints；推进超过 TTL；在 UI 修改条件或页大小。
+- 预期：重复、过期、未知或不匹配 token 在发网前明确拒绝；UI 条件/页大小变化清空旧页并从第一页搜索；进程重启后旧 token 不恢复。
+- 观察面与窗口：HTTP problem、Adapter 调用计数、浏览器页码。
+- 证据：自动化与 UI 交互记录。
+- 失败处理：阻断依赖 continuation 的交付。
+- 清理：none。
+- 证据边界：明确不承诺跨重启恢复。
+
 ## 执行顺序与依赖
 
-- 先完成静态/自动化门禁和嵌入构建，再重启后端；TC-IA01/03/04 可在同一浏览器会话执行，TC-IA02 依赖真实来源，TC-IA05 最后汇总。
+- 先用 TC-PG03—05 固定 continuation、Session 与 Bridge 负向合同，再构建并重启；TC-PG01—02 从真实 Dashboard 走到 linux.do 后续页；最后重跑 TC-IA02/05 受影响面。
 - 安全用例失败阻断所有交付；真实上游单点故障不掩盖本地产品路径。
 
 ## 计划攻击与开放缺口
 
 - 仍可能全绿但产品错误的路径：只看新导航会漏旧路由，因此直接访问旧 URL；只看掩码会漏查询旁路，因此重放 `include_value=true` 并检查 OpenAPI；只看 HTTP 200 会漏真实搜索结果，因此从浏览器入口走到条目。
 - 仍需现场发明的输入或步骤：若默认 SQLite 没有任何 Credential，则 HTTP 用不存在 ID 验证参数先被拒绝，写操作只检查表单与自动化，不写入用户密钥。
-- 下一步：TC-IA01—05 已执行完毕，从 `test/test-report.md` 的最终裁决进入提交与交付。
+- 下一步：TC-IA01—05 的既有证据保持成立；TC-PG01—05 与搜索、构建、全量门禁均已执行，结论见 Test Report。

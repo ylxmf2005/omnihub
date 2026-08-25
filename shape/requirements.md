@@ -135,7 +135,7 @@ View freshness 优先采用上游有效的 TTL/Cache-Control/Expires；没有可
 
 ### REQ-018：分页与截断
 
-Adapter cursor 为 Channel 内部 Provider 私有且不冒充全局 cursor。无状态多 Channel 查询 v1 只承诺有界首窗；不能稳定续页时 `continuation` 为空并在 coverage 标记 truncated。只有保存了各 Channel cursor 与 merge buffer 的服务端 Query Session/View 才可签发全局 opaque cursor。
+Adapter cursor 为 Channel 内部 Provider 私有且不冒充全局 cursor。Dashboard Backend 通过 15 分钟、进程内 Query Session 保存各 Channel cursor、已取得但未交付的 merge buffer 与消费位置，并签发单次消费的 opaque continuation；token 过期、重放、条件不匹配或进程重启后在发网前失败。CLI 的单次无状态执行、未接 cursor 的 Route 与 View refresh 不伪造续页能力。
 
 ### REQ-019：错误与退出语义
 

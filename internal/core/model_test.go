@@ -78,6 +78,7 @@ func TestOperationValidation(t *testing.T) {
 		}), wantError: true},
 		{name: "invalid domain scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"https://example.com"}} }), wantError: true},
 		{name: "duplicate domain scope", operation: replace(base, func(value *Operation) { value.Scope = Scope{Domains: []string{"example.com", "EXAMPLE.COM"}} }), wantError: true},
+		{name: "OmniHub continuation", operation: replace(base, func(value *Operation) { token := "ctn_" + strings.Repeat("0", 64); value.Continuation = &token })},
 		{name: "continuation unsupported", operation: replace(base, func(value *Operation) { token := "adapter-cursor"; value.Continuation = &token }), wantError: true},
 		{name: "untyped selector", operation: replace(base, func(value *Operation) { value.RoutePolicy.Prefer = []RouteSelector{{ID: "github"}} }), wantError: true},
 		{name: "auto with prefer hint", operation: replace(base, func(value *Operation) {
@@ -459,6 +460,14 @@ func TestBuildEnvelopeAggregatesTerminalStatus(t *testing.T) {
 	}
 	if envelope.Continuation.Mode != "none" {
 		t.Fatalf("BuildEnvelope() continuation mode = %q, want none", envelope.Continuation.Mode)
+	}
+
+	requestToken := "ctn_" + strings.Repeat("0", 64)
+	nextToken := "ctn_" + strings.Repeat("1", 64)
+	input.Request.Continuation = &requestToken
+	input.Continuation = Continuation{Mode: "opaque", Token: &nextToken}
+	if _, err := BuildEnvelope(input); err != nil {
+		t.Fatalf("BuildEnvelope() rejected valid opaque continuation: %v", err)
 	}
 }
 

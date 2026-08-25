@@ -155,6 +155,7 @@ export interface Operation {
   similarity_grouping: 'off' | 'semantic'
   semantic_profile_id?: string | null
   deadline_ms: number
+  continuation?: string
   /** `search` only. */
   query?: string
 	/** `search` only. */
@@ -191,7 +192,7 @@ interface RankedQueryInput extends QueryInputBase {
   similarity_grouping: 'off' | 'semantic'
   /** Required by the schema when `similarity_grouping` is `semantic`. */
   semantic_profile_id?: string | null
-  continuation?: null
+  continuation?: string
 }
 
 export interface SearchInput extends RankedQueryInput {
@@ -307,8 +308,8 @@ export interface ExecutionRecord {
 }
 
 export interface Continuation {
-  mode: 'none' | 'cursor' | string
-  cursor?: string | null
+  mode: 'none' | 'opaque' | string
+  token?: string | null
   limitations: string[]
 }
 
